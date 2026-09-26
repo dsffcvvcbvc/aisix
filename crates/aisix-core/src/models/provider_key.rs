@@ -50,6 +50,16 @@ pub struct ProviderKey {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_base: Option<String>,
 
+    /// Optional upstream project id dispatched with the request (Google
+    /// Cloud Code `project` envelope field for the Antigravity bridge).
+    /// `None` (the default for every stored document written before this
+    /// field existed) falls back to the bridge's shared default, so
+    /// existing keys keep working unchanged. Deliberately `Option` with
+    /// a serde default: a row the control plane projects without this
+    /// key must keep loading instead of being skipped whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+
     /// Upstream provider identifier, such as `"deepseek"`, `"openai"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.
     #[serde(default)]
     pub provider: String,
@@ -636,6 +646,27 @@ mod tests {
     }
 
     #[test]
+    fn project_defaults_to_none_for_legacy_documents() {
+        // On-disk compatibility: documents written before `project`
+        // existed carry no such key and must load with `None` (the
+        // bridge then falls back to its shared default).
+        let p: ProviderKey =
+            serde_json::from_str(r#"{"display_name":"agy","secret":"k"}"#).unwrap();
+        assert_eq!(p.project, None);
+    }
+
+    #[test]
+    fn project_round_trips_when_set() {
+        let p: ProviderKey = serde_json::from_str(
+            r#"{"display_name":"agy","secret":"k","project":"my-cloud-project"}"#,
+        )
+        .unwrap();
+        assert_eq!(p.project.as_deref(), Some("my-cloud-project"));
+        let back: ProviderKey = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert_eq!(back.project.as_deref(), Some("my-cloud-project"));
+    }
+
+    #[test]
     fn tolerates_unknown_fields_for_forward_compat() {
         // cp-api may ship new fields ahead of the DP rolling out; serde
         // must accept them. The write path still rejects them via the
@@ -947,6 +978,7 @@ mod tests {
             display_name: "openai-prod".into(),
             api_key: "sk-x".into(),
             api_base: None,
+            project: None,
             provider: String::new(),
             adapter: None,
             apis: None,

@@ -304,6 +304,13 @@
       "minLength": 1,
       "type": "string"
     },
+    "project": {
+      "description": "Optional upstream project id dispatched with the request (Google Cloud Code `project` envelope field for the Antigravity bridge). `None` (the default for every stored document written before this field existed) falls back to the bridge's shared default, so existing keys keep working unchanged. Deliberately `Option` with a serde default: a row the control plane projects without this key must keep loading instead of being skipped whole.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "provider": {
       "default": "",
       "description": "Upstream provider identifier, such as `\"deepseek\"`, `\"openai\"`, or a model catalog ID. The gateway uses this value for provider-specific dispatch and base URL validation.",

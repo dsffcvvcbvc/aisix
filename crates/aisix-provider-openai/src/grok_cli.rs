@@ -13,8 +13,8 @@
 //!   `principal_type` / `principal_id`, which have no `ProviderKey`
 //!   field here and are omitted); up to 3 attempts, `invalid_grant` /
 //!   `invalid_client` terminal. The public `client_id` resolves from
-//!   `GROK_OAUTH_CLIENT_ID` env (the TS side reads the same env plus
-//!   an embedded default the gateway does not ship).
+//!   `GROK_OAUTH_CLIENT_ID` env (the TS side reads the same env) with
+//!   the public CLI default embedded below.
 //! - `executors/grok-cli.ts:340-388` (`transformRequest`): `store =
 //!   false`, `include` gains `reasoning.encrypted_content`, effort
 //!   defaults to `"high"` (except `grok-composer-2.5-fast`, which must
@@ -69,6 +69,25 @@ const GROK_TOKEN_URL: &str = "https://auth.x.ai/oauth2/token";
 /// `ProviderKey.api_base` still wins (corporate proxy convention).
 pub const GROK_DEFAULT_BASE: &str = "https://cli-chat-proxy.grok.com/v1";
 
+/// Public OAuth client id (`grok_id` in open-sse `publicCreds.ts`,
+/// extracted from the public Grok Build CLI; a PKCE native-app value,
+/// public by design). Short UUID shape — matches no secret-scanner
+/// pattern, so it lives as a plain literal rather than masked bytes.
+const GROK_EMBEDDED_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+
+/// Resolve the OAuth client id: `GROK_OAUTH_CLIENT_ID` env (same name
+/// the TS side reads) wins when set, otherwise the embedded public
+/// default. Never empty, so the mint's fail-closed error below is
+/// unreachable in practice — it stays as the guard.
+fn resolve_oauth_client_id() -> String {
+    let from_env = aisix_gateway::resolve_public_cred(&[], &["GROK_OAUTH_CLIENT_ID"]);
+    if from_env.is_empty() {
+        GROK_EMBEDDED_CLIENT_ID.to_string()
+    } else {
+        from_env
+    }
+}
+
 /// `GROK_BUILD_SUPPORTED_REASONING_EFFORTS`.
 const SUPPORTED_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh"];
 /// `GROK_BUILD_DEFAULT_REASONING_EFFORT`.
@@ -115,7 +134,19 @@ fn grok_user_agent() -> String {
 }
 
 /// `getGrokBuildSessionHeaders` (`grokBuild.ts:91-117`).
-fn session_headers(token: &str, sse: bool) -> Result<HeaderMap, BridgeError> {
+/// `model_override` carries the dispatched upstream model
+/// (`x-grok-model-override`). `x-userid` / `x-email` are intentionally
+/// NOT synthesized: the TS side fills them from the stored Grok account
+/// (`providerSpecificData.userId`, account email), which the stateless
+/// gateway does not hold — the gateway-local caller id lives in a
+/// different identity domain and must never be sent as the Grok user.
+/// An operator that needs those headers sets them explicitly via the
+/// key's `forward_client_headers` / `default_headers`.
+fn session_headers(
+    token: &str,
+    sse: bool,
+    model_override: Option<&str>,
+) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     let pairs: &[(&str, String)] = &[
         ("content-type", "application/json".to_string()),
@@ -149,6 +180,16 @@ fn session_headers(token: &str, sse: bool) -> Result<HeaderMap, BridgeError> {
             HeaderValue::from_str(value).map_err(|_| {
                 BridgeError::InvalidUpstreamCredentials(
                     "grok credential is not a valid header value".into(),
+                )
+            })?,
+        );
+    }
+    if let Some(model) = model_override.map(str::trim).filter(|m| !m.is_empty()) {
+        headers.insert(
+            HeaderName::from_static("x-grok-model-override"),
+            HeaderValue::from_str(model).map_err(|_| {
+                BridgeError::InvalidUpstreamConfig(
+                    "grok model id is not a valid header value".into(),
                 )
             })?,
         );
@@ -468,14 +509,12 @@ impl GrokTokenMint {
                 }
             }
         }
-        let client_id = std::env::var("GROK_OAUTH_CLIENT_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| {
-                BridgeError::InvalidUpstreamCredentials(
-                    "grok OAuth client id is not configured (GROK_OAUTH_CLIENT_ID); re-authenticate the account".into(),
-                )
-            })?;
+        let client_id = resolve_oauth_client_id();
+        if client_id.trim().is_empty() {
+            return Err(BridgeError::InvalidUpstreamCredentials(
+                "grok OAuth client id is not configured (GROK_OAUTH_CLIENT_ID); re-authenticate the account".into(),
+            ));
+        }
         let client_id = client_id.trim().to_string();
         // No guard held across the network round-trips below (each
         // attempt awaits + sleeps); re-acquire + re-check before insert.
@@ -483,8 +522,15 @@ impl GrokTokenMint {
         let mut won: Option<GrokRefreshOutcome> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             if attempt > 1 {
-                let backoff = Duration::from_millis(200 * 2_u64.pow(attempt - 2).min(8));
-                tokio::time::sleep(backoff).await;
+                let base_ms = 200 * 2_u64.pow(attempt - 2).min(8);
+                // Jitter without a rand dependency: the low clock bits
+                // spread concurrent refresh retries that would otherwise
+                // wake in lockstep after the same failure.
+                let jitter_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| u64::from(d.subsec_nanos()) % (base_ms + 1))
+                    .unwrap_or(0);
+                tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
             }
             match refresh_once(
                 &self.client,
@@ -579,8 +625,9 @@ impl GrokCliBridge {
         request_id: &str,
         sse: bool,
         hdr: &UpstreamHeaderContext<'_>,
+        model_override: Option<&str>,
     ) -> Result<HeaderMap, BridgeError> {
-        let mut headers = session_headers(token, sse)?;
+        let mut headers = session_headers(token, sse, model_override)?;
         headers.insert(
             HeaderName::from_static("x-aisix-request-id"),
             HeaderValue::from_str(request_id).map_err(|e| {
@@ -717,7 +764,13 @@ impl Bridge for GrokCliBridge {
             .unwrap_or(&ctx.model.display_name);
         let raw_body = build_responses_body(req, upstream_model, true, Some(DEFAULT_EFFORT));
         let body = sanitize_responses_body(raw_body, upstream_model);
-        let headers = Self::build_headers(&credential, &ctx.request_id, true, &ctx.header_ctx())?;
+        let headers = Self::build_headers(
+            &credential,
+            &ctx.request_id,
+            true,
+            &ctx.header_ctx(),
+            Some(upstream_model),
+        )?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "grok-cli/responses",
@@ -805,14 +858,28 @@ mod tests {
 
     #[test]
     fn session_headers_carry_grok_identity() {
-        let headers = session_headers("tok", true).unwrap();
+        let headers = session_headers("tok", true, Some("grok-4.7")).unwrap();
         assert_eq!(headers["x-grok-client-version"], "1.0.41");
         assert_eq!(headers["x-grok-client-identifier"], "grok-shell");
         assert_eq!(headers["x-xai-token-auth"], "xai-grok-cli");
         assert_eq!(headers["x-authenticateresponse"], "authenticate-response");
         assert_eq!(headers["authorization"], "Bearer tok");
+        assert_eq!(headers["x-grok-model-override"], "grok-4.7");
         let ua = headers["user-agent"].to_str().unwrap().to_string();
         assert!(ua.starts_with("grok-shell/1.0.41 ("), "ua={ua}");
+    }
+
+    #[test]
+    fn session_headers_omit_model_override_when_absent() {
+        let headers = session_headers("tok", true, None).unwrap();
+        assert!(!headers.contains_key("x-grok-model-override"));
+    }
+
+    #[test]
+    fn oauth_client_id_embeds_public_default() {
+        // The embedded default is a plain literal (UUID shape, no
+        // scanner pattern); the env name stays the documented override.
+        assert!(!resolve_oauth_client_id().is_empty());
     }
 
     #[test]

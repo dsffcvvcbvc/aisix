@@ -58,11 +58,33 @@ const QWEN_CLI_VERSION: &str = "0.19.3";
 pub const QODER_DEFAULT_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
 fn qwen_user_agent() -> String {
+    // Node-style runtime tokens (`getQwenCliUserAgent` renders
+    // `process.platform` / `process.arch` verbatim): `darwin` (not
+    // `macos`), `win32` (not `windows`), `x64`/`arm64` (not
+    // `x86_64`/`aarch64`).
     format!(
         "QwenCode/{QWEN_CLI_VERSION} ({}; {})",
-        std::env::consts::OS,
-        std::env::consts::ARCH
+        node_platform(),
+        node_arch()
     )
+}
+
+/// `process.platform` vocabulary from Rust's compile-time constants.
+fn node_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        _ => std::env::consts::OS,
+    }
+}
+
+/// `process.arch` vocabulary from Rust's compile-time constants.
+fn node_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        _ => std::env::consts::ARCH,
+    }
 }
 
 fn stainless_os() -> &'static str {
@@ -203,7 +225,13 @@ async fn exchange_refresh_token(
         }
         return Err(BridgeError::upstream_status(
             status.as_u16(),
-            format!("qoder token refresh rejected ({status}): {text}"),
+            format!(
+                "qoder token refresh rejected ({status}): {}",
+                aisix_gateway::truncate_lossy(
+                    &text,
+                    aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES
+                )
+            ),
         ));
     }
     let tokens: serde_json::Value = serde_json::from_slice(&raw).map_err(|e| {
@@ -295,6 +323,32 @@ impl QoderTokenMint {
         }
         *guard = Some((access.clone(), refresh.clone(), Instant::now() + ttl));
         Ok(Some((access, refresh)))
+    }
+}
+
+/// `sanitizeQwenThinkingToolChoice` (`services/qwenThinking.ts`): with
+/// thinking active, an incompatible `tool_choice` (`"required"` or any
+/// object form) is neutralized to `"auto"` — DashScope rejects the
+/// combination. Inactive thinking (or an already-compatible choice)
+/// leaves the body untouched.
+fn sanitize_qwen_thinking_tool_choice(body: &mut serde_json::Value) {
+    let thinking_active = match body.get("thinking") {
+        Some(serde_json::Value::Bool(true)) => true,
+        Some(obj @ serde_json::Value::Object(_)) => {
+            obj.get("type").and_then(|t| t.as_str()) == Some("enabled")
+        }
+        _ => body.get("enable_thinking").and_then(|v| v.as_bool()) == Some(true),
+    };
+    if !thinking_active {
+        return;
+    }
+    let incompatible = match body.get("tool_choice") {
+        Some(serde_json::Value::String(s)) => s == "required",
+        Some(serde_json::Value::Object(_)) | Some(serde_json::Value::Array(_)) => true,
+        _ => false,
+    };
+    if incompatible {
+        body["tool_choice"] = serde_json::Value::String("auto".to_string());
     }
 }
 
@@ -451,12 +505,13 @@ impl Bridge for QoderBridge {
         let upstream = map_model(model_name).to_string();
         let messages = messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_request(req, &upstream, &messages, false);
-        let body = prepare_outbound_body(
+        let mut body = prepare_outbound_body(
             &typed,
             is_reasoning_model(ReasoningFamily::Openai, &upstream),
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
+        sanitize_qwen_thinking_tool_choice(&mut body);
         let headers = self.build_headers(&credential, &ctx.request_id, false, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -500,12 +555,13 @@ impl Bridge for QoderBridge {
         let upstream = map_model(model_name).to_string();
         let messages = messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_request(req, &upstream, &messages, true);
-        let body = prepare_outbound_body(
+        let mut body = prepare_outbound_body(
             &typed,
             is_reasoning_model(ReasoningFamily::Openai, &upstream),
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
+        sanitize_qwen_thinking_tool_choice(&mut body);
         let headers = self.build_headers(&credential, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -576,6 +632,42 @@ mod tests {
     }
 
     #[test]
+    fn qwen_thinking_neutralizes_incompatible_tool_choice() {
+        for thinking in [
+            serde_json::json!({"thinking": true}),
+            serde_json::json!({"enable_thinking": true}),
+            serde_json::json!({"thinking": {"type": "enabled"}}),
+        ] {
+            for choice in [
+                serde_json::json!("required"),
+                serde_json::json!({"type": "function", "function": {"name": "f"}}),
+            ] {
+                let mut body = thinking.clone();
+                body["tool_choice"] = choice.clone();
+                sanitize_qwen_thinking_tool_choice(&mut body);
+                assert_eq!(
+                    body["tool_choice"],
+                    serde_json::json!("auto"),
+                    "body={body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_thinking_leaves_compatible_bodies_alone() {
+        // No thinking: even "required" survives.
+        let mut body = serde_json::json!({"tool_choice": "required"});
+        sanitize_qwen_thinking_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], serde_json::json!("required"));
+
+        // Thinking with a compatible choice survives.
+        let mut body = serde_json::json!({"thinking": true, "tool_choice": "auto"});
+        sanitize_qwen_thinking_tool_choice(&mut body);
+        assert_eq!(body["tool_choice"], serde_json::json!("auto"));
+    }
+
+    #[test]
     fn envelope_error_detects_non_200_status() {
         let err = qoder_envelope_error(r#"{"statusCodeValue":401,"body":"bad key"}"#)
             .expect("must detect");
@@ -599,6 +691,11 @@ mod tests {
         assert_eq!(headers["x-dashscope-cachecontrol"], "enable");
         let ua = headers[header::USER_AGENT].to_str().unwrap().to_string();
         assert!(ua.starts_with("QwenCode/0.19.3 ("), "ua={ua}");
+        // Node-style arch token (M15): never the raw Rust triple name.
+        if matches!(std::env::consts::ARCH, "x86_64" | "aarch64") {
+            let arch_token = ua.rsplit("; ").next().unwrap_or("").trim_end_matches(')');
+            assert!(matches!(arch_token, "x64" | "arm64"), "ua={ua}");
+        }
         assert_eq!(headers["x-dashscope-useragent"], ua.as_str());
         assert_eq!(headers["x-stainless-lang"], "js");
     }

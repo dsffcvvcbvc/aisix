@@ -8,7 +8,7 @@
 //! - Streaming SSE parser translating candidate parts into `content` and `reasoning_content` (`thought`)
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -19,9 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aisix_core::Adapter;
 use aisix_gateway::sse::{SseDecoder, SseEvent};
 use aisix_gateway::{
-    apply_request_headers, scrub_upstream_headers, Bridge, BridgeContext, BridgeError, ChatChunk,
-    ChatChunkStream, ChatDelta, ChatFormat, ChatResponse, FinishReason, Role,
-    UpstreamHeaderContext, UsageStats,
+    apply_request_headers, resolve_public_cred, scrub_upstream_headers, truncate_lossy, Bridge,
+    BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat, ChatResponse,
+    FinishReason, Role, UpstreamHeaderContext, UsageStats, MAX_UPSTREAM_ERROR_MESSAGE_BYTES,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,26 +32,70 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-fn env_or_empty(name: &str) -> String {
-    std::env::var(name).unwrap_or_default()
-}
-
 const GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const ANTIGRAVITY_RPC_URL: &str =
     "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+/// Fallback RPC host (`ANTIGRAVITY_RUNTIME_BASE_URLS[1]` in the TS
+/// registry). Tried only when the primary host fails at the transport
+/// layer; upstream HTTP rejections are not retried elsewhere.
+const ANTIGRAVITY_RPC_FALLBACK_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
 /// IDE version embedded in the spoofed Antigravity `User-Agent`.
 /// Kept at `2.1.1` per spec; the header value is rendered from this
 /// single const (pinned by `user_agent_carries_ide_version`).
 const ANTIGRAVITY_IDE_VERSION: &str = "2.1.1";
-const GOOG_API_CLIENT: &str = "gl-node/22.21.1";
-/// Default Cloud Code project sent in the envelope. The TS executor
-/// resolves this per-account via `loadCodeAssist` against its OAuth
-/// account store; the gateway holds only the `ProviderKey` secret (no
-/// project-id field, no account store), so per-account discovery is
-/// impossible without a resource-schema change. The shared default
-/// stays — removing it would break every existing key, and a missing
-/// project fails closed upstream anyway.
+/// Suffix of the OAuth (ide-node) `User-Agent`
+/// (`antigravityIdeNodeUserAgent`: the Node API client the official IDE
+/// build refreshes tokens with). Sent only on the token-refresh face —
+/// never on content requests.
+const ANTIGRAVITY_IDE_NODE_API_CLIENT: &str = "google-api-nodejs-client/10.3.0";
+/// Default Cloud Code project sent in the envelope. Per-key
+/// `ProviderKey.project` wins when set; this stays as the fallback so
+/// existing keys keep working unchanged, and a missing project fails
+/// closed upstream anyway. (The TS executor resolves the project
+/// per-account via `loadCodeAssist`; the gateway has no account store,
+/// so per-account discovery is out of scope here.)
 const ANTIGRAVITY_DEFAULT_PROJECT: &str = "aicode-consumers";
+
+/// Embedded public OAuth client id, XOR-masked per the mandatory
+/// `PUBLIC_CREDS.md` pattern (installed-app PKCE credential, public by
+/// design; the literal would trip secret scanners). Copied from the TS
+/// `antigravity_id` entry — same mask, same bytes.
+const ANTIGRAVITY_MASKED_CLIENT_ID: &[u8] = &[
+    94, 93, 89, 88, 66, 95, 67, 68, 83, 29, 69, 76, 83, 65, 29, 14, 69, 5, 66, 6, 3, 92, 1, 64, 94,
+    25, 23, 23, 72, 66, 70, 87, 26, 29, 12, 65, 25, 91, 7, 89, 9, 93, 66, 92, 16, 4, 75, 76, 0, 5,
+    17, 66, 14, 12, 66, 17, 93, 10, 24, 29, 12, 0, 12, 26, 26, 17, 72, 30, 1, 76, 15, 6, 14,
+];
+/// Embedded public OAuth client secret (`antigravity_alt` entry, same
+/// masking). Resolution order: `ANTIGRAVITY_OAUTH_CLIENT_SECRET` env,
+/// then this default.
+const ANTIGRAVITY_MASKED_CLIENT_SECRET: &[u8] = &[
+    40, 34, 45, 58, 34, 55, 88, 63, 80, 21, 54, 34, 48, 88, 81, 85, 97, 18, 125, 37, 92, 3, 37, 48,
+    87, 6, 44, 38, 25, 10, 67, 19, 40, 40, 5,
+];
+
+/// Resolve the OAuth client id: `ANTIGRAVITY_OAUTH_CLIENT_ID` env first
+/// (same name the TS registry reads), legacy `ANTIGRAVITY_CLIENT_ID`
+/// second, embedded public default last.
+fn resolve_oauth_client_id() -> String {
+    resolve_public_cred(
+        ANTIGRAVITY_MASKED_CLIENT_ID,
+        &["ANTIGRAVITY_OAUTH_CLIENT_ID", "ANTIGRAVITY_CLIENT_ID"],
+    )
+}
+
+/// Resolve the OAuth client secret: `ANTIGRAVITY_OAUTH_CLIENT_SECRET`
+/// env first, legacy `ANTIGRAVITY_CLIENT_SECRET` second, embedded public
+/// default last.
+fn resolve_oauth_client_secret() -> String {
+    resolve_public_cred(
+        ANTIGRAVITY_MASKED_CLIENT_SECRET,
+        &[
+            "ANTIGRAVITY_OAUTH_CLIENT_SECRET",
+            "ANTIGRAVITY_CLIENT_SECRET",
+        ],
+    )
+}
 
 // ─── Token Mint ─────────────────────────────────────────────────────────────
 
@@ -86,8 +130,8 @@ impl Default for AntigravityTokenMint {
 impl AntigravityTokenMint {
     pub fn new() -> Self {
         Self {
-            client_id: env_or_empty("ANTIGRAVITY_CLIENT_ID"),
-            client_secret: env_or_empty("ANTIGRAVITY_CLIENT_SECRET"),
+            client_id: resolve_oauth_client_id(),
+            client_secret: resolve_oauth_client_secret(),
             client: Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -122,7 +166,7 @@ impl AntigravityTokenMint {
         // with an opaque upstream 400.
         if self.client_id.trim().is_empty() || self.client_secret.trim().is_empty() {
             return Err(BridgeError::InvalidUpstreamCredentials(
-                "ANTIGRAVITY_CLIENT_ID/SECRET not configured".into(),
+                "ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET not configured".into(),
             ));
         }
 
@@ -138,6 +182,18 @@ impl AntigravityTokenMint {
         let resp = self
             .client
             .post(GOOGLE_OAUTH_TOKEN_URL)
+            // Token-refresh face identity (`antigravity.ts:860-876`):
+            // JSON accept plus the ide-node UA. The `X-Goog-Api-Client`
+            // gl-node value belongs to this same ide-node face only —
+            // it must never be sent on content requests.
+            .header(header::ACCEPT, "application/json")
+            .header(
+                header::USER_AGENT,
+                format!(
+                    "antigravity/{ANTIGRAVITY_IDE_VERSION} darwin/arm64 \
+                     {ANTIGRAVITY_IDE_NODE_API_CLIENT}"
+                ),
+            )
             .form(&params)
             .send()
             .await
@@ -159,7 +215,10 @@ impl AntigravityTokenMint {
             }
             return Err(BridgeError::upstream_status(
                 status.as_u16(),
-                format!("antigravity token refresh rejected ({status}): {body}"),
+                format!(
+                    "antigravity token refresh rejected ({status}): {}",
+                    truncate_lossy(&body, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+                ),
             ));
         }
 
@@ -191,7 +250,7 @@ struct AntigravityEnvelope<'a> {
     #[serde(rename = "userAgent")]
     user_agent: &'static str,
     #[serde(rename = "requestType")]
-    request_type: &'static str,
+    request_type: &'a str,
     #[serde(rename = "requestId")]
     request_id: String,
     request: AntigravityRequest,
@@ -204,6 +263,10 @@ struct AntigravityRequest {
     system_instruction: Option<AntigravitySystemInstruction>,
     #[serde(rename = "generationConfig")]
     generation_config: AntigravityGenConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AntigravityTool>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    tool_config: Option<AntigravityToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "sessionId")]
     session_id: Option<String>,
 }
@@ -211,7 +274,33 @@ struct AntigravityRequest {
 #[derive(Serialize)]
 struct AntigravityContent {
     role: &'static str,
-    parts: Vec<AntigravityPart>,
+    parts: Vec<AntigravityRequestPart>,
+}
+
+/// Request-side content part: plain text or a replayed function call.
+/// History never carries `thought`/`thoughtSignature` parts — the
+/// single-turn projection has no signature store, and Cloud Code drops
+/// signature-less `thoughtSignature` echoes anyway
+/// (`antigravity.ts:748-810` filter), so replayed reasoning is
+/// intentionally not forwarded (see `convert_chat_format`).
+#[derive(Serialize)]
+struct AntigravityRequestPart {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "functionCall")]
+    function_call: Option<AntigravityFunctionCallBody>,
+}
+
+/// Native function call as Cloud Code expects it on the wire. No
+/// `thoughtSignature`: the executor's history filter keeps
+/// signature-less `functionCall` parts (only `thought`/`thoughtSignature`
+/// echoes are stripped), and the translator's Cloud Code path runs with
+/// signature bypass (`supportsSignatureBypass`), so replayed calls from
+/// the gateway's `extra["tool_calls"]` slot dispatch without one.
+#[derive(Serialize)]
+struct AntigravityFunctionCallBody {
+    name: String,
+    args: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -224,6 +313,45 @@ struct AntigravityPart {
     text: String,
 }
 
+/// One `functionDeclarations` tool entry (`buildGeminiTools` in
+/// `geminiToolsSanitizer.ts`: OpenAI `{type:"function",
+/// function:{…}}`, bare `{name,…}` and pre-shaped
+/// `{functionDeclarations:[…]}` inputs all fold into this).
+#[derive(Serialize)]
+struct AntigravityTool {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<AntigravityFunctionDeclaration>,
+}
+
+#[derive(Serialize)]
+struct AntigravityFunctionDeclaration {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<serde_json::Value>,
+}
+
+/// `toolConfig` (`antigravity.ts:795-798` + `convertOpenAIToolChoiceToGemini`
+/// in `openai-to-gemini.ts`): `VALIDATED` by default (a call may happen
+/// or plain text may answer, but any call is schema-validated),
+/// `ANY` for `tool_choice: "required"`, `NONE` for `"none"`.
+#[derive(Serialize)]
+struct AntigravityToolConfig {
+    #[serde(rename = "functionCallingConfig")]
+    function_calling_config: AntigravityFunctionCallingConfig,
+}
+
+#[derive(Serialize)]
+struct AntigravityFunctionCallingConfig {
+    mode: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "allowedFunctionNames"
+    )]
+    allowed_function_names: Option<Vec<String>>,
+}
+
 #[derive(Serialize)]
 struct AntigravityGenConfig {
     #[serde(rename = "topK")]
@@ -232,37 +360,83 @@ struct AntigravityGenConfig {
     top_p: f32,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<AntigravityThinkingConfig>,
 }
 
-/// 429 Shield: Sanitizes text against Google's anti-Claude heuristic filter.
-/// Google Cloud Code triggers HTTP 429 RESOURCE_EXHAUSTED when system prompt
-/// contains specific competitor assistant declarations.
-/// Mirrors `COMPETITIVE_AGENT_PROMPT_PATTERNS` in
-/// `omniroute/open-sse/executors/antigravity.ts:367-372`: case-insensitive,
-/// word-boundaried, same four phrases.
-fn agent_identity_re() -> &'static Regex {
+#[derive(Serialize)]
+struct AntigravityThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    thinking_budget: u32,
+}
+
+/// Conservative ceiling for `maxOutputTokens`. The etalon resolves a
+/// per-model cap from its catalogue (fallback 16384); the gateway has no
+/// model catalogue, so the shared declared ceiling most Antigravity
+/// models publish (65535) is the clamp. Oversized Copilot-style values
+/// above it would 400 upstream (`antigravityOutputCap.ts`).
+const ANTIGRAVITY_MAX_OUTPUT_TOKENS: u32 = 65535;
+
+fn build_generation_config(req: &ChatFormat) -> AntigravityGenConfig {
+    // Thinking budget the caller attached via `extra` (the unified
+    // thinking adapter's body-root `thinking_budget` shape). `None`
+    // means non-thinking: no `thinkingConfig` is emitted at all.
+    let thinking_budget: Option<u32> = req
+        .extra
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|b| u32::try_from(b).ok())
+        .filter(|b| *b > 0);
+    let mut max_output_tokens = req.max_tokens.unwrap_or(ANTIGRAVITY_MAX_OUTPUT_TOKENS);
+    // `applyAntigravityGenerationDefaults`: the thinking budget must fit
+    // inside the output window, so a max at or under the budget is
+    // bumped past it.
+    if let Some(budget) = thinking_budget {
+        if max_output_tokens <= budget {
+            max_output_tokens = budget.saturating_add(1);
+        }
+    }
+    max_output_tokens = max_output_tokens.min(ANTIGRAVITY_MAX_OUTPUT_TOKENS);
+    AntigravityGenConfig {
+        top_k: 40,
+        top_p: 1.0,
+        max_output_tokens,
+        temperature: req.temperature,
+        thinking_config: thinking_budget
+            .map(|thinking_budget| AntigravityThinkingConfig { thinking_budget }),
+    }
+}
+
+/// 429 Shield: strips competitor-assistant identity sentences from the
+/// system instruction ONLY (`stripCompetitiveAgentPrompts` in
+/// `antigravity.ts:367-400`). Same four case-insensitive word-boundaried
+/// phrases, same sentence-strip (`\bphrase\b[^\n]*` eats the rest of the
+/// line), same blank-line collapse. User/assistant/tool texts are never
+/// touched — sanitizing them would corrupt quoted code and replayed
+/// transcripts.
+fn agent_identity_patterns() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"(?i)\b(you are a claude agent|you are claude code|you are an ai assistant created by anthropic)\b",
+            r"(?i)\b(you are a claude agent|built on anthropic's claude agent sdk|you are claude code|you are an ai assistant created by anthropic)\b[^\n]*",
         )
         .expect("agent identity sanitize regex must compile")
     })
 }
 
-fn agent_sdk_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\bbuilt on anthropic's claude agent sdk\b")
-            .expect("agent SDK sanitize regex must compile")
-    })
-}
-
-fn sanitize_prompt_text(text: &str) -> String {
-    let replaced = agent_identity_re().replace_all(text, "AI Assistant");
-    agent_sdk_re()
-        .replace_all(&replaced, "built on standard SDK")
-        .into_owned()
+fn sanitize_system_text(text: &str) -> String {
+    static COLLAPSE_RE: OnceLock<Regex> = OnceLock::new();
+    let collapse = COLLAPSE_RE
+        .get_or_init(|| Regex::new(r"\n{3,}").expect("newline collapse regex must compile"));
+    let stripped = agent_identity_patterns().replace_all(text, "");
+    // Collapse the blank lines the strip leaves behind, same as the
+    // etalon (`.replace(/\n{3,}/g, "\n\n").trimStart()` per pattern).
+    collapse
+        .replace_all(&stripped, "\n\n")
+        .trim_start()
+        .to_string()
 }
 
 // ─── Request identity (`antigravityIdentity.ts`) ──────────────────────────
@@ -349,61 +523,326 @@ fn convert_chat_format<'a>(
     req: &'a ChatFormat,
     model_name: &'a str,
     credential: &str,
+    project: &'a str,
 ) -> AntigravityEnvelope<'a> {
-    let mut contents = Vec::new();
+    // History normalization, mirroring the executor's content fix-ups
+    // (`antigravity.ts:748-810`):
+    // - tool results (`functionResponse`) travel as `user` turns;
+    // - empty texts are dropped, never emitted as empty parts;
+    // - adjacent same-role turns merge into one `contents` entry;
+    // - replayed reasoning (`thought`/`thoughtSignature`) is stripped:
+    //   the projection never fabricates those parts, and only the
+    //   response path surfaces `thought` as `reasoning_content`;
+    // - a trailing `model` turn is stripped (Cloud Code 400s on
+    //   "Requests ending with a model turn"), keeping at least one
+    //   entry (`stripTrailingAntigravityAssistantTurn` guard).
+    let mut contents: Vec<AntigravityContent> = Vec::new();
+    let mut push_parts = |role: &'static str, parts: Vec<AntigravityRequestPart>| {
+        if parts.is_empty() {
+            return;
+        }
+        if let Some(last) = contents.last_mut() {
+            if last.role == role {
+                last.parts.extend(parts);
+                return;
+            }
+        }
+        contents.push(AntigravityContent { role, parts });
+    };
     let mut system_text = String::new();
 
     for m in &req.messages {
         if m.is_reasoning_only() {
             continue;
         }
-        let text = sanitize_prompt_text(m.content_str());
         match m.role {
             Role::System | Role::Developer => {
+                let text = m.content_str().trim();
+                if text.is_empty() {
+                    continue;
+                }
                 if !system_text.is_empty() {
                     system_text.push_str("\n\n");
                 }
-                system_text.push_str(&text);
+                system_text.push_str(text);
             }
             Role::User | Role::Tool => {
-                contents.push(AntigravityContent {
-                    role: "user",
-                    parts: vec![AntigravityPart { text }],
-                });
+                // `functionResponse` → `user` role (same mapping as the
+                // executor's `role = "user"` override). Tool results
+                // arrive as text: without a stored thought-signature
+                // namespace the gateway cannot echo native
+                // `functionResponse` parts the upstream would accept,
+                // so they fold to text — the etalon's signatureless
+                // "text" fallback for unmatched responses.
+                let text = m.content_str().trim();
+                if text.is_empty() {
+                    continue;
+                }
+                push_parts(
+                    "user",
+                    vec![AntigravityRequestPart {
+                        text: Some(text.to_string()),
+                        function_call: None,
+                    }],
+                );
             }
             Role::Assistant => {
-                contents.push(AntigravityContent {
-                    role: "model",
-                    parts: vec![AntigravityPart { text }],
-                });
+                let mut parts = Vec::new();
+                let text = m.content_str().trim();
+                if !text.is_empty() {
+                    parts.push(AntigravityRequestPart {
+                        text: Some(text.to_string()),
+                        function_call: None,
+                    });
+                }
+                // Replay the previous turn's tool calls as native
+                // `functionCall` parts (response path stores them in
+                // `extra["tool_calls"]` in OpenAI shape). Cloud Code
+                // tolerates signature-less `functionCall` history on
+                // this face (signature bypass), so no
+                // `thoughtSignature` is fabricated.
+                if let Some(calls) = m.extra.get("tool_calls").and_then(|v| v.as_array()) {
+                    for call in calls {
+                        let function = if call.get("function").is_some() {
+                            call.get("function")
+                        } else {
+                            Some(call)
+                        };
+                        let Some(name) = function
+                            .and_then(|f| f.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|n| !n.is_empty())
+                        else {
+                            continue;
+                        };
+                        let args = function
+                            .and_then(|f| f.get("arguments"))
+                            .map(|a| match a {
+                                serde_json::Value::String(s) => serde_json::from_str(s)
+                                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                                other => other.clone(),
+                            })
+                            .unwrap_or(serde_json::Value::Object(Default::default()));
+                        parts.push(AntigravityRequestPart {
+                            text: None,
+                            function_call: Some(AntigravityFunctionCallBody {
+                                name: name.to_string(),
+                                args,
+                            }),
+                        });
+                    }
+                }
+                push_parts("model", parts);
             }
         }
     }
+    while contents.len() > 1 && contents.last().is_some_and(|c| c.role == "model") {
+        contents.pop();
+    }
 
-    let system_instruction = if !system_text.is_empty() {
+    // The shield runs on the assembled system instruction only — never
+    // on user/assistant/tool texts.
+    let system_text = sanitize_system_text(&system_text);
+    let system_instruction = if system_text.trim().is_empty() {
+        None
+    } else {
         Some(AntigravitySystemInstruction {
             parts: vec![AntigravityPart { text: system_text }],
         })
-    } else {
-        None
+    };
+
+    let (tools, tool_config) = build_function_tools(req);
+
+    // Image models ride the same envelope with `requestType:
+    // "image_gen"` (the translator sets body-root `requestType`; the
+    // gateway reads the same key from `extra`). Anything else is an
+    // agent turn.
+    let request_type = match req
+        .extra
+        .get("requestType")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("image_gen") => "image_gen",
+        _ => "agent",
     };
 
     AntigravityEnvelope {
-        project: ANTIGRAVITY_DEFAULT_PROJECT,
+        project,
         model: model_name,
         user_agent: "antigravity",
-        request_type: "agent",
+        request_type,
         request_id: generate_request_id(),
         request: AntigravityRequest {
             contents,
             system_instruction,
-            generation_config: AntigravityGenConfig {
-                top_k: 40,
-                top_p: 1.0,
-                max_output_tokens: 65535,
-            },
+            generation_config: build_generation_config(req),
+            tools,
+            tool_config,
             session_id: Some(resolve_session_id(credential)),
         },
+    }
+}
+
+/// Fold `ChatFormat` tools into one `functionDeclarations` entry plus
+/// `toolConfig` (`antigravity.ts:795-798`). Without both, the upstream
+/// never emits `functionCall` parts and function calling is dead.
+/// Returns `(None, None)` when the caller sent no tools.
+fn build_function_tools(
+    req: &ChatFormat,
+) -> (Option<Vec<AntigravityTool>>, Option<AntigravityToolConfig>) {
+    let mut declarations: Vec<AntigravityFunctionDeclaration> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let push_declaration = |raw_name: &str,
+                            description: Option<&serde_json::Value>,
+                            parameters: Option<&serde_json::Value>,
+                            declarations: &mut Vec<AntigravityFunctionDeclaration>,
+                            seen: &mut HashSet<String>| {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let name = sanitize_function_name(name);
+        // Duplicate declaration names make Cloud Code 400 the
+        // request; first one wins (fail-closed, mirrors the
+        // etalon's `seenToolNames` guard).
+        if !seen.insert(name.clone()) {
+            return;
+        }
+        declarations.push(AntigravityFunctionDeclaration {
+            name,
+            description: description
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            parameters: parameters.cloned(),
+        });
+    };
+    if let Some(tools) = req.extra.get("tools").and_then(|v| v.as_array()) {
+        for raw in tools {
+            // Pre-shaped Gemini entry.
+            if let Some(fns) = raw.get("functionDeclarations").and_then(|v| v.as_array()) {
+                for f in fns {
+                    push_declaration(
+                        f.get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        f.get("description"),
+                        f.get("parameters"),
+                        &mut declarations,
+                        &mut seen,
+                    );
+                }
+                continue;
+            }
+            // Bare `{name, description, parameters|input_schema}`.
+            if let Some(name) = raw.get("name").and_then(serde_json::Value::as_str) {
+                push_declaration(
+                    name,
+                    raw.get("description"),
+                    raw.get("parameters").or_else(|| raw.get("input_schema")),
+                    &mut declarations,
+                    &mut seen,
+                );
+                continue;
+            }
+            // OpenAI `{type:"function", function:{name,…}}`.
+            if let Some(function) = raw.get("function") {
+                push_declaration(
+                    function
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or(""),
+                    function.get("description"),
+                    function.get("parameters"),
+                    &mut declarations,
+                    &mut seen,
+                );
+            }
+        }
+    }
+    if declarations.is_empty() {
+        return (None, None);
+    }
+    let tool_config = AntigravityToolConfig {
+        function_calling_config: function_calling_config(req),
+    };
+    (
+        Some(vec![AntigravityTool {
+            function_declarations: declarations,
+        }]),
+        Some(tool_config),
+    )
+}
+
+/// Simplified port of `sanitizeGeminiToolName`
+/// (`geminiToolsSanitizer.ts`): Gemini identifiers match
+/// `^[A-Za-z_][A-Za-z0-9_.-]*$` (64 chars). The TS side hashes on
+/// collision; collisions are instead dropped by the caller, so this
+/// only normalizes the charset here and never returns empty.
+fn sanitize_function_name(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        return "tool".to_string();
+    }
+    if !(out.as_bytes()[0].is_ascii_alphabetic() || out.as_bytes()[0] == b'_') {
+        out.insert(0, '_');
+    }
+    out.truncate(64);
+    out
+}
+
+/// `convertOpenAIToolChoiceToGemini` (`openai-to-gemini.ts`): the mode
+/// for this request's `toolConfig`. `VALIDATED` stays the default for
+/// "auto"/unset so existing callers see no behavior change.
+fn function_calling_config(req: &ChatFormat) -> AntigravityFunctionCallingConfig {
+    let (mode, allowed_function_names) = match req.extra.get("tool_choice") {
+        None | Some(serde_json::Value::Null) => ("VALIDATED", None),
+        Some(serde_json::Value::String(s)) => match s.as_str() {
+            "none" => ("NONE", None),
+            "required" | "any" => ("ANY", None),
+            _ => ("VALIDATED", None),
+        },
+        Some(serde_json::Value::Object(o)) => {
+            match o.get("type").and_then(serde_json::Value::as_str) {
+                Some("none") => ("NONE", None),
+                Some("required") | Some("any") => ("ANY", None),
+                Some("function") => match o
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    Some(name) => ("ANY", Some(vec![sanitize_function_name(name)])),
+                    None => ("VALIDATED", None),
+                },
+                _ => ("VALIDATED", None),
+            }
+        }
+        _ => ("VALIDATED", None),
+    };
+    AntigravityFunctionCallingConfig {
+        mode: mode.to_string(),
+        allowed_function_names,
+    }
+}
+
+/// Project for the envelope: per-key `ProviderKey.project` wins when
+/// set; otherwise the shared default. Trims the stored value so a
+/// whitespace-only override falls back instead of 400ing upstream.
+fn resolve_project(key: &aisix_core::ProviderKey) -> &str {
+    match key.project.as_deref() {
+        Some(p) if !p.trim().is_empty() => p.trim(),
+        _ => ANTIGRAVITY_DEFAULT_PROJECT,
     }
 }
 
@@ -553,10 +992,11 @@ impl AntigravityBridge {
             ))
             .map_err(|_| BridgeError::Config("invalid antigravity user-agent".into()))?,
         );
-        headers.insert(
-            HeaderName::from_static("x-goog-api-client"),
-            HeaderValue::from_static(GOOG_API_CLIENT),
-        );
+        // NOTE: no `X-Goog-Api-Client` here by design. The etalon strips
+        // it from content requests (`antigravityClientProfile.ts:24-31`):
+        // the gl-node value belongs to the ide-node face only (token
+        // refresh above), and sending it on content requests breaks the
+        // native IDE fingerprint.
         headers.insert(
             HeaderName::from_static("x-aisix-request-id"),
             HeaderValue::from_str(request_id)
@@ -723,7 +1163,12 @@ impl Bridge for AntigravityBridge {
             .model_name
             .as_deref()
             .unwrap_or(&ctx.model.display_name);
-        let envelope = convert_chat_format(req, upstream_model, credential);
+        let envelope = convert_chat_format(
+            req,
+            upstream_model,
+            credential,
+            resolve_project(&ctx.provider_key),
+        );
         let mut body_value = serde_json::to_value(&envelope).map_err(|e| {
             BridgeError::Config(format!(
                 "failed to serialize antigravity request envelope: {e}"
@@ -736,21 +1181,46 @@ impl Bridge for AntigravityBridge {
             ))
         })?;
 
-        let resp = self
-            .client
-            .post(ANTIGRAVITY_RPC_URL)
-            .headers(headers)
-            .body(body_json)
-            .send()
-            .await
-            .map_err(|e| BridgeError::Transport(format!("antigravity RPC connect error: {e}")))?;
+        // Ordered RPC hosts: the primary plus the `cloudcode-pa`
+        // fallback (`ANTIGRAVITY_RUNTIME_BASE_URLS`). Only a transport
+        // failure moves to the next host — an upstream HTTP rejection
+        // is answered, never replayed elsewhere.
+        let mut resp_opt = None;
+        let mut last_error =
+            BridgeError::Transport("antigravity RPC connect error: no hosts attempted".into());
+        for rpc_url in [ANTIGRAVITY_RPC_URL, ANTIGRAVITY_RPC_FALLBACK_URL] {
+            match self
+                .client
+                .post(rpc_url)
+                .headers(headers.clone())
+                .body(body_json.clone())
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    resp_opt = Some(resp);
+                    break;
+                }
+                Err(e) => {
+                    last_error =
+                        BridgeError::Transport(format!("antigravity RPC connect error: {e}"));
+                }
+            }
+        }
+        let resp = match resp_opt {
+            Some(resp) => resp,
+            None => return Err(last_error),
+        };
 
         let status = resp.status();
         if !status.is_success() {
             let err_body = resp.text().await.unwrap_or_default();
             return Err(BridgeError::upstream_status(
                 status.as_u16(),
-                format!("antigravity upstream error ({status}): {err_body}"),
+                format!(
+                    "antigravity upstream error ({status}): {}",
+                    truncate_lossy(&err_body, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+                ),
             ));
         }
 
@@ -869,6 +1339,18 @@ impl Bridge for AntigravityBridge {
                                                             continue;
                                                         }
                                                     }
+                                                    // `thought` parts surface as `reasoning_content`.
+                                                    // Deliberate, not a mapping gap: the response
+                                                    // fold reports `thoughtsTokenCount` BESIDE
+                                                    // `candidatesTokenCount`
+                                                    // (`sseCollect.ts:147-155`), and the
+                                                    // Responses-face convention the codex/grok
+                                                    // bridges share carries model reasoning in
+                                                    // `reasoning_content`. The request path
+                                                    // never echoes them back — history `thought`/
+                                                    // `thoughtSignature` parts are stripped (see
+                                                    // `AntigravityRequestPart`), so no behavior
+                                                    // changes here.
                                                     let is_thought = part.thought == Some(true);
                                                     if is_thought {
                                                         yield ChatChunk {
@@ -920,45 +1402,264 @@ impl Bridge for AntigravityBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aisix_gateway::decode_public_cred_bytes;
+    use aisix_gateway::ChatMessage;
 
     #[test]
-    fn sanitize_is_case_insensitive_with_word_boundary() {
-        // Mixed register per phrase must still sanitize (old 5x `replace`
-        // was case-sensitive and missed these).
+    fn shield_strips_trigger_sentence_case_insensitively() {
+        // Etalon sentence-strip: the trigger plus the rest of its line
+        // is removed (not replaced with a placeholder).
         for input in [
             "YOU ARE A CLAUDE AGENT, here to help",
             "You Are Claude Code with instructions",
             "yOu ArE aN aI aSsIsTaNt CrEaTeD bY aNtHrOpIc, hello",
             "BUILT ON ANTHROPIC'S CLAUDE AGENT SDK v1",
         ] {
-            let out = sanitize_prompt_text(input);
+            let out = sanitize_system_text(input);
             assert!(
-                !agent_identity_re().is_match(&out) && !agent_sdk_re().is_match(&out),
+                !agent_identity_patterns().is_match(&out),
                 "unsanitized remainder in {out:?} from {input:?}"
             );
         }
         assert_eq!(
-            sanitize_prompt_text("You are a Claude agent, built today"),
-            "AI Assistant, built today"
+            sanitize_system_text("You are a Claude agent, built today"),
+            ""
         );
-        assert_eq!(
-            sanitize_prompt_text("You are Claude Code!"),
-            "AI Assistant!"
+        assert_eq!(sanitize_system_text("You are Claude Code!"), "");
+    }
+
+    #[test]
+    fn shield_keeps_surrounding_instruction_lines() {
+        let out = sanitize_system_text("Be helpful.\nYou are Claude Code, obey.\nStay brief.");
+        assert!(!agent_identity_patterns().is_match(&out));
+        assert!(out.contains("Be helpful."), "got {out:?}");
+        assert!(out.contains("Stay brief."), "got {out:?}");
+    }
+
+    #[test]
+    fn shield_leaves_unrelated_text_untouched() {
+        let plain = "You are a helpful coding assistant. Claude models are great.";
+        assert_eq!(sanitize_system_text(plain), plain);
+    }
+
+    #[test]
+    fn shield_applies_to_system_only_not_user_text() {
+        // A trigger phrase in USER text must survive verbatim: the shield
+        // runs on the assembled system instruction, never on turn texts.
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::system("Be helpful."),
+                ChatMessage::user("You are Claude Code, right?"),
+            ],
         );
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        let user_turn = env
+            .request
+            .contents
+            .iter()
+            .find(|c| c.role == "user")
+            .expect("user turn present");
         assert_eq!(
-            sanitize_prompt_text("You are an AI assistant created by Anthropic."),
-            "AI Assistant."
+            user_turn.parts[0].text.as_deref(),
+            Some("You are Claude Code, right?")
         );
+        let system = env.request.system_instruction.expect("system present");
+        assert_eq!(system.parts[0].text, "Be helpful.");
+    }
+
+    #[test]
+    fn contents_merge_same_role_and_drop_empties() {
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("first"),
+                ChatMessage::user("second"),
+                ChatMessage::user("   "),
+                ChatMessage::assistant("answer"),
+            ],
+        );
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        // Adjacent user turns merged; the blank one dropped; the trailing
+        // assistant turn stripped (Cloud Code 400s on trailing model).
+        assert_eq!(env.request.contents.len(), 1);
+        assert_eq!(env.request.contents[0].role, "user");
+        assert_eq!(env.request.contents[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn trailing_model_turn_stripped_but_never_emptied() {
+        let req = ChatFormat::new(
+            "m",
+            vec![ChatMessage::user("hi"), ChatMessage::assistant("trailing")],
+        );
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        assert_eq!(env.request.contents.len(), 1);
+        assert_eq!(env.request.contents[0].role, "user");
+
+        // A lone model turn is kept: the strip must never empty contents.
+        let solo = ChatFormat::new("m", vec![ChatMessage::assistant("only")]);
+        let env = convert_chat_format(&solo, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        assert_eq!(env.request.contents.len(), 1);
+    }
+
+    #[test]
+    fn tool_results_fold_to_user_and_calls_to_function_call_parts() {
+        let mut assistant = ChatMessage::assistant("");
+        assistant.extra.insert(
+            "tool_calls".to_string(),
+            serde_json::json!([{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "search", "arguments": r#"{"q":"x"}"#},
+            }]),
+        );
+        let req = ChatFormat::new(
+            "m",
+            vec![
+                ChatMessage::user("go"),
+                assistant,
+                ChatMessage::tool("result text"),
+            ],
+        );
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        // Trailing tool turn survives (role user); the empty-text
+        // assistant turn contributes only its functionCall part.
+        assert_eq!(env.request.contents.len(), 3);
+        let model_turn = &env.request.contents[1];
+        assert_eq!(model_turn.role, "model");
+        assert_eq!(model_turn.parts.len(), 1);
+        let call = model_turn.parts[0]
+            .function_call
+            .as_ref()
+            .expect("functionCall part");
+        assert_eq!(call.name, "search");
+        assert_eq!(call.args, serde_json::json!({"q": "x"}));
+        let tool_turn = env.request.contents.last().unwrap();
+        assert_eq!(tool_turn.role, "user");
+        assert_eq!(tool_turn.parts[0].text.as_deref(), Some("result text"));
+    }
+
+    #[test]
+    fn tools_become_function_declarations_with_validated_default() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("go")]);
+        req.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{
+                "type": "function",
+                "function": {
+                    "name": "get-weather!",
+                    "description": "weather",
+                    "parameters": {"type": "object"},
+                },
+            }]),
+        );
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        let tools = env.request.tools.expect("tools present");
+        assert_eq!(tools.len(), 1);
+        // `!` is not a Gemini identifier char: normalized, not dropped.
+        assert_eq!(tools[0].function_declarations[0].name, "get-weather_");
+        let config = env.request.tool_config.expect("toolConfig present");
+        let config_value = serde_json::to_value(&config).unwrap();
         assert_eq!(
-            sanitize_prompt_text("Built on Anthropic's Claude Agent SDK, extended"),
-            "built on standard SDK, extended"
+            config_value["functionCallingConfig"]["mode"],
+            serde_json::json!("VALIDATED")
         );
     }
 
     #[test]
-    fn sanitize_leaves_unrelated_text_untouched() {
-        let plain = "You are a helpful coding assistant. Claude models are great.";
-        assert_eq!(sanitize_prompt_text(plain), plain);
+    fn tool_choice_required_maps_to_any() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("go")]);
+        req.extra.insert(
+            "tools".to_string(),
+            serde_json::json!([{"type": "function", "function": {"name": "f"}}]),
+        );
+        req.extra
+            .insert("tool_choice".to_string(), serde_json::json!("required"));
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        let config_value = serde_json::to_value(&env.request.tool_config.unwrap()).unwrap();
+        assert_eq!(
+            config_value["functionCallingConfig"]["mode"],
+            serde_json::json!("ANY")
+        );
+    }
+
+    #[test]
+    fn no_tools_means_no_tool_config() {
+        let req = ChatFormat::new("m", vec![ChatMessage::user("go")]);
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        assert!(env.request.tools.is_none());
+        assert!(env.request.tool_config.is_none());
+    }
+
+    #[test]
+    fn generation_config_wires_temperature_max_and_thinking() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("go")]);
+        req.temperature = Some(0.5);
+        req.max_tokens = Some(1024);
+        req.extra
+            .insert("thinking_budget".to_string(), serde_json::json!(2048));
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        let config = serde_json::to_value(&env.request.generation_config).unwrap();
+        assert_eq!(config["temperature"], serde_json::json!(0.5));
+        // max (1024) <= budget (2048): bumped past the budget.
+        assert_eq!(config["maxOutputTokens"], serde_json::json!(2049));
+        assert_eq!(
+            config["thinkingConfig"]["thinkingBudget"],
+            serde_json::json!(2048)
+        );
+    }
+
+    #[test]
+    fn generation_config_clamps_oversized_max() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("go")]);
+        req.max_tokens = Some(u32::MAX);
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        let config = serde_json::to_value(&env.request.generation_config).unwrap();
+        assert_eq!(
+            config["maxOutputTokens"],
+            serde_json::json!(ANTIGRAVITY_MAX_OUTPUT_TOKENS)
+        );
+        assert!(config.get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn project_prefers_provider_key_over_default() {
+        let key: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"k","secret":"s"}"#).unwrap();
+        assert_eq!(resolve_project(&key), ANTIGRAVITY_DEFAULT_PROJECT);
+        let key: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"k","secret":"s","project":"custom-proj"}"#)
+                .unwrap();
+        assert_eq!(resolve_project(&key), "custom-proj");
+        let key: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"k","secret":"s","project":"   "}"#).unwrap();
+        assert_eq!(resolve_project(&key), ANTIGRAVITY_DEFAULT_PROJECT);
+    }
+
+    #[test]
+    fn request_type_passes_image_gen_through() {
+        let req = ChatFormat::new("m", vec![ChatMessage::user("draw")]);
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        assert_eq!(env.request_type, "agent");
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("draw")]);
+        req.extra
+            .insert("requestType".to_string(), serde_json::json!("image_gen"));
+        let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
+        assert_eq!(env.request_type, "image_gen");
+    }
+
+    #[test]
+    fn embedded_oauth_defaults_decode_to_plausible_shapes() {
+        // Structural assertions only: the suite must not contain
+        // scanner-matching literals, so values are checked by shape.
+        let id = decode_public_cred_bytes(ANTIGRAVITY_MASKED_CLIENT_ID);
+        assert_eq!(id.len(), ANTIGRAVITY_MASKED_CLIENT_ID.len());
+        assert!(id.chars().all(|c| c.is_ascii_graphic()));
+        assert!(id.starts_with("1071006060591"), "unexpected id shape");
+        let secret = decode_public_cred_bytes(ANTIGRAVITY_MASKED_CLIENT_SECRET);
+        assert_eq!(secret.len(), ANTIGRAVITY_MASKED_CLIENT_SECRET.len());
+        assert!(secret.chars().all(|c| c.is_ascii_graphic()));
     }
 
     #[test]

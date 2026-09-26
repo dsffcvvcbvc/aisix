@@ -36,8 +36,33 @@ pub async fn update_resources(
     let new_snapshot =
         aisix_core::filesource::load_from_str(&body, "admin_api", revision as i64, &env_lookup)
             .map_err(|errs| {
-                let msgs: Vec<String> = errs.errors.into_iter().map(|e| e.to_string()).collect();
-                AdminError::BadRequest(format!("Validation failed: {}", msgs.join("; ")))
+                // Cap the surfaced validation detail: a hostile payload
+                // can produce thousands of errors with unbounded
+                // messages, and this string lands in the admin API
+                // response verbatim.
+                const MAX_VALIDATION_ERRORS: usize = 10;
+                const MAX_ERROR_CHARS: usize = 500;
+                let total = errs.errors.len();
+                let msgs: Vec<String> = errs
+                    .errors
+                    .into_iter()
+                    .take(MAX_VALIDATION_ERRORS)
+                    .map(|e| {
+                        let text = e.to_string();
+                        if text.chars().count() > MAX_ERROR_CHARS {
+                            let truncated: String = text.chars().take(MAX_ERROR_CHARS).collect();
+                            format!("{truncated}…")
+                        } else {
+                            text
+                        }
+                    })
+                    .collect();
+                let suffix = if total > MAX_VALIDATION_ERRORS {
+                    format!("; …and {} more", total - MAX_VALIDATION_ERRORS)
+                } else {
+                    String::new()
+                };
+                AdminError::BadRequest(format!("Validation failed: {}{suffix}", msgs.join("; ")))
             })?;
 
     // Commit via `rcu`, which swaps the whole snapshot atomically: an

@@ -32,6 +32,7 @@ pub mod chat;
 pub mod credential;
 pub mod dns_cache;
 pub mod hub;
+pub mod public_creds;
 pub mod sse;
 pub mod structured_output;
 pub mod upstream_headers;
@@ -51,6 +52,7 @@ pub use chat::{
 };
 pub use credential::credential_fingerprint;
 pub use hub::{upstream_protocol, Hub, UPSTREAM_PROTOCOL_UNKNOWN};
+pub use public_creds::{decode_public_cred_bytes, resolve_public_cred};
 pub use sse::{SseDecoder, SseEvent, SseFrameTooLarge};
 pub use structured_output::{
     apply_schema_limits, close_object_schemas, json_schema_from_response_format,

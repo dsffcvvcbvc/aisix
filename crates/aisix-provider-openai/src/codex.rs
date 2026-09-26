@@ -27,7 +27,8 @@
 //! - Refresh is reactive (on 401, single retry) rather than
 //!   expiry-proactive with account-store persistence — the gateway is
 //!   stateless. `CODEX_OAUTH_CLIENT_ID` env carries the public client
-//!   id (same env name the TS registry reads).
+//!   id (same env name the TS registry reads), with the public CLI
+//!   default embedded below.
 
 use std::time::{Duration, Instant};
 
@@ -61,17 +62,126 @@ pub const CODEX_DEFAULT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 /// OAuth token endpoint (registry `oauth.tokenUrl`).
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-fn codex_user_agent() -> String {
-    format!("codex-cli/{CODEX_CLIENT_VERSION} (Windows 10.0.26200; x64)")
+/// Originator fingerprint the real CLI sends on the inference face
+/// (`codex.ts:1174`, `openai/codex ... DEFAULT_ORIGINATOR`).
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
+/// Public OAuth client id (`codex_id` in open-sse `publicCreds.ts`,
+/// extracted from the public Codex CLI; a PKCE native-app value, public
+/// by design). Short `app_…` shape — matches no secret-scanner pattern,
+/// so it lives as a plain literal rather than masked bytes.
+const CODEX_EMBEDDED_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+/// Resolve the OAuth client id: `CODEX_OAUTH_CLIENT_ID` env (same name
+/// the TS registry reads) wins when set, otherwise the embedded public
+/// default. Never empty, so the mint's fail-closed error below is
+/// unreachable in practice — it stays as the guard.
+fn resolve_oauth_client_id() -> String {
+    let from_env = aisix_gateway::resolve_public_cred(&[], &["CODEX_OAUTH_CLIENT_ID"]);
+    if from_env.is_empty() {
+        CODEX_EMBEDDED_CLIENT_ID.to_string()
+    } else {
+        from_env
+    }
 }
 
-/// `getCodexDefaultHeaders` (`codexClient.ts:99-105`) + Bearer auth.
-fn codex_headers(token: &str, sse: bool) -> Result<HeaderMap, BridgeError> {
+/// A caller-supplied Codex version is `x.y.z` digits only — anything
+/// else is not forwarded upstream.
+fn is_version_token(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Extract the Codex client version the CALLER reported, so it is
+/// forwarded upstream instead of a pinned default going stale
+/// (`getCodexClientVersionFromHeaders`, `codexClient.ts:53-96`): the
+/// backend gates newer models on the client version, and a pinned
+/// default silently rots every time the user upgrades their CLI. The
+/// `version` header wins; otherwise the `codex…/x.y.z` token inside the
+/// caller's `User-Agent`. Returns `None` when the caller sent nothing
+/// usable — callers fall back to [`CODEX_CLIENT_VERSION`].
+fn caller_codex_version(client_headers: Option<&http::HeaderMap>) -> Option<String> {
+    let headers = client_headers?;
+    let pick = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(version) = pick("version") {
+        if is_version_token(version) {
+            return Some(version.to_string());
+        }
+    }
+    let ua = pick("user-agent")?;
+    version_in_codex_user_agent(&ua)
+}
+
+/// Find the first `codex…/x.y.z` token in a User-Agent value
+/// (`CODEX_CLIENT_VERSION_IN_UA_PATTERN`: `codex[-_]<id>` or
+/// `codex-cli`, case-insensitive).
+fn version_in_codex_user_agent(user_agent: &str) -> Option<String> {
+    let lower = user_agent.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(offset) = lower[search_from..].find("codex") {
+        let mut rest = &lower[search_from + offset + "codex".len()..];
+        // Optional `[-_][A-Za-z0-9_]*` suffix (`codex_cli_rs`,
+        // `codex-exec`, …) before the `/x.y.z`.
+        if let Some(stripped) = rest.strip_prefix('-').or_else(|| rest.strip_prefix('_')) {
+            let end = stripped
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(stripped.len());
+            rest = &stripped[end..];
+        }
+        if let Some(version) = rest.strip_prefix('/').and_then(parse_version_token) {
+            return Some(version);
+        }
+        search_from += offset + "codex".len();
+    }
+    None
+}
+
+/// Parse a leading `x.y.z` token, returning it when the shape is exact.
+fn parse_version_token(rest: &str) -> Option<String> {
+    let mut parts = Vec::with_capacity(3);
+    let mut remaining = rest;
+    for _ in 0..3 {
+        let end = remaining
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(remaining.len());
+        if end == 0 {
+            return None;
+        }
+        parts.push(&remaining[..end]);
+        remaining = &remaining[end..];
+        if parts.len() < 3 {
+            if !remaining.starts_with('.') {
+                return None;
+            }
+            remaining = &remaining[1..];
+        }
+    }
+    Some(parts.join("."))
+}
+
+fn codex_user_agent(client_version: &str) -> String {
+    format!("codex-cli/{client_version} (Windows 10.0.26200; x64)")
+}
+
+/// `getCodexDefaultHeaders` (`codexClient.ts:99-105`) + Bearer auth +
+/// the `originator` CLI fingerprint the backend expects on the
+/// inference face.
+fn codex_headers(token: &str, sse: bool, client_version: &str) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     let pairs: &[(&str, String)] = &[
-        ("version", CODEX_CLIENT_VERSION.to_string()),
+        ("version", client_version.to_string()),
         ("openai-beta", CODEX_OPENAI_BETA.to_string()),
-        ("user-agent", codex_user_agent()),
+        ("originator", CODEX_ORIGINATOR.to_string()),
+        ("user-agent", codex_user_agent(client_version)),
         (
             "accept",
             (if sse {
@@ -138,7 +248,13 @@ async fn exchange_refresh_token(
         }
         return Err(BridgeError::upstream_status(
             status.as_u16(),
-            format!("codex token refresh rejected ({status}): {text}"),
+            format!(
+                "codex token refresh rejected ({status}): {}",
+                aisix_gateway::truncate_lossy(
+                    &text,
+                    aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES
+                )
+            ),
         ));
     }
     let tokens: Value = serde_json::from_slice(&raw).map_err(|e| {
@@ -191,14 +307,12 @@ impl CodexTokenMint {
                 }
             }
         }
-        let client_id = std::env::var("CODEX_OAUTH_CLIENT_ID")
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| {
-                BridgeError::InvalidUpstreamCredentials(
-                    "codex OAuth client id is not configured (CODEX_OAUTH_CLIENT_ID); re-authenticate the account".into(),
-                )
-            })?;
+        let client_id = resolve_oauth_client_id();
+        if client_id.trim().is_empty() {
+            return Err(BridgeError::InvalidUpstreamCredentials(
+                "codex OAuth client id is not configured (CODEX_OAUTH_CLIENT_ID); re-authenticate the account".into(),
+            ));
+        }
         // No guard held across the network round-trip: exchange first,
         // then re-acquire + re-check before inserting.
         let (access, refresh, expires_in) = exchange_refresh_token(
@@ -278,7 +392,11 @@ impl CodexBridge {
         sse: bool,
         hdr: &UpstreamHeaderContext<'_>,
     ) -> Result<HeaderMap, BridgeError> {
-        let mut headers = codex_headers(token, sse)?;
+        // Forward the caller's own Codex version when it sent one
+        // (M20); the pinned default is only the fallback.
+        let default_version = CODEX_CLIENT_VERSION.to_string();
+        let client_version = caller_codex_version(hdr.client_headers).unwrap_or(default_version);
+        let mut headers = codex_headers(token, sse, &client_version)?;
         headers.insert(
             HeaderName::from_static("x-aisix-request-id"),
             HeaderValue::from_str(request_id).map_err(|e| {
@@ -481,14 +599,62 @@ mod tests {
 
     #[test]
     fn default_headers_match_codex_client() {
-        let headers = codex_headers("tok", true).unwrap();
+        let headers = codex_headers("tok", true, CODEX_CLIENT_VERSION).unwrap();
         assert_eq!(headers["version"], CODEX_CLIENT_VERSION);
         assert_eq!(headers["openai-beta"], CODEX_OPENAI_BETA);
+        assert_eq!(headers["originator"], "codex_cli_rs");
         assert_eq!(
             headers["user-agent"],
             format!("codex-cli/{CODEX_CLIENT_VERSION} (Windows 10.0.26200; x64)").as_str()
         );
         assert_eq!(headers["authorization"], "Bearer tok");
+    }
+
+    #[test]
+    fn caller_version_forwards_version_header_first() {
+        use http::HeaderValue;
+        let mut headers = http::HeaderMap::new();
+        headers.insert("version", HeaderValue::from_static("0.200.0"));
+        headers.insert(
+            "user-agent",
+            HeaderValue::from_static("codex_cli_rs/0.154.0 (Mac OS 26.6.2; arm64)"),
+        );
+        assert_eq!(
+            caller_codex_version(Some(&headers)).as_deref(),
+            Some("0.200.0")
+        );
+    }
+
+    #[test]
+    fn caller_version_parses_codex_user_agent_variants() {
+        use http::HeaderValue;
+        for (ua, expected) in [
+            (
+                "codex_cli_rs/0.154.0 (Mac OS 26.6.2; arm64)",
+                Some("0.154.0"),
+            ),
+            (
+                "codex_exec/0.154.0 (Mac OS 26.6.2; arm64) xterm-256color (codex_exec; 0.154.0)",
+                Some("0.154.0"),
+            ),
+            ("codex-cli/1.2.3 (Windows 10.0.26200; x64)", Some("1.2.3")),
+            ("Mozilla/5.0", None),
+            ("codex_cli_rs/not-a-version (x)", None),
+        ] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert("user-agent", HeaderValue::from_str(ua).unwrap());
+            assert_eq!(
+                caller_codex_version(Some(&headers)).as_deref(),
+                expected,
+                "ua={ua}"
+            );
+        }
+        assert_eq!(caller_codex_version(None), None);
+    }
+
+    #[test]
+    fn oauth_client_id_embeds_public_default() {
+        assert!(!resolve_oauth_client_id().is_empty());
     }
 
     #[test]

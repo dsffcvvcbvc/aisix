@@ -20,9 +20,10 @@
 //!
 //! Credential routing inside `ProviderKey.api_key` (one secret, three
 //! shapes — mirrors `AntigravityTokenMint::get_token`):
-//! - `sk_…` / `sk-…` → BYOK key, sent verbatim (ClinePass only; the
-//!   `cline` vendor rejects it upstream, exactly as the TS executor
-//!   would after sending `workos:sk_…` — here it fails loudly instead).
+//! - `sk_…` / `sk-…` → BYOK key, sent verbatim on the `clinepass`
+//!   vendor only; the `cline` vendor always prefixes `workos:` and lets
+//!   the upstream reject it, exactly as the TS executor does after
+//!   sending `workos:sk_…`.
 //! - `workos:…` → OAuth access token, sent verbatim.
 //! - anything else → OAuth refresh token, exchanged via the mint below
 //!   (cached in-process with a 300s expiry margin). Operators holding
@@ -52,9 +53,40 @@ use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{build_request, messages_from, DeveloperRoleMode};
 
 /// Cline client identity version sent as `User-Agent: Cline/<ver>`,
-/// `X-CLIENT-VERSION` and `X-CORE-VERSION` (the TS side sends the app
-/// version; here the bridge crate's own version plays that role).
-const CLINE_CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// `X-CLIENT-VERSION` and `X-CORE-VERSION`: the gateway's own build
+/// version plays the TS side's app-version role (the workspace crate
+/// version is a placeholder `0.0.0` and is never reported — see
+/// `aisix_core::version`).
+fn cline_client_version() -> String {
+    aisix_core::BUILD_VERSION.clone()
+}
+
+/// Node-style platform token (`applyClineProtocolHeaders` reads
+/// `process.platform`: `darwin` / `linux` / `win32`). Rust's
+/// `std::env::consts::OS` says `macos` / `windows` instead — map them,
+/// never emit the literal `"unknown"`.
+fn cline_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "windows" => "win32",
+        _ => std::env::consts::OS,
+    }
+}
+
+/// Inbound `X-Task-ID` passthrough (`resolveClineTaskId`): task identity
+/// may only come from the request context, is validated like the
+/// etalon's `cleanHeaderValue` (trimmed, ≤256 chars, no CR/LF/NUL), and
+/// is never invented at the proxy layer.
+fn inbound_task_id(client_headers: Option<&HeaderMap>) -> Option<String> {
+    let value = client_headers?
+        .get("x-task-id")
+        .and_then(|v| v.to_str().ok())?;
+    let cleaned = value.trim();
+    if cleaned.is_empty() || cleaned.len() > 256 || cleaned.contains(['\r', '\n', '\0']) {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
 
 /// Canonical Cline chat-completions base. An explicit
 /// `ProviderKey.api_base` still wins (corporate proxy convention).
@@ -151,7 +183,13 @@ async fn exchange_refresh_token(
         }
         return Err(BridgeError::upstream_status(
             status.as_u16(),
-            format!("cline token refresh rejected ({status}): {text}"),
+            format!(
+                "cline token refresh rejected ({status}): {}",
+                aisix_gateway::truncate_lossy(
+                    &text,
+                    aisix_gateway::MAX_UPSTREAM_ERROR_MESSAGE_BYTES
+                )
+            ),
         ));
     }
     let payload: ClineRefreshPayload = serde_json::from_slice(&raw).map_err(|e| {
@@ -226,16 +264,16 @@ impl ClinepassTokenMint {
         }
     }
 
-    /// Resolve `credential` to `(authorization_value, was_byok)`.
+    /// Resolve an OAuth `credential` (refresh token or `workos:` access
+    /// token) to `(authorization_value, was_byok=false)`. BYOK routing
+    /// lives one level up in `ClinepassCore::resolve_authorization`,
+    /// which is vendor-aware; the mint only ever sees OAuth shapes.
     pub async fn get_authorization(&self, credential: &str) -> Result<(String, bool), BridgeError> {
         let credential = credential.trim();
         if credential.is_empty() {
             return Err(BridgeError::InvalidUpstreamCredentials(
                 "cline provider_key.api_key is empty".into(),
             ));
-        }
-        if is_byok_key(credential) {
-            return Ok((format!("Bearer {credential}"), true));
         }
         if credential.starts_with("workos:") {
             return Ok((format!("Bearer {credential}"), false));
@@ -289,8 +327,9 @@ fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
 /// header would ship a request the upstream no longer fingerprints as
 /// Cline, with nothing in the logs. The set therefore returns `Result`
 /// rather than skipping what it cannot encode.
-fn cline_protocol_headers() -> Result<HeaderMap, BridgeError> {
+fn cline_protocol_headers(client_headers: Option<&HeaderMap>) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
+    let client_version = cline_client_version();
     let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
         let n = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
             BridgeError::Config(format!(
@@ -314,22 +353,20 @@ fn cline_protocol_headers() -> Result<HeaderMap, BridgeError> {
     set(
         &mut headers,
         "user-agent",
-        format!("Cline/{CLINE_CLIENT_VERSION}"),
+        format!("Cline/{client_version}"),
     )?;
     set(&mut headers, "x-is-multiroot", "false".to_string())?;
     set(&mut headers, "x-client-type", "omniroute".to_string())?;
-    set(
-        &mut headers,
-        "x-client-version",
-        CLINE_CLIENT_VERSION.to_string(),
-    )?;
-    set(&mut headers, "x-platform", std::env::consts::OS.to_string())?;
-    set(&mut headers, "x-platform-version", "unknown".to_string())?;
-    set(
-        &mut headers,
-        "x-core-version",
-        CLINE_CLIENT_VERSION.to_string(),
-    )?;
+    set(&mut headers, "x-client-version", client_version.clone())?;
+    set(&mut headers, "x-platform", cline_platform().to_string())?;
+    // The etalon sends the runtime version (`process.version`) here;
+    // the gateway's closest analog is its own build version — never the
+    // literal `"unknown"` the old code sent.
+    set(&mut headers, "x-platform-version", cline_client_version())?;
+    set(&mut headers, "x-core-version", client_version)?;
+    if let Some(task_id) = inbound_task_id(client_headers) {
+        set(&mut headers, "x-task-id", task_id)?;
+    }
     Ok(headers)
 }
 
@@ -338,7 +375,7 @@ fn build_request_headers(
     request_id: &str,
     hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
-    let mut headers = cline_protocol_headers()?;
+    let mut headers = cline_protocol_headers(hdr.client_headers)?;
     headers.insert(
         header::AUTHORIZATION,
         HeaderValue::from_str(authorization).map_err(|_| {
@@ -374,16 +411,42 @@ fn build_request_headers(
 struct ClinepassCore {
     client: Client,
     mint: Arc<ClinepassTokenMint>,
+    /// `true` for the `clinepass` vendor (dual-auth: a `sk_…` BYOK key
+    /// is sent verbatim), `false` for the `cline` vendor (always
+    /// `workos:`-prefixed — `applyClineAuthHeaders(..., isClinepass =
+    /// false)`; a BYOK key there is rejected upstream, exactly as the
+    /// TS executor behaves after sending `workos:sk_…`).
+    allow_byok: bool,
 }
 
 impl ClinepassCore {
-    fn new() -> Self {
+    fn new(allow_byok: bool) -> Self {
         Self {
             client: aisix_gateway::client_builder()
                 .build()
                 .unwrap_or_else(|_| Client::new()),
             mint: Arc::new(ClinepassTokenMint::new()),
+            allow_byok,
         }
+    }
+
+    /// Vendor-aware credential routing into `(authorization_value,
+    /// was_byok)`. BYOK is decided here (see `allow_byok`); everything
+    /// else falls through to the shared OAuth mint.
+    async fn resolve_authorization(&self, credential: &str) -> Result<(String, bool), BridgeError> {
+        let credential = credential.trim();
+        if credential.is_empty() {
+            return Err(BridgeError::InvalidUpstreamCredentials(
+                "cline provider_key.api_key is empty".into(),
+            ));
+        }
+        if is_byok_key(credential) {
+            if self.allow_byok {
+                return Ok((format!("Bearer {credential}"), true));
+            }
+            return Ok((format!("Bearer {}", cline_access_token(credential)), false));
+        }
+        self.mint.get_authorization(credential).await
     }
 
     fn client_for(&self, ctx: &BridgeContext) -> Client {
@@ -460,8 +523,7 @@ impl ClinepassCore {
         // so even a `stream: false` client request goes out streaming
         // and `chat()` accumulates the SSE back into JSON.
         let (authorization, _) = self
-            .mint
-            .get_authorization(&ctx.provider_key.api_key)
+            .resolve_authorization(&ctx.provider_key.api_key)
             .await?;
         let upstream =
             ctx.model.model_name.as_deref().ok_or_else(|| {
@@ -564,7 +626,7 @@ pub struct ClineBridge {
 impl ClinepassBridge {
     pub fn new() -> Self {
         Self {
-            core: ClinepassCore::new(),
+            core: ClinepassCore::new(true),
         }
     }
 }
@@ -578,7 +640,7 @@ impl Default for ClinepassBridge {
 impl ClineBridge {
     pub fn new() -> Self {
         Self {
-            core: ClinepassCore::new(),
+            core: ClinepassCore::new(false),
         }
     }
 }
@@ -646,6 +708,55 @@ impl Bridge for ClineBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_headers_carry_build_version_and_node_platform() {
+        let headers = cline_protocol_headers(None).unwrap();
+        let version = aisix_core::BUILD_VERSION.as_str();
+        assert_eq!(headers["user-agent"], format!("Cline/{version}").as_str());
+        assert_eq!(headers["x-client-version"], version);
+        assert_eq!(headers["x-core-version"], version);
+        // Node-style platform token (`process.platform`), never the
+        // literal "unknown" the old code sent as the version.
+        assert_ne!(headers["x-platform"].to_str().unwrap(), "unknown");
+        assert_eq!(headers["x-platform-version"], version);
+        assert!(!headers.contains_key("x-task-id"));
+    }
+
+    #[test]
+    fn task_id_forwards_only_when_valid() {
+        use http::HeaderValue;
+        let valid = {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-task-id", HeaderValue::from_static("task-123"));
+            cline_protocol_headers(Some(&headers)).unwrap()
+        };
+        assert_eq!(valid["x-task-id"], "task-123");
+
+        for bad in ["   ", "x".repeat(257).as_str()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-task-id", HeaderValue::from_str(bad).unwrap());
+            assert!(
+                !cline_protocol_headers(Some(&headers))
+                    .unwrap()
+                    .contains_key("x-task-id"),
+                "bad task id must not forward: {bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cline_vendor_prefixes_byok_while_clinepass_sends_verbatim() {
+        let pass = ClinepassCore::new(true);
+        let (auth, was_byok) = pass.resolve_authorization("sk_test123").await.unwrap();
+        assert_eq!(auth, "Bearer sk_test123");
+        assert!(was_byok);
+
+        let cline = ClinepassCore::new(false);
+        let (auth, was_byok) = cline.resolve_authorization("sk_test123").await.unwrap();
+        assert_eq!(auth, "Bearer workos:sk_test123");
+        assert!(!was_byok);
+    }
 
     #[test]
     fn access_token_prefixing_is_idempotent() {
