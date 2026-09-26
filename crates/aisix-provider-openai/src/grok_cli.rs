@@ -36,8 +36,8 @@ use std::time::{Duration, Instant};
 
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
-    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
-    ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    apply_request_headers, scrub_upstream_headers, Bridge, BridgeContext, BridgeError, ChatChunk,
+    ChatChunkStream, ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -107,7 +107,11 @@ fn map_arch() -> &'static str {
 }
 
 fn grok_user_agent() -> String {
-    format!("{GROK_CLIENT_IDENTIFIER}/{GROK_CLIENT_VERSION} ({}; {})", map_platform(), map_arch())
+    format!(
+        "{GROK_CLIENT_IDENTIFIER}/{GROK_CLIENT_VERSION} ({}; {})",
+        map_platform(),
+        map_arch()
+    )
 }
 
 /// `getGrokBuildSessionHeaders` (`grokBuild.ts:91-117`).
@@ -117,14 +121,25 @@ fn session_headers(token: &str, sse: bool) -> Result<HeaderMap, BridgeError> {
         ("content-type", "application/json".to_string()),
         (
             "accept",
-            (if sse { "text/event-stream" } else { "application/json" }).to_string(),
+            (if sse {
+                "text/event-stream"
+            } else {
+                "application/json"
+            })
+            .to_string(),
         ),
         ("x-grok-client-version", GROK_CLIENT_VERSION.to_string()),
-        ("x-grok-client-identifier", GROK_CLIENT_IDENTIFIER.to_string()),
+        (
+            "x-grok-client-identifier",
+            GROK_CLIENT_IDENTIFIER.to_string(),
+        ),
         ("x-grok-client-mode", "headless".to_string()),
         ("user-agent", grok_user_agent()),
         ("x-xai-token-auth", GROK_TOKEN_AUTH.to_string()),
-        ("x-authenticateresponse", "authenticate-response".to_string()),
+        (
+            "x-authenticateresponse",
+            "authenticate-response".to_string(),
+        ),
         ("authorization", format!("Bearer {token}")),
     ];
     for (name, value) in pairs {
@@ -196,13 +211,7 @@ fn sanitize_function_call_output(output: &Value) -> String {
             }
             repaired
                 .chars()
-                .map(|c| {
-                    if is_lone_surrogate(c) {
-                        '\u{fffd}'
-                    } else {
-                        c
-                    }
-                })
+                .map(|c| if is_lone_surrogate(c) { '\u{fffd}' } else { c })
                 .collect()
         }
         Value::Array(parts) => {
@@ -253,7 +262,10 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
         Some(Value::Array(arr)) => arr.clone(),
         _ => Vec::new(),
     };
-    if !include.iter().any(|v| v.as_str() == Some(GROK_REASONING_INCLUDE)) {
+    if !include
+        .iter()
+        .any(|v| v.as_str() == Some(GROK_REASONING_INCLUDE))
+    {
         include.push(Value::String(GROK_REASONING_INCLUDE.to_string()));
     }
     body["include"] = Value::Array(include);
@@ -271,7 +283,11 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
         let mut changed = false;
         for mut item in input {
             if let Some(obj) = item.as_object_mut() {
-                let item_type = obj.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+                let item_type = obj
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
                 if item_type == "reasoning" && obj.get("content").is_some_and(|c| c.is_null()) {
                     obj.remove("content");
                     changed = true;
@@ -315,10 +331,7 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
         }
     }
     if model == NO_EFFORT_MODEL {
-        if let Some(r) = body
-            .get_mut("reasoning")
-            .and_then(|r| r.as_object_mut())
-        {
+        if let Some(r) = body.get_mut("reasoning").and_then(|r| r.as_object_mut()) {
             r.remove("effort");
         }
     } else if !has_explicit_effort
@@ -329,16 +342,20 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
     {
         match body.get_mut("reasoning") {
             Some(Value::Object(r)) => {
-                r.insert("effort".to_string(), Value::String(DEFAULT_EFFORT.to_string()));
+                r.insert(
+                    "effort".to_string(),
+                    Value::String(DEFAULT_EFFORT.to_string()),
+                );
             }
             _ => {
                 body["reasoning"] = serde_json::json!({"effort": DEFAULT_EFFORT});
             }
         }
     }
-    if body.get("reasoning").is_some_and(|r| {
-        r.as_object().is_some_and(|o| o.is_empty())
-    }) {
+    if body
+        .get("reasoning")
+        .is_some_and(|r| r.as_object().is_some_and(|o| o.is_empty()))
+    {
         if let Some(obj) = body.as_object_mut() {
             obj.remove("reasoning");
         }
@@ -373,6 +390,7 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
 struct GrokRefreshOutcome {
     access_token: String,
     refresh_token: String,
+    expires_in: Option<u64>,
 }
 
 /// Single refresh attempt (`refreshGrokBuildCredentialsOnce`).
@@ -400,7 +418,8 @@ async fn refresh_once(
     let data: Value = resp.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
         let code = data.get("error").and_then(Value::as_str).unwrap_or("");
-        let terminal = attempt >= max_attempts || matches!(code, "invalid_grant" | "invalid_client");
+        let terminal =
+            attempt >= max_attempts || matches!(code, "invalid_grant" | "invalid_client");
         if terminal {
             return Err(BridgeError::InvalidUpstreamCredentials(format!(
                 "grok refresh rejected ({status}, {code}); re-authentication required"
@@ -408,7 +427,10 @@ async fn refresh_once(
         }
         return Ok(None);
     }
-    let access = data.get("access_token").and_then(Value::as_str).unwrap_or("");
+    let access = data
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if access.is_empty() {
         if attempt >= max_attempts {
             return Err(BridgeError::UpstreamDecode(
@@ -424,6 +446,9 @@ async fn refresh_once(
             .and_then(Value::as_str)
             .unwrap_or(refresh_token)
             .to_string(),
+        // Server-reported TTL with the documented 21600s fallback
+        // (same convention as the codex/qoder mints).
+        expires_in: data.get("expires_in").and_then(Value::as_u64),
     }))
 }
 
@@ -451,13 +476,11 @@ impl GrokTokenMint {
                     "grok OAuth client id is not configured (GROK_OAUTH_CLIENT_ID); re-authenticate the account".into(),
                 )
             })?;
-        let mut guard = self.cached.write().await;
-        if let Some((token, _, expiry)) = guard.as_ref() {
-            if Instant::now() + Duration::from_secs(300) < *expiry {
-                return Ok((token.clone(), refresh_token.to_string()));
-            }
-        }
+        let client_id = client_id.trim().to_string();
+        // No guard held across the network round-trips below (each
+        // attempt awaits + sleeps); re-acquire + re-check before insert.
         const MAX_ATTEMPTS: u32 = 3;
+        let mut won: Option<GrokRefreshOutcome> = None;
         for attempt in 1..=MAX_ATTEMPTS {
             if attempt > 1 {
                 let backoff = Duration::from_millis(200 * 2_u64.pow(attempt - 2).min(8));
@@ -474,18 +497,28 @@ impl GrokTokenMint {
             .await?
             {
                 Some(outcome) => {
-                    // `expires_in` defaults to 21600 upstream.
-                    *guard = Some((
-                        outcome.access_token.clone(),
-                        outcome.refresh_token.clone(),
-                        Instant::now() + Duration::from_secs(21600),
-                    ));
-                    return Ok((outcome.access_token, outcome.refresh_token));
+                    won = Some(outcome);
+                    break;
                 }
                 None => continue,
             }
         }
-        Err(BridgeError::Transport("grok token refresh failed after 3 attempts".into()))
+        let outcome = won.ok_or_else(|| {
+            BridgeError::Transport("grok token refresh failed after 3 attempts".into())
+        })?;
+        let ttl = Duration::from_secs(outcome.expires_in.unwrap_or(21600).max(1));
+        let mut guard = self.cached.write().await;
+        if let Some((token, _, expiry)) = guard.as_ref() {
+            if Instant::now() + Duration::from_secs(300) < *expiry {
+                return Ok((token.clone(), refresh_token.to_string()));
+            }
+        }
+        *guard = Some((
+            outcome.access_token.clone(),
+            outcome.refresh_token.clone(),
+            Instant::now() + ttl,
+        ));
+        Ok((outcome.access_token, outcome.refresh_token))
     }
 }
 
@@ -521,9 +554,7 @@ impl GrokCliBridge {
 
     fn resolve_base(ctx: &BridgeContext) -> String {
         match ctx.provider_key.api_base.as_deref() {
-            Some(b) if !b.trim().is_empty() => {
-                b.trim().trim_end_matches('/').to_string()
-            }
+            Some(b) if !b.trim().is_empty() => b.trim().trim_end_matches('/').to_string(),
             _ => GROK_DEFAULT_BASE.to_string(),
         }
     }
@@ -552,10 +583,12 @@ impl GrokCliBridge {
         let mut headers = session_headers(token, sse)?;
         headers.insert(
             HeaderName::from_static("x-aisix-request-id"),
-            HeaderValue::from_str(request_id)
-                .map_err(|e| BridgeError::Config(format!("request_id contains invalid header chars: {e}")))?,
+            HeaderValue::from_str(request_id).map_err(|e| {
+                BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+            })?,
         );
         apply_request_headers(&mut headers, hdr);
+        scrub_upstream_headers(&mut headers);
         Ok(headers)
     }
 
@@ -572,24 +605,26 @@ impl GrokCliBridge {
             let resp = url
                 .clone()
                 .post_on(client)
+                .headers(headers.clone())
                 .json(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
                 if let Ok((access, _)) = self.mint.refresh(credential).await {
-                    let auth = HeaderValue::from_str(&format!("Bearer {access}")).map_err(|_| {
-                        BridgeError::InvalidUpstreamCredentials(
-                            "refreshed grok token is not a valid header value".into(),
-                        )
-                    })?;
+                    let auth =
+                        HeaderValue::from_str(&format!("Bearer {access}")).map_err(|_| {
+                            BridgeError::InvalidUpstreamCredentials(
+                                "refreshed grok token is not a valid header value".into(),
+                            )
+                        })?;
                     headers.insert(header::AUTHORIZATION, auth);
                     continue;
                 }
             }
             return Ok(resp);
         }
-        unreachable!("the loop above always returns on its first two iterations");
+        Err(BridgeError::Transport("grok retry loop exhausted".into()))
     }
 }
 
@@ -612,7 +647,11 @@ impl Bridge for GrokCliBridge {
         aisix_core::Adapter::Openai.wire_protocol()
     }
 
-    async fn chat(&self, req: &ChatFormat, ctx: &BridgeContext) -> Result<ChatResponse, BridgeError> {
+    async fn chat(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let mut stream = self.chat_stream(req, ctx).await?;
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
@@ -640,17 +679,27 @@ impl Bridge for GrokCliBridge {
             .unwrap_or(&ctx.model.display_name)
             .to_string();
         let mut message = aisix_gateway::ChatMessage::assistant(full_content);
-        if !tool_calls.is_empty() {
-            message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        let has_tools = !tool_calls.is_empty();
+        if has_tools {
+            message
+                .extra
+                .insert("tool_calls".to_string(), Value::Array(tool_calls));
         }
         if !full_reasoning.is_empty() {
-            message.extra.insert("reasoning_content".to_string(), Value::String(full_reasoning));
+            message.extra.insert(
+                "reasoning_content".to_string(),
+                Value::String(full_reasoning),
+            );
         }
         Ok(ChatResponse {
             id: ctx.request_id.clone(),
             model,
             message,
-            finish_reason: aisix_gateway::FinishReason::Stop,
+            finish_reason: if has_tools {
+                aisix_gateway::FinishReason::ToolCalls
+            } else {
+                aisix_gateway::FinishReason::Stop
+            },
             usage: final_usage.unwrap_or_default(),
         })
     }
@@ -683,7 +732,8 @@ impl Bridge for GrokCliBridge {
         let credential_for_retry = credential.clone();
         let this = &self;
         let resp = with_deadline(ctx.deadline, started, async move {
-            this.post_responses(&url, headers, &body, &client, &credential_for_retry).await
+            this.post_responses(&url, headers, &body, &client, &credential_for_retry)
+                .await
         })
         .await?;
         // Non-streaming terminal object (proxies sometimes answer 200 +
@@ -769,7 +819,11 @@ mod tests {
     fn sanitize_sets_store_false_and_reasoning_include() {
         let body = sanitize_responses_body(serde_json::json!({"model": "grok-4.7"}), "grok-4.7");
         assert_eq!(body["store"], serde_json::json!(false));
-        assert!(body["include"].as_array().unwrap().iter().any(|v| v == GROK_REASONING_INCLUDE));
+        assert!(body["include"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == GROK_REASONING_INCLUDE));
         assert_eq!(body["reasoning"]["effort"], serde_json::json!("high"));
     }
 

@@ -19,8 +19,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aisix_core::Adapter;
 use aisix_gateway::sse::{SseDecoder, SseEvent};
 use aisix_gateway::{
-    Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream, ChatDelta, ChatFormat,
-    ChatResponse, FinishReason, Role, UsageStats,
+    apply_request_headers, scrub_upstream_headers, Bridge, BridgeContext, BridgeError, ChatChunk,
+    ChatChunkStream, ChatDelta, ChatFormat, ChatResponse, FinishReason, Role,
+    UpstreamHeaderContext, UsageStats,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -116,14 +117,17 @@ impl AntigravityTokenMint {
             }
         }
 
-        // Slow write-path: refresh token under write lock
-        let mut guard = self.cached.write().await;
-        if let Some((token, expiry)) = guard.get(&key) {
-            if Instant::now() + Duration::from_secs(300) < *expiry {
-                return Ok(token.clone());
-            }
+        // Fail fast on missing OAuth client material (same shape as the
+        // grok/codex mints): without it the refresh below can only fail
+        // with an opaque upstream 400.
+        if self.client_id.trim().is_empty() || self.client_secret.trim().is_empty() {
+            return Err(BridgeError::InvalidUpstreamCredentials(
+                "ANTIGRAVITY_CLIENT_ID/SECRET not configured".into(),
+            ));
         }
 
+        // No guard held across the network round-trip below: refresh
+        // first, then re-acquire + re-check before inserting.
         let params = [
             ("grant_type", "refresh_token"),
             ("client_id", &self.client_id),
@@ -144,6 +148,15 @@ impl AntigravityTokenMint {
         let status = resp.status();
         if !status.is_success() {
             let body: String = resp.text().await.unwrap_or_default();
+            // Rotated/revoked refresh tokens are terminal: surface
+            // re-auth instead of a retryable upstream status.
+            if status == reqwest::StatusCode::BAD_REQUEST
+                && (body.contains("invalid_grant") || body.contains("invalid_client"))
+            {
+                return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                    "antigravity refresh token rejected ({status}); re-authentication required"
+                )));
+            }
             return Err(BridgeError::upstream_status(
                 status.as_u16(),
                 format!("antigravity token refresh rejected ({status}): {body}"),
@@ -157,6 +170,12 @@ impl AntigravityTokenMint {
         let ttl_secs = payload.expires_in.unwrap_or(3600);
         let expiry = Instant::now() + Duration::from_secs(ttl_secs);
         let token = payload.access_token;
+        let mut guard = self.cached.write().await;
+        if let Some((cached, cached_expiry)) = guard.get(&key) {
+            if Instant::now() + Duration::from_secs(300) < *cached_expiry {
+                return Ok(cached.clone());
+            }
+        }
         guard.insert(key, (token.clone(), expiry));
 
         Ok(token)
@@ -506,7 +525,12 @@ impl AntigravityBridge {
         }
     }
 
-    fn build_headers(&self, token: &str, request_id: &str) -> Result<HeaderMap, BridgeError> {
+    fn build_headers(
+        &self,
+        token: &str,
+        request_id: &str,
+        hdr: &UpstreamHeaderContext<'_>,
+    ) -> Result<HeaderMap, BridgeError> {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -538,6 +562,9 @@ impl AntigravityBridge {
             HeaderValue::from_str(request_id)
                 .map_err(|_| BridgeError::Config("invalid request_id header".into()))?,
         );
+        // Operator headers merge before the fingerprint scrub, which runs
+        // last with Authorization re-inserted last.
+        apply_request_headers(&mut headers, hdr);
         scrub_proxy_headers(&mut headers);
         Ok(headers)
     }
@@ -550,15 +577,16 @@ impl AntigravityBridge {
 /// the denylist is dropped if it ever arrives via a merge, the
 /// Node `Accept-Encoding` is pinned, and `Authorization` is moved
 /// last to match the native fingerprint.
+///
+/// The shared proxy/chromium pass lives in
+/// [`scrub_upstream_headers`](aisix_gateway::upstream_headers::scrub_upstream_headers);
+/// the Antigravity-only extras (Stainless SDK tells, referers,
+/// `x-title`, the `Accept-Encoding` pin) stay here because sibling
+/// bridges legitimately own some of those names (qoder's
+/// `x-stainless-*`, cline's `http-referer`/`x-title`).
 fn scrub_proxy_headers(headers: &mut HeaderMap) {
-    const REMOVE: &[&str] = &[
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-proto",
-        "x-forwarded-port",
-        "x-real-ip",
-        "forwarded",
-        "via",
+    scrub_upstream_headers(headers);
+    const ANTIGRAVITY_ONLY: &[&str] = &[
         "x-title",
         "x-stainless-lang",
         "x-stainless-package-version",
@@ -571,13 +599,6 @@ fn scrub_proxy_headers(headers: &mut HeaderMap) {
         "x-stainless-helper-method",
         "http-referer",
         "referer",
-        "sec-ch-ua",
-        "sec-ch-ua-mobile",
-        "sec-ch-ua-platform",
-        "sec-fetch-mode",
-        "sec-fetch-site",
-        "sec-fetch-dest",
-        "priority",
         "accept-encoding",
     ];
     let auth = headers.remove(header::AUTHORIZATION);
@@ -589,11 +610,13 @@ fn scrub_proxy_headers(headers: &mut HeaderMap) {
             let lower = name.as_str().to_ascii_lowercase();
             // Our own correlation header is intentionally sent upstream
             // (same as the OpenAI bridge); any other gateway-internal
-            // `x-aisix-*` key is an infra tell and is dropped.
+            // `x-aisix-*` key is an infra tell and is dropped (already
+            // handled by the shared scrub; kept here for the
+            // Antigravity-only re-pass).
             if lower.starts_with("x-aisix-") {
                 return lower != "x-aisix-request-id";
             }
-            REMOVE.contains(&lower.as_str())
+            ANTIGRAVITY_ONLY.contains(&lower.as_str())
         })
         .cloned()
         .collect();
@@ -693,7 +716,7 @@ impl Bridge for AntigravityBridge {
 
         let access_token = self.token_mint.get_token(credential).await?;
         let request_id = ctx.request_id.clone();
-        let headers = self.build_headers(&access_token, &request_id)?;
+        let headers = self.build_headers(&access_token, &request_id, &ctx.header_ctx())?;
 
         let upstream_model = ctx
             .model
@@ -771,7 +794,8 @@ impl Bridge for AntigravityBridge {
                                 }
                             }
                             if let Some(container) = sse.response {
-                                let usage = container.usage_metadata.as_ref().map(usage_from_metadata);
+                                let mut usage =
+                                    container.usage_metadata.as_ref().map(usage_from_metadata);
 
                                 if let Some(candidates) = container.candidates {
                                     for candidate in candidates {
@@ -783,7 +807,14 @@ impl Bridge for AntigravityBridge {
 
                                         if let Some(content) = candidate.content {
                                             if let Some(parts) = content.parts {
+                                                let last = parts.len().saturating_sub(1);
                                                 for (index, part) in parts.into_iter().enumerate() {
+                                                    // Moved on the last part, cloned otherwise:
+                                                    // every emitted chunk still carries the
+                                                    // frame's usage, but the final move
+                                                    // avoids one clone per SSE response
+                                                    // (the hot single-part case moves).
+                                                    let is_last = index == last;
                                                     // Native `functionCall` part (Gemini 3.x
                                                     // answers to functionDeclarations with
                                                     // this, usually carrying a
@@ -829,7 +860,11 @@ impl Bridge for AntigravityBridge {
                                                                 finish_reason: Some(
                                                                     FinishReason::ToolCalls,
                                                                 ),
-                                                                usage: usage.clone(),
+                                                                usage: if is_last {
+                                                                    usage.take()
+                                                                } else {
+                                                                    usage.clone()
+                                                                },
                                                             };
                                                             continue;
                                                         }
@@ -844,7 +879,11 @@ impl Bridge for AntigravityBridge {
                                                                 ..Default::default()
                                                             },
                                                             finish_reason: finish_reason.clone(),
-                                                            usage: usage.clone(),
+                                                            usage: if is_last {
+                                                                usage.take()
+                                                            } else {
+                                                                usage.clone()
+                                                            },
                                                         };
                                                     } else if part.text.is_some() {
                                                         yield ChatChunk {
@@ -855,7 +894,11 @@ impl Bridge for AntigravityBridge {
                                                                 ..Default::default()
                                                             },
                                                             finish_reason: finish_reason.clone(),
-                                                            usage: usage.clone(),
+                                                            usage: if is_last {
+                                                                usage.take()
+                                                            } else {
+                                                                usage.clone()
+                                                            },
                                                         };
                                                     }
                                                 }
@@ -927,6 +970,21 @@ mod tests {
         assert_eq!(token_cache_key("same"), token_cache_key("same"));
     }
 
+    #[tokio::test]
+    async fn missing_oauth_client_material_fails_fast() {
+        let mint = AntigravityTokenMint {
+            client_id: String::new(),
+            client_secret: String::new(),
+            client: Client::new(),
+            cached: RwLock::new(HashMap::new()),
+        };
+        let err = mint.get_token("some-refresh-token").await.unwrap_err();
+        assert!(
+            matches!(err, BridgeError::InvalidUpstreamCredentials(_)),
+            "unexpected: {err:?}"
+        );
+    }
+
     #[test]
     fn user_agent_carries_ide_version() {
         let ua = format!("antigravity/ide/{ANTIGRAVITY_IDE_VERSION} darwin/arm64");
@@ -947,7 +1005,10 @@ mod tests {
         assert_ne!(resolve_session_id("cred-a"), resolve_session_id("cred-b"));
         assert!(resolve_session_id("cred-a").parse::<i64>().is_ok());
         let empty = resolve_session_id("  ");
-        assert!(empty.starts_with('-'), "empty credential must yield a generated id, got {empty}");
+        assert!(
+            empty.starts_with('-'),
+            "empty credential must yield a generated id, got {empty}"
+        );
     }
 
     #[test]
@@ -968,13 +1029,15 @@ mod tests {
 
     #[test]
     fn thoughts_tokens_fold_into_completion() {
-        let usage = usage_from_metadata(&serde_json::from_value(serde_json::json!({
-            "promptTokenCount": 10,
-            "candidatesTokenCount": 20,
-            "totalTokenCount": 40,
-            "thoughtsTokenCount": 10,
-        }))
-        .unwrap());
+        let usage = usage_from_metadata(
+            &serde_json::from_value(serde_json::json!({
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20,
+                "totalTokenCount": 40,
+                "thoughtsTokenCount": 10,
+            }))
+            .unwrap(),
+        );
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 30);
         assert_eq!(usage.reasoning_tokens, 10);
@@ -1007,6 +1070,15 @@ mod tests {
         assert_eq!(
             part.function_call.as_ref().unwrap().name.as_deref(),
             Some("search")
+        );
+        // The signature must decode (wire tolerance): a part carrying
+        // one is a covered shape, not an accident. It is intentionally
+        // not forwarded — the single-turn projection has no replay turn
+        // to echo it on.
+        assert_eq!(
+            part.thought_signature.as_ref().and_then(|v| v.as_str()),
+            Some("sig"),
+            "thoughtSignature must survive decoding"
         );
     }
 

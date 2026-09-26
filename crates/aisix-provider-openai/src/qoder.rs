@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
-    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat,
-    ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    apply_request_headers, scrub_upstream_headers, Bridge, BridgeContext, BridgeError,
+    ChatChunkStream, ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -104,13 +104,16 @@ fn dashscope_headers(token: &str) -> Result<HeaderMap, BridgeError> {
             HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| BridgeError::Config(format!("bad qoder header name: {name}")))?,
             HeaderValue::from_str(&value).map_err(|_| {
-                BridgeError::InvalidUpstreamCredentials("qoder credential is not a valid header value".into())
+                BridgeError::InvalidUpstreamCredentials(
+                    "qoder credential is not a valid header value".into(),
+                )
             })?,
         );
     }
     headers.insert(
         header::USER_AGENT,
-        HeaderValue::from_str(&ua).map_err(|e| BridgeError::Config(format!("qoder UA invalid: {e}")))?,
+        HeaderValue::from_str(&ua)
+            .map_err(|e| BridgeError::Config(format!("qoder UA invalid: {e}")))?,
     );
     Ok(headers)
 }
@@ -168,7 +171,8 @@ async fn exchange_refresh_token(
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<(String, String, Option<u64>), BridgeError> {
-    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{client_secret}"));
+    let basic =
+        base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{client_secret}"));
     let params = [
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
@@ -188,6 +192,15 @@ async fn exchange_refresh_token(
     let raw = resp.bytes().await.unwrap_or_default();
     if !status.is_success() {
         let text = String::from_utf8_lossy(&raw);
+        let code = extract_qoder_error_code(&text);
+        if matches!(code.as_deref(), Some("invalid_grant" | "invalid_client"))
+            || status == reqwest::StatusCode::UNAUTHORIZED
+        {
+            return Err(BridgeError::InvalidUpstreamCredentials(format!(
+                "qoder refresh token rejected ({}); re-authentication required",
+                code.as_deref().unwrap_or("unauthorized")
+            )));
+        }
         return Err(BridgeError::upstream_status(
             status.as_u16(),
             format!("qoder token refresh rejected ({status}): {text}"),
@@ -202,7 +215,9 @@ async fn exchange_refresh_token(
         .unwrap_or("")
         .to_string();
     if access.is_empty() {
-        return Err(BridgeError::UpstreamDecode("qoder token response carried no access_token".into()));
+        return Err(BridgeError::UpstreamDecode(
+            "qoder token response carried no access_token".into(),
+        ));
     }
     let refresh = tokens
         .get("refresh_token")
@@ -218,41 +233,68 @@ struct QoderTokenMint {
     cached: RwLock<Option<(String, String, Instant)>>,
 }
 
+fn extract_qoder_error_code(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let error = value.get("error")?;
+    if let Some(code) = error.get("code").and_then(|c| c.as_str()) {
+        return Some(code.to_string());
+    }
+    if let Some(code) = error.get("error").and_then(|c| c.as_str()) {
+        return Some(code.to_string());
+    }
+    if let Some(s) = error.as_str() {
+        return Some(s.to_string());
+    }
+    None
+}
+
 impl QoderTokenMint {
     fn oauth_env() -> Option<(String, String, String)> {
-        let id = std::env::var("QODER_OAUTH_CLIENT_ID").ok().filter(|s| !s.trim().is_empty())?;
-        let secret =
-            std::env::var("QODER_OAUTH_CLIENT_SECRET").ok().filter(|s| !s.trim().is_empty())?;
-        let url = std::env::var("QODER_OAUTH_TOKEN_URL").ok().filter(|s| !s.trim().is_empty())?;
+        let id = std::env::var("QODER_OAUTH_CLIENT_ID")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let secret = std::env::var("QODER_OAUTH_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        let url = std::env::var("QODER_OAUTH_TOKEN_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
         Some((id, secret, url))
     }
 
     /// Reactive refresh on a 401: exchanges `refresh_token` (the stored
-    /// credential) via Basic auth. Returns `None` when browser OAuth is
-    /// not configured in this environment (TS returns null there).
-    async fn refresh_on_401(&self, refresh_token: &str) -> Option<(String, String)> {
+    /// credential) via Basic auth. Returns `Ok(None)` when browser OAuth is
+    /// not configured in this environment (TS returns null there);
+    /// terminal upstream rejections surface as
+    /// `InvalidUpstreamCredentials` instead of being swallowed.
+    async fn refresh_on_401(
+        &self,
+        refresh_token: &str,
+    ) -> Result<Option<(String, String)>, BridgeError> {
         {
             let guard = self.cached.read().await;
             if let Some((token, _, expiry)) = guard.as_ref() {
                 if Instant::now() + Duration::from_secs(300) < *expiry {
-                    return Some((token.clone(), refresh_token.to_string()));
+                    return Ok(Some((token.clone(), refresh_token.to_string())));
                 }
             }
         }
-        let (id, secret, url) = Self::oauth_env()?;
+        let Some((id, secret, url)) = Self::oauth_env() else {
+            return Ok(None);
+        };
+        // No guard held across the network round-trip; re-acquire +
+        // re-check before inserting.
+        let (access, refresh, expires_in) =
+            exchange_refresh_token(&self.client, &url, &id, &secret, refresh_token).await?;
+        let ttl = Duration::from_secs(expires_in.unwrap_or(3600).max(1));
         let mut guard = self.cached.write().await;
         if let Some((token, _, expiry)) = guard.as_ref() {
             if Instant::now() + Duration::from_secs(300) < *expiry {
-                return Some((token.clone(), refresh_token.to_string()));
+                return Ok(Some((token.clone(), refresh_token.to_string())));
             }
         }
-        let (access, refresh, expires_in) =
-            exchange_refresh_token(&self.client, &url, &id, &secret, refresh_token)
-                .await
-                .ok()?;
-        let ttl = Duration::from_secs(expires_in.unwrap_or(3600).max(1));
         *guard = Some((access.clone(), refresh.clone(), Instant::now() + ttl));
-        Some((access, refresh))
+        Ok(Some((access, refresh)))
     }
 }
 
@@ -294,13 +336,18 @@ impl QoderBridge {
         hdr: &UpstreamHeaderContext<'_>,
     ) -> Result<HeaderMap, BridgeError> {
         let mut headers = dashscope_headers(token)?;
-        let rid = HeaderValue::from_str(request_id)
-            .map_err(|e| BridgeError::Config(format!("request_id contains invalid header chars: {e}")))?;
+        let rid = HeaderValue::from_str(request_id).map_err(|e| {
+            BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+        })?;
         headers.insert(HeaderName::from_static("x-aisix-request-id"), rid);
         if sse {
-            headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+            headers.insert(
+                header::ACCEPT,
+                HeaderValue::from_static("text/event-stream"),
+            );
         }
         apply_request_headers(&mut headers, hdr);
+        scrub_upstream_headers(&mut headers);
         Ok(headers)
     }
 
@@ -317,25 +364,33 @@ impl QoderBridge {
             let resp = url
                 .clone()
                 .post_on(client)
+                .headers(headers.clone())
                 .json(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
             // Reactive Basic refresh on 401 (single retry).
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
-                if let Some((access, _)) = self.mint.refresh_on_401(credential).await {
-                    let auth = HeaderValue::from_str(&format!("Bearer {access}")).map_err(|_| {
-                        BridgeError::InvalidUpstreamCredentials(
-                            "refreshed qoder token is not a valid header value".into(),
-                        )
-                    })?;
-                    headers.insert(header::AUTHORIZATION, auth);
-                    continue;
+                match self.mint.refresh_on_401(credential).await {
+                    Ok(Some((access, _))) => {
+                        let auth =
+                            HeaderValue::from_str(&format!("Bearer {access}")).map_err(|_| {
+                                BridgeError::InvalidUpstreamCredentials(
+                                    "refreshed qoder token is not a valid header value".into(),
+                                )
+                            })?;
+                        headers.insert(header::AUTHORIZATION, auth);
+                        continue;
+                    }
+                    // Terminal credential failure: surface re-auth
+                    // instead of replaying the stale 401 body.
+                    Err(e @ BridgeError::InvalidUpstreamCredentials(_)) => return Err(e),
+                    Ok(None) | Err(_) => {}
                 }
             }
             return Ok(resp);
         }
-        unreachable!("the loop above always returns on its first two iterations");
+        Err(BridgeError::Transport("qoder retry loop exhausted".into()))
     }
 }
 
@@ -350,7 +405,8 @@ impl Default for QoderBridge {
 /// status + message when the frame is an error envelope, `None` for
 /// ordinary OpenAI chunks.
 fn qoder_envelope_error(payload: &str) -> Option<BridgeError> {
-    let envelope: serde_json::Value = serde_json::from_str(payload.trim_start_matches("data:").trim()).ok()?;
+    let envelope: serde_json::Value =
+        serde_json::from_str(payload.trim_start_matches("data:").trim()).ok()?;
     let status_val = envelope.get("statusCodeValue").and_then(|v| v.as_u64())? as u16;
     if status_val == 200 {
         return None;
@@ -382,13 +438,16 @@ impl Bridge for QoderBridge {
         aisix_core::Adapter::Openai.wire_protocol()
     }
 
-    async fn chat(&self, req: &ChatFormat, ctx: &BridgeContext) -> Result<ChatResponse, BridgeError> {
+    async fn chat(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         let credential = api_key(ctx)?;
-        let model_name = ctx
-            .model
-            .model_name
-            .as_deref()
-            .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))?;
+        let model_name =
+            ctx.model.model_name.as_deref().ok_or_else(|| {
+                BridgeError::InvalidUpstreamConfig("model.model_name missing".into())
+            })?;
         let upstream = map_model(model_name).to_string();
         let messages = messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_request(req, &upstream, &messages, false);
@@ -413,7 +472,8 @@ impl Bridge for QoderBridge {
         let credential_for_retry = credential.clone();
         let this = &self;
         let resp = with_deadline(ctx.deadline, started, async move {
-            this.post_chat(&url, headers, &body, &client, &credential_for_retry).await
+            this.post_chat(&url, headers, &body, &client, &credential_for_retry)
+                .await
         })
         .await?;
         let status = resp.status();
@@ -433,11 +493,10 @@ impl Bridge for QoderBridge {
         ctx: &BridgeContext,
     ) -> Result<ChatChunkStream, BridgeError> {
         let credential = api_key(ctx)?;
-        let model_name = ctx
-            .model
-            .model_name
-            .as_deref()
-            .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))?;
+        let model_name =
+            ctx.model.model_name.as_deref().ok_or_else(|| {
+                BridgeError::InvalidUpstreamConfig("model.model_name missing".into())
+            })?;
         let upstream = map_model(model_name).to_string();
         let messages = messages_from(req, DeveloperRoleMode::MapToSystem);
         let typed = build_request(req, &upstream, &messages, true);
@@ -521,7 +580,9 @@ mod tests {
         let err = qoder_envelope_error(r#"{"statusCodeValue":401,"body":"bad key"}"#)
             .expect("must detect");
         match err {
-            BridgeError::UpstreamStatus { status, message, .. } => {
+            BridgeError::UpstreamStatus {
+                status, message, ..
+            } => {
                 assert_eq!(status, 401);
                 assert!(message.contains("bad key"));
             }
@@ -552,10 +613,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/oauth/token"))
-            .and(header(
-                "authorization",
-                "Basic aWQ6c2VjcmV0",
-            ))
+            .and(header("authorization", "Basic aWQ6c2VjcmV0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "a-new",
                 "expires_in": 7200,

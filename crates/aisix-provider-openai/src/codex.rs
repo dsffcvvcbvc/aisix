@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
-    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat,
-    ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    apply_request_headers, scrub_upstream_headers, Bridge, BridgeContext, BridgeError,
+    ChatChunkStream, ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -74,7 +74,12 @@ fn codex_headers(token: &str, sse: bool) -> Result<HeaderMap, BridgeError> {
         ("user-agent", codex_user_agent()),
         (
             "accept",
-            (if sse { "text/event-stream" } else { "application/json" }).to_string(),
+            (if sse {
+                "text/event-stream"
+            } else {
+                "application/json"
+            })
+            .to_string(),
         ),
         ("content-type", "application/json".to_string()),
         ("authorization", format!("Bearer {token}")),
@@ -139,7 +144,10 @@ async fn exchange_refresh_token(
     let tokens: Value = serde_json::from_slice(&raw).map_err(|e| {
         BridgeError::UpstreamDecode(format!("failed to parse codex token response: {e}"))
     })?;
-    let access = tokens.get("access_token").and_then(Value::as_str).unwrap_or("");
+    let access = tokens
+        .get("access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if access.is_empty() {
         return Err(BridgeError::UpstreamDecode(
             "codex token response carried no access_token".into(),
@@ -191,15 +199,22 @@ impl CodexTokenMint {
                     "codex OAuth client id is not configured (CODEX_OAUTH_CLIENT_ID); re-authenticate the account".into(),
                 )
             })?;
+        // No guard held across the network round-trip: exchange first,
+        // then re-acquire + re-check before inserting.
+        let (access, refresh, expires_in) = exchange_refresh_token(
+            &self.client,
+            CODEX_TOKEN_URL,
+            refresh_token,
+            client_id.trim(),
+        )
+        .await?;
+        let ttl = Duration::from_secs(expires_in.unwrap_or(3600).max(1));
         let mut guard = self.cached.write().await;
         if let Some((token, _, expiry)) = guard.as_ref() {
             if Instant::now() + Duration::from_secs(300) < *expiry {
                 return Ok((token.clone(), refresh_token.to_string()));
             }
         }
-        let (access, refresh, expires_in) =
-            exchange_refresh_token(&self.client, CODEX_TOKEN_URL, refresh_token, client_id.trim()).await?;
-        let ttl = Duration::from_secs(expires_in.unwrap_or(3600).max(1));
         *guard = Some((access.clone(), refresh.clone(), Instant::now() + ttl));
         Ok((access, refresh))
     }
@@ -266,10 +281,12 @@ impl CodexBridge {
         let mut headers = codex_headers(token, sse)?;
         headers.insert(
             HeaderName::from_static("x-aisix-request-id"),
-            HeaderValue::from_str(request_id)
-                .map_err(|e| BridgeError::Config(format!("request_id contains invalid header chars: {e}")))?,
+            HeaderValue::from_str(request_id).map_err(|e| {
+                BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+            })?,
         );
         apply_request_headers(&mut headers, hdr);
+        scrub_upstream_headers(&mut headers);
         Ok(headers)
     }
 
@@ -286,24 +303,26 @@ impl CodexBridge {
             let resp = url
                 .clone()
                 .post_on(client)
+                .headers(headers.clone())
                 .json(body)
                 .send()
                 .await
                 .map_err(aisix_gateway::send_error)?;
             if resp.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
                 if let Ok((access, _)) = self.mint.refresh(credential).await {
-                    let auth = HeaderValue::from_str(&format!("Bearer {access}")).map_err(|_| {
-                        BridgeError::InvalidUpstreamCredentials(
-                            "refreshed codex token is not a valid header value".into(),
-                        )
-                    })?;
+                    let auth =
+                        HeaderValue::from_str(&format!("Bearer {access}")).map_err(|_| {
+                            BridgeError::InvalidUpstreamCredentials(
+                                "refreshed codex token is not a valid header value".into(),
+                            )
+                        })?;
                     headers.insert(header::AUTHORIZATION, auth);
                     continue;
                 }
             }
             return Ok(resp);
         }
-        unreachable!("the loop above always returns on its first two iterations");
+        Err(BridgeError::Transport("codex retry loop exhausted".into()))
     }
 }
 
@@ -325,7 +344,11 @@ impl Bridge for CodexBridge {
         aisix_core::Adapter::Openai.wire_protocol()
     }
 
-    async fn chat(&self, req: &ChatFormat, ctx: &BridgeContext) -> Result<ChatResponse, BridgeError> {
+    async fn chat(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         // `forceStream: true` — upstream streams even for `stream:
         // false` clients; accumulate the SSE back into JSON.
         let mut stream = self.chat_stream(req, ctx).await?;
@@ -355,17 +378,27 @@ impl Bridge for CodexBridge {
             .unwrap_or(&ctx.model.display_name)
             .to_string();
         let mut message = aisix_gateway::ChatMessage::assistant(full_content);
-        if !tool_calls.is_empty() {
-            message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        let has_tools = !tool_calls.is_empty();
+        if has_tools {
+            message
+                .extra
+                .insert("tool_calls".to_string(), Value::Array(tool_calls));
         }
         if !full_reasoning.is_empty() {
-            message.extra.insert("reasoning_content".to_string(), Value::String(full_reasoning));
+            message.extra.insert(
+                "reasoning_content".to_string(),
+                Value::String(full_reasoning),
+            );
         }
         Ok(ChatResponse {
             id: ctx.request_id.clone(),
             model,
             message,
-            finish_reason: aisix_gateway::FinishReason::Stop,
+            finish_reason: if has_tools {
+                aisix_gateway::FinishReason::ToolCalls
+            } else {
+                aisix_gateway::FinishReason::Stop
+            },
             usage: final_usage.unwrap_or_default(),
         })
     }
@@ -384,7 +417,12 @@ impl Bridge for CodexBridge {
         // No default effort: the TS side derives it from the model
         // alias suffix, which the gateway does not model — the caller
         // (or operator `extra`) decides.
-        let body = build_responses_body(req, upstream_model, true, None);
+        let mut body = build_responses_body(req, upstream_model, true, None);
+        // Same `store = false` sanitizer as grok-cli: the Responses
+        // backends must not persist the conversation server-side.
+        if body.get("store").is_none() {
+            body["store"] = Value::Bool(false);
+        }
         let headers = Self::build_headers(&credential, &ctx.request_id, true, &ctx.header_ctx())?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -400,7 +438,8 @@ impl Bridge for CodexBridge {
         let credential_for_retry = credential.clone();
         let this = &self;
         let resp = with_deadline(ctx.deadline, started, async move {
-            this.post_responses(&url, headers, &body, &client, &credential_for_retry).await
+            this.post_responses(&url, headers, &body, &client, &credential_for_retry)
+                .await
         })
         .await?;
         let status = resp.status();

@@ -52,10 +52,10 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod antigravity;
 mod bridge;
 mod token_mint;
 mod wire;
-pub mod antigravity;
 
-pub use bridge::{VertexBridge, VertexPublisher};
 pub use antigravity::{AntigravityBridge, AntigravityTokenMint};
+pub use bridge::{VertexBridge, VertexPublisher};

@@ -20,7 +20,9 @@
 //!   Responses `function_call` items; the proxy layer re-encodes them
 //!   for the client.
 
-use aisix_gateway::{ChatChunk, ChatDelta, ChatFormat, ChatResponse, FinishReason, Role, UsageStats};
+use aisix_gateway::{
+    ChatChunk, ChatDelta, ChatFormat, ChatResponse, FinishReason, Role, UsageStats,
+};
 use serde_json::Value;
 
 /// Build the Responses request body from a normalised chat request.
@@ -53,7 +55,9 @@ pub fn build_responses_body(
                 input.push(serde_json::json!({"type": "message", "role": "user", "content": text}));
             }
             Role::Assistant => {
-                input.push(serde_json::json!({"type": "message", "role": "assistant", "content": text}));
+                input.push(
+                    serde_json::json!({"type": "message", "role": "assistant", "content": text}),
+                );
             }
         }
     }
@@ -140,7 +144,11 @@ pub fn output_item_tool_call(item: &Value) -> Option<Value> {
     if item.get("type").and_then(Value::as_str)? != "function_call" {
         return None;
     }
-    let name = item.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     if name.is_empty() {
         return None;
     }
@@ -167,7 +175,7 @@ fn responses_usage(value: &Value) -> UsageStats {
         .and_then(|u| u.get("input_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
-    let completion = usage
+    let output = usage
         .and_then(|u| u.get("output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
@@ -175,10 +183,40 @@ fn responses_usage(value: &Value) -> UsageStats {
         .and_then(|u| u.get("total_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0) as u32;
+    // `output_tokens_details.reasoning_tokens` names the reasoning subset
+    // (Responses shape of the Chat `completion_tokens_details` field).
+    // Tolerate the singular `output_token_details` spelling some proxies
+    // emit, plus a flattened top-level `reasoning_tokens`.
+    let reasoning = usage
+        .and_then(|u| {
+            u.get("output_tokens_details")
+                .or_else(|| u.get("output_token_details"))
+        })
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            usage
+                .and_then(|u| u.get("reasoning_tokens"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0) as u32;
+    // Beside-vs-subset: the Responses backends that report reasoning
+    // BESIDE `output_tokens` state `total == prompt + output + reasoning`
+    // (Gemini-shape, cf. Antigravity `usage_from_metadata`); the ones
+    // that already include it state `total == prompt + output`. Fold only
+    // in the beside case so a subset is never double-counted.
+    let beside = reasoning > 0 && total == prompt.saturating_add(output).saturating_add(reasoning);
     UsageStats {
         prompt_tokens: prompt,
-        completion_tokens: completion,
+        completion_tokens: if beside {
+            output.saturating_add(reasoning)
+        } else {
+            output
+        },
         total_tokens: total,
+        reasoning_tokens: reasoning,
+        reasoning_folded_into_completion: if beside { reasoning } else { 0 },
+        upstream_total_tokens: total,
         ..Default::default()
     }
 }
@@ -216,10 +254,14 @@ pub fn response_into_chat_response(raw: &Value, id: &str, model: &str) -> ChatRe
     };
     let mut message = aisix_gateway::ChatMessage::assistant(content);
     if !tool_calls.is_empty() {
-        message.extra.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        message
+            .extra
+            .insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
     if !reasoning.is_empty() {
-        message.extra.insert("reasoning_content".to_string(), Value::String(reasoning));
+        message
+            .extra
+            .insert("reasoning_content".to_string(), Value::String(reasoning));
     }
     ChatResponse {
         id: raw
@@ -245,8 +287,25 @@ pub fn response_into_chat_response(raw: &Value, id: &str, model: &str) -> ChatRe
 /// `response.incomplete` frames (usage + finish reason), and the
 /// `response.function_call_arguments.done` tool-call frame. Returns
 /// `None` for keep-alive / bookkeeping events the client must not see.
+///
+/// A payload that is not JSON at all is a corrupt frame, not
+/// bookkeeping: it is warn-logged (with a capped snippet) and dropped
+/// rather than silently swallowed, so a systematic upstream shape drift
+/// shows up in operator logs instead of surfacing as empty completions.
 pub fn stream_event_into_chat_chunk(payload: &str, model: &str, id: &str) -> Option<ChatChunk> {
-    let value: Value = serde_json::from_str(payload).ok()?;
+    let value: Value = match serde_json::from_str(payload) {
+        Ok(v) => v,
+        Err(_) => {
+            if !payload.trim().is_empty() {
+                let snippet: String = payload.chars().take(200).collect();
+                tracing::warn!(
+                    responses_event = %snippet,
+                    "responses SSE data frame failed to parse as JSON; dropping frame"
+                );
+            }
+            return None;
+        }
+    };
     let event_type = value.get("type").and_then(Value::as_str).unwrap_or("");
     match event_type {
         "response.output_text.delta" => {
@@ -284,7 +343,10 @@ pub fn stream_event_into_chat_chunk(payload: &str, model: &str, id: &str) -> Opt
         "response.function_call_arguments.done" => {
             let name = value.get("name").and_then(Value::as_str).unwrap_or("");
             let call_id = value.get("call_id").and_then(Value::as_str).unwrap_or("");
-            let arguments = value.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+            let arguments = value
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
             Some(ChatChunk {
                 id: id.to_string(),
                 model: model.to_string(),
@@ -318,13 +380,15 @@ pub fn stream_event_into_chat_chunk(payload: &str, model: &str, id: &str) -> Opt
             // A terminal frame that only carries usage (the deltas
             // already delivered the text) must not re-emit an empty
             // content delta — yield usage with no delta instead.
+            // Moved (not cloned) into the delta: these locals die here.
+            let has_tools = !tool_calls.is_empty();
             let delta = ChatDelta {
-                content: (!content.is_empty()).then(|| content.clone()),
-                reasoning_content: (!reasoning.is_empty()).then(|| reasoning.clone()),
-                tool_calls: (!tool_calls.is_empty()).then(|| tool_calls.clone()),
+                content: (!content.is_empty()).then_some(content),
+                reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                tool_calls: has_tools.then_some(tool_calls),
                 ..Default::default()
             };
-            let finish_reason = if !tool_calls.is_empty() {
+            let finish_reason = if has_tools {
                 Some(FinishReason::ToolCalls)
             } else if event_type == "response.incomplete" {
                 Some(FinishReason::Length)
@@ -363,6 +427,52 @@ mod tests {
         assert_eq!(resp.message.content_str(), "hello");
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
         assert_eq!(resp.usage.total_tokens, 8);
+        assert_eq!(resp.usage.upstream_total_tokens, 8);
+    }
+
+    #[test]
+    fn beside_reasoning_folds_into_completion() {
+        // `total == prompt + output + reasoning`: reasoning reported
+        // BESIDE the completion (Gemini-shape) folds in.
+        let raw = serde_json::json!({
+            "id": "resp-2",
+            "model": "grok-4.7",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "total_tokens": 40,
+                "output_tokens_details": {"reasoning_tokens": 10}
+            }
+        });
+        let resp = response_into_chat_response(&raw, "req-1", "fallback");
+        assert_eq!(resp.usage.prompt_tokens, 10);
+        assert_eq!(resp.usage.completion_tokens, 30);
+        assert_eq!(resp.usage.reasoning_tokens, 10);
+        assert_eq!(resp.usage.reasoning_folded_into_completion, 10);
+        assert_eq!(resp.usage.upstream_total_tokens, 40);
+    }
+
+    #[test]
+    fn subset_reasoning_is_not_double_counted() {
+        // `total == prompt + output`: reasoning already inside the
+        // completion (OpenAI subset shape) must not be added again.
+        let raw = serde_json::json!({
+            "id": "resp-3",
+            "model": "codex",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20,
+                "total_tokens": 30,
+                "output_tokens_details": {"reasoning_tokens": 8}
+            }
+        });
+        let resp = response_into_chat_response(&raw, "req-1", "fallback");
+        assert_eq!(resp.usage.completion_tokens, 20);
+        assert_eq!(resp.usage.reasoning_tokens, 8);
+        assert_eq!(resp.usage.reasoning_folded_into_completion, 0);
+        assert_eq!(resp.usage.upstream_total_tokens, 30);
     }
 
     #[test]

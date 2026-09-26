@@ -130,13 +130,6 @@ impl Hub {
         self.family_bridges.get(&adapter).map(|r| r.clone())
     }
 
-    /// Alias for [`Hub::family_bridge_for`] kept for the
-    /// `hub.get_family(adapter)` call shape used by dispatch docs
-    /// (`aisix-proxy/src/dispatch.rs`). Delegates without new logic.
-    pub fn get_family(&self, adapter: Adapter) -> Option<Arc<dyn Bridge>> {
-        self.family_bridge_for(adapter)
-    }
-
     /// The vendor strings a specialized bridge is registered for.
     ///
     /// Exposed so `upstream_protocol_label_matches_dispatched_bridge`
@@ -160,7 +153,7 @@ impl Hub {
             return Some(b.clone());
         }
         let adapter = pk.adapter?;
-        self.get_family(adapter)
+        self.family_bridge_for(adapter)
     }
 }
 

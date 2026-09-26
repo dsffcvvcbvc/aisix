@@ -330,6 +330,60 @@ pub fn apply_request_headers(headers: &mut HeaderMap, ctx: &UpstreamHeaderContex
     ForwardedClientHeaders::resolve(ctx).apply(headers);
 }
 
+/// Scrub proxy-tracing / Chromium-fingerprint tells from an outbound
+/// upstream `HeaderMap`, keeping the gateway correlation id and moving
+/// `Authorization` last (native-client fingerprint order).
+///
+/// Shared by the CLI-bridge vendors (`clinepass`, `codex`, `grok-cli`,
+/// `qoder`) and Antigravity: every bridge builds its identity headers
+/// first, merges operator headers via [`apply_request_headers`], then
+/// calls this last — `identity → apply → scrub → auth-last`.
+///
+/// Deliberately narrow: only proxy-tracing (`x-forwarded-*`, `x-real-ip`,
+/// `forwarded`, `via`), Chromium fingerprint (`sec-ch-ua*`,
+/// `sec-fetch-*`, `priority`) and gateway-internal `x-aisix-*` (except
+/// `x-aisix-request-id`, which intentionally travels upstream) are
+/// removed. Bridge-owned identity headers (`x-stainless-*` on qoder,
+/// `http-referer` / `x-title` on cline, `accept-encoding` pins) are NOT
+/// touched here — each bridge owns those and re-asserts them after this
+/// when its upstream requires it (Antigravity does).
+pub fn scrub_upstream_headers(headers: &mut HeaderMap) {
+    const REMOVE: &[&str] = &[
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-real-ip",
+        "forwarded",
+        "via",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "sec-fetch-mode",
+        "sec-fetch-site",
+        "sec-fetch-dest",
+        "priority",
+    ];
+    let auth = headers.remove(http::header::AUTHORIZATION);
+    let doomed: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let lower = name.as_str().to_ascii_lowercase();
+            if lower.starts_with("x-aisix-") {
+                return lower != "x-aisix-request-id";
+            }
+            REMOVE.contains(&lower.as_str())
+        })
+        .cloned()
+        .collect();
+    for name in doomed {
+        headers.remove(name);
+    }
+    if let Some(auth) = auth {
+        headers.insert(http::header::AUTHORIZATION, auth);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +889,60 @@ mod tests {
         let ctx = UpstreamHeaderContext::default().with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn scrub_drops_proxy_and_chromium_tells_but_keeps_the_bridge_identity() {
+        let mut headers = client(&[
+            ("x-forwarded-for", "10.0.0.1"),
+            ("x-real-ip", "10.0.0.1"),
+            ("forwarded", "for=10.0.0.1"),
+            ("via", "1.1 proxy"),
+            ("sec-ch-ua", "\"Chromium\""),
+            ("sec-fetch-mode", "cors"),
+            ("priority", "u=0"),
+            ("x-aisix-tenant", "internal-only"),
+            ("x-aisix-request-id", "req-1"),
+            // Bridge-owned identity: the scrub must not touch it.
+            ("x-stainless-lang", "js"),
+            ("http-referer", "https://cline.bot"),
+            ("authorization", "Bearer tok"),
+        ]);
+        scrub_upstream_headers(&mut headers);
+        for gone in [
+            "x-forwarded-for",
+            "x-real-ip",
+            "forwarded",
+            "via",
+            "sec-ch-ua",
+            "sec-fetch-mode",
+            "priority",
+            "x-aisix-tenant",
+        ] {
+            assert!(!headers.contains_key(gone), "{gone} should be scrubbed");
+        }
+        assert_eq!(headers["x-aisix-request-id"], "req-1");
+        assert_eq!(headers["x-stainless-lang"], "js");
+        assert_eq!(headers["http-referer"], "https://cline.bot");
+        assert_eq!(headers["authorization"], "Bearer tok");
+    }
+
+    #[test]
+    fn scrub_moves_authorization_last() {
+        // The native clients put `Authorization` after the identity
+        // block, so the scrub has to re-insert it to keep the
+        // fingerprint order rather than leave it wherever it landed.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer tok"),
+        );
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("Cline/1.0.0"),
+        );
+        scrub_upstream_headers(&mut headers);
+        let names: Vec<&str> = headers.keys().map(|n| n.as_str()).collect();
+        assert_eq!(names, vec!["user-agent", "authorization"]);
     }
 }

@@ -59,8 +59,8 @@ pub use structured_output::{
 };
 pub use upstream_headers::{
     apply_request_headers, client_header_forwardable, header_forward_blocked,
-    resolve_default_headers, resolve_extra_headers, CallerIdentity, ForwardedClientHeaders,
-    UpstreamHeaderContext,
+    resolve_default_headers, resolve_extra_headers, scrub_upstream_headers, CallerIdentity,
+    ForwardedClientHeaders, UpstreamHeaderContext,
 };
 pub use upstream_http::{
     client_builder, error_with_causes, send_error, transport_error_message, UpstreamHttpConfig,

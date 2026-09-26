@@ -28,19 +28,29 @@ pub async fn update_resources(
     }
 
     let env_lookup = |name: &str| std::env::var(name).ok();
-    let current_version = state.snapshot.version();
-    let new_version = current_version + 1;
+    // Revision stamped into the loaded snapshot. It is a pre-read
+    // counter, i.e. a hint: see the commit note below for why it cannot
+    // be exact.
+    let revision = state.snapshot.version() + 1;
 
     let new_snapshot =
-        aisix_core::filesource::load_from_str(&body, "admin_api", new_version as i64, &env_lookup)
+        aisix_core::filesource::load_from_str(&body, "admin_api", revision as i64, &env_lookup)
             .map_err(|errs| {
                 let msgs: Vec<String> = errs.errors.into_iter().map(|e| e.to_string()).collect();
                 AdminError::BadRequest(format!("Validation failed: {}", msgs.join("; ")))
             })?;
 
-    // Commit via RCU (CAS) so concurrent POSTs cannot lose an update
-    // the way a bare load + store sequence can. `SnapshotHandle::store`
-    // takes `S` directly (`snapshot.rs:340`, `main.rs:479`) — no `Arc::new`.
+    // Commit via `rcu`, which swaps the whole snapshot atomically: an
+    // in-flight reader that already loaded the previous one keeps a
+    // valid `Arc` to it for as long as it needs, and never observes a
+    // half-applied snapshot. It is NOT a version-keyed
+    // compare-and-swap here — the closure ignores its argument, so this
+    // is a last-writer-wins full replace and two concurrent POSTs both
+    // apply, the later one winning. Consequently two concurrent writers
+    // can also stamp the SAME revision above (both pre-read the same
+    // counter); the response therefore reports the publish counter read
+    // back AFTER the commit, which is the value the snapshot consumers
+    // actually observe.
     state.snapshot.rcu(|_| new_snapshot.clone());
     let applied_version = state.snapshot.version();
 
@@ -88,7 +98,9 @@ fn persist_resources_file(target: &Path, body: &str) -> Result<(), String> {
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
+                if let Err(e) = dir.sync_all() {
+                    tracing::warn!(path = %target.display(), error = %e, "parent dir fsync failed after resources persist");
+                }
             }
         }
     }
@@ -148,9 +160,11 @@ pub async fn serve_dashboard_index() -> Response {
         }
     }
 
-    // Clean status landing page if dashboard SPA build has not been placed yet
+    // Clean status landing page if dashboard SPA build has not been placed yet.
+    // English, matching the rest of the admin surface (this is an
+    // operator fallback, not a dashboard locale).
     Html(r#"<!DOCTYPE html>
-<html lang="ru">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <title>AISIX Gateway Dashboard</title>
@@ -167,9 +181,9 @@ pub async fn serve_dashboard_index() -> Response {
 <body>
   <div class="card">
     <div class="badge">AISIX Unified Native Gateway</div>
-    <h1>Панель управления шлюзом</h1>
-    <p>Ядро шлюза активно и обрабатывает запросы. Статический SPA-дашборд ожидает размещения в директории <code>~/.aisix/dashboard/out</code>.</p>
-    <a href="/admin/openapi-scalar" class="btn">Открыть Scalar UI (OpenAPI)</a>
+    <h1>Gateway dashboard</h1>
+    <p>The gateway core is running and serving requests. The static SPA dashboard is expected in <code>~/.aisix/dashboard/out</code>.</p>
+    <a href="/admin/openapi-scalar" class="btn">Open Scalar UI (OpenAPI)</a>
   </div>
 </body>
 </html>"#).into_response()
@@ -177,9 +191,19 @@ pub async fn serve_dashboard_index() -> Response {
 
 pub async fn serve_dashboard_asset(AxumPath(path): AxumPath<String>) -> Response {
     let root = dashboard_root();
-    // Security: sanitize path to avoid directory traversal
-    let clean_path = path.trim_start_matches('/').replace("..", "");
-    let file_path = root.join(&clean_path);
+    // Security: resolve the request against the asset root segment by
+    // segment (see `dashboard_asset_relative`) instead of stripping
+    // `..` textually — the textual strip is defeated by `....//`.
+    let Some(rel) = dashboard_asset_relative(&path) else {
+        // `/` (and an all-empty path) is the SPA root, not a file; a
+        // `..` segment is an escape attempt and never gets a document.
+        return if path.split('/').all(|s| s.is_empty()) {
+            serve_dashboard_index().await
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    };
+    let file_path = root.join(&rel);
 
     if file_path.is_file() {
         if let Ok(bytes) = std::fs::read(&file_path) {
@@ -193,9 +217,84 @@ pub async fn serve_dashboard_asset(AxumPath(path): AxumPath<String>) -> Response
     }
 
     // SPA fallback: for client-side routing, non-asset paths fallback to index.html
-    if !clean_path.contains('.') {
+    if !rel.to_string_lossy().contains('.') {
         return serve_dashboard_index().await;
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// The asset-root-relative path a dashboard request resolves to, or
+/// `None` when the request tries to leave the asset root.
+///
+/// Rejecting a `..` segment outright is the point: the previous
+/// `trim_start_matches('/').replace("..", "")` did not. `....//`
+/// strips to `//`, and `root.join("//etc/passwd")` is an ABSOLUTE
+/// path, so the read landed outside the root on any unix host.
+///
+/// `\` is rejected outright even though it is not a separator here: it
+/// is on Windows, and the `/` split below would not see it. NUL is
+/// rejected because it truncates the argument at the syscall, leaving
+/// a different path than the one validated.
+fn dashboard_asset_relative(path: &str) -> Option<PathBuf> {
+    if path.contains('\\') || path.contains('\0') {
+        return None;
+    }
+    let mut rel = PathBuf::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => continue,
+            ".." => return None,
+            other => rel.push(other),
+        }
+    }
+    (!rel.as_os_str().is_empty()).then_some(rel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn asset_paths_resolve_under_the_root() {
+        assert_eq!(
+            dashboard_asset_relative("assets/app.js").unwrap(),
+            PathBuf::from("assets/app.js")
+        );
+        // A leading slash and a redundant `.` carry no meaning for the
+        // join and must not be able to smuggle one in.
+        assert_eq!(
+            dashboard_asset_relative("/static/./app.js").unwrap(),
+            PathBuf::from("static/app.js")
+        );
+    }
+
+    #[test]
+    fn traversal_segments_are_rejected() {
+        assert!(dashboard_asset_relative("../../etc/passwd").is_none());
+        assert!(dashboard_asset_relative("assets/../../etc/passwd").is_none());
+        assert!(dashboard_asset_relative("assets/..").is_none());
+        assert!(dashboard_asset_relative("assets\\..\\..\\etc\\passwd").is_none());
+        assert!(dashboard_asset_relative("assets/app.js\0.png").is_none());
+        // Nothing to read: the SPA root, served by the index handler.
+        assert!(dashboard_asset_relative("").is_none());
+        assert!(dashboard_asset_relative("/").is_none());
+    }
+
+    #[test]
+    fn a_segment_named_like_a_dotdot_is_not_a_traversal() {
+        // The shape the old textual strip broke on, and the reason it
+        // broke: `....//` collapsed to `//`, and `root.join("//etc/passwd")`
+        // is ABSOLUTE, so the read left the root. Segment-wise, `....` is
+        // an ordinary directory name, so the resolved path stays relative
+        // and can only ever land under the root. `..foo` / `foo..` are
+        // ordinary names too — rejecting them would break real assets.
+        let rel = dashboard_asset_relative("....//....//etc/passwd").unwrap();
+        assert_eq!(rel, PathBuf::from("..../..../etc/passwd"));
+        assert!(!rel.is_absolute(), "resolved asset path must stay relative");
+        assert_eq!(
+            dashboard_asset_relative("..foo/bar..").unwrap(),
+            PathBuf::from("..foo/bar..")
+        );
+    }
 }

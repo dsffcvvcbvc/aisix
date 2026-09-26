@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use aisix_gateway::url_cache::cached_endpoint_url;
 use aisix_gateway::{
-    apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunkStream, ChatFormat,
-    ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
+    apply_request_headers, scrub_upstream_headers, Bridge, BridgeContext, BridgeError,
+    ChatChunkStream, ChatFormat, ChatResponse, SseDecoder, SseEvent, UpstreamHeaderContext,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -44,6 +44,7 @@ use http::{
 };
 use reqwest::{header, Client, StatusCode};
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::bridge::{map_http_error, parse_stream_chunk, prepare_outbound_body, with_deadline};
@@ -163,7 +164,9 @@ async fn exchange_refresh_token(
     let access_token = data_access.or(payload.access_token).ok_or_else(|| {
         BridgeError::UpstreamDecode("cline token response carried no accessToken".into())
     })?;
-    let refresh_token = data_refresh.or(payload.refresh_token).unwrap_or_else(|| refresh_token.to_string());
+    let refresh_token = data_refresh
+        .or(payload.refresh_token)
+        .unwrap_or_else(|| refresh_token.to_string());
     let ttl = match data_expires_in.or(payload.expires_in) {
         Some(secs) if secs > 0 => Duration::from_secs(secs as u64),
         _ => match data_expires_at.as_deref() {
@@ -245,27 +248,34 @@ impl ClinepassTokenMint {
                 }
             }
         }
+        // Drop the read guard before the network round-trip, then
+        // re-acquire + re-check under the write lock (no guard is held
+        // across `.send().await`).
+        let (access_token, refresh_token, ttl) =
+            exchange_refresh_token(&self.client, CLINE_REFRESH_URL, credential).await?;
         let mut guard = self.cached.write().await;
         if let Some((token, _, expiry)) = guard.as_ref() {
             if Instant::now() + Duration::from_secs(300) < *expiry {
                 return Ok((format!("Bearer {}", cline_access_token(token)), false));
             }
         }
-        let (access_token, refresh_token, ttl) =
-            exchange_refresh_token(&self.client, CLINE_REFRESH_URL, credential).await?;
-        *guard = Some((
-            access_token.clone(),
-            refresh_token,
-            Instant::now() + ttl,
-        ));
-        Ok((format!("Bearer {}", cline_access_token(&access_token)), false))
+        *guard = Some((access_token.clone(), refresh_token, Instant::now() + ttl));
+        Ok((
+            format!("Bearer {}", cline_access_token(&access_token)),
+            false,
+        ))
     }
 }
 
 // ─── Shared bridge core ─────────────────────────────────────────────────
 
 fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
-    if ctx.provider_key.provider.trim().eq_ignore_ascii_case("openai") {
+    if ctx
+        .provider_key
+        .provider
+        .trim()
+        .eq_ignore_ascii_case("openai")
+    {
         DeveloperRoleMode::Preserve
     } else {
         DeveloperRoleMode::MapToSystem
@@ -273,26 +283,54 @@ fn developer_role_mode(ctx: &BridgeContext) -> DeveloperRoleMode {
 }
 
 /// The `applyClineProtocolHeaders` identity set (`clineAuth.ts:72-98`).
-fn cline_protocol_headers() -> HeaderMap {
+///
+/// Every name and value is a compile-time constant, so a rejected one is
+/// a build-level mistake, not runtime input: a silently dropped identity
+/// header would ship a request the upstream no longer fingerprints as
+/// Cline, with nothing in the logs. The set therefore returns `Result`
+/// rather than skipping what it cannot encode.
+fn cline_protocol_headers() -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
     let set = |headers: &mut HeaderMap, name: &'static str, value: String| {
-        if let (Ok(n), Ok(v)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            headers.insert(n, v);
-        }
+        let n = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+            BridgeError::Config(format!(
+                "cline identity header name `{name}` is invalid: {e}"
+            ))
+        })?;
+        let v = HeaderValue::from_str(&value).map_err(|e| {
+            BridgeError::Config(format!(
+                "cline identity header `{name}` has an invalid value: {e}"
+            ))
+        })?;
+        headers.insert(n, v);
+        Ok::<(), BridgeError>(())
     };
-    set(&mut headers, "http-referer", "https://cline.bot".to_string());
-    set(&mut headers, "x-title", "Cline".to_string());
-    set(&mut headers, "user-agent", format!("Cline/{CLINE_CLIENT_VERSION}"));
-    set(&mut headers, "x-is-multiroot", "false".to_string());
-    set(&mut headers, "x-client-type", "omniroute".to_string());
-    set(&mut headers, "x-client-version", CLINE_CLIENT_VERSION.to_string());
-    set(&mut headers, "x-platform", std::env::consts::OS.to_string());
-    set(&mut headers, "x-platform-version", "unknown".to_string());
-    set(&mut headers, "x-core-version", CLINE_CLIENT_VERSION.to_string());
-    headers
+    set(
+        &mut headers,
+        "http-referer",
+        "https://cline.bot".to_string(),
+    )?;
+    set(&mut headers, "x-title", "Cline".to_string())?;
+    set(
+        &mut headers,
+        "user-agent",
+        format!("Cline/{CLINE_CLIENT_VERSION}"),
+    )?;
+    set(&mut headers, "x-is-multiroot", "false".to_string())?;
+    set(&mut headers, "x-client-type", "omniroute".to_string())?;
+    set(
+        &mut headers,
+        "x-client-version",
+        CLINE_CLIENT_VERSION.to_string(),
+    )?;
+    set(&mut headers, "x-platform", std::env::consts::OS.to_string())?;
+    set(&mut headers, "x-platform-version", "unknown".to_string())?;
+    set(
+        &mut headers,
+        "x-core-version",
+        CLINE_CLIENT_VERSION.to_string(),
+    )?;
+    Ok(headers)
 }
 
 fn build_request_headers(
@@ -300,23 +338,36 @@ fn build_request_headers(
     request_id: &str,
     hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
-    let mut headers = cline_protocol_headers();
+    let mut headers = cline_protocol_headers()?;
     headers.insert(
         header::AUTHORIZATION,
         HeaderValue::from_str(authorization).map_err(|_| {
-            BridgeError::InvalidUpstreamCredentials("cline credential is not a valid header value".into())
+            BridgeError::InvalidUpstreamCredentials(
+                "cline credential is not a valid header value".into(),
+            )
         })?,
     );
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(header::ACCEPT, HeaderValue::from_static("text/event-stream"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
     headers.insert(
         HeaderName::from_static("x-aisix-request-id"),
-        HeaderValue::from_str(request_id)
-            .map_err(|e| BridgeError::Config(format!("request_id contains invalid header chars: {e}")))?,
+        HeaderValue::from_str(request_id).map_err(|e| {
+            BridgeError::Config(format!("request_id contains invalid header chars: {e}"))
+        })?,
     );
     // Operator `default_headers` + forwarded client headers merge last
     // (skip-if-present: the Cline identity set above always wins).
     apply_request_headers(&mut headers, hdr);
+    // Shared proxy/chromium-tell scrub runs last (Authorization re-inserted
+    // last inside); bridge-owned Cline identity (`http-referer`, `x-title`)
+    // is preserved by the shared scrub's narrow denylist.
+    scrub_upstream_headers(&mut headers);
     Ok(headers)
 }
 
@@ -350,6 +401,7 @@ impl ClinepassCore {
         let mut stream = self.chat_stream_inner(req, ctx).await?;
         let mut full_content = String::new();
         let mut full_reasoning = String::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
         let mut final_usage = None;
         while let Some(chunk_res) = stream.next().await {
             let chunk = chunk_res?;
@@ -358,6 +410,9 @@ impl ClinepassCore {
             }
             if let Some(reasoning) = chunk.delta.reasoning_content {
                 full_reasoning.push_str(&reasoning);
+            }
+            if let Some(calls) = chunk.delta.tool_calls {
+                tool_calls.extend(calls);
             }
             if chunk.usage.is_some() {
                 final_usage = chunk.usage;
@@ -370,17 +425,28 @@ impl ClinepassCore {
             .unwrap_or(&ctx.model.display_name)
             .to_string();
         let mut message = aisix_gateway::ChatMessage::assistant(full_content);
+        let has_tools = !tool_calls.is_empty();
+        if has_tools {
+            message
+                .extra
+                .insert("tool_calls".to_string(), Value::Array(tool_calls));
+        }
         if !full_reasoning.is_empty() {
             message.extra.insert(
                 "reasoning_content".to_string(),
                 serde_json::Value::String(full_reasoning),
             );
         }
+        let finish_reason = if has_tools {
+            aisix_gateway::FinishReason::ToolCalls
+        } else {
+            aisix_gateway::FinishReason::Stop
+        };
         Ok(ChatResponse {
             id: ctx.request_id.clone(),
             model,
             message,
-            finish_reason: aisix_gateway::FinishReason::Stop,
+            finish_reason,
             usage: final_usage.unwrap_or_default(),
         })
     }
@@ -393,12 +459,14 @@ impl ClinepassCore {
         // `forceStream: true` — the upstream only implements streaming,
         // so even a `stream: false` client request goes out streaming
         // and `chat()` accumulates the SSE back into JSON.
-        let (authorization, _) = self.mint.get_authorization(&ctx.provider_key.api_key).await?;
-        let upstream = ctx
-            .model
-            .model_name
-            .as_deref()
-            .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))?;
+        let (authorization, _) = self
+            .mint
+            .get_authorization(&ctx.provider_key.api_key)
+            .await?;
+        let upstream =
+            ctx.model.model_name.as_deref().ok_or_else(|| {
+                BridgeError::InvalidUpstreamConfig("model.model_name missing".into())
+            })?;
         let messages = messages_from(req, developer_role_mode(ctx));
         let typed = build_request(req, upstream, &messages, true);
         let body = prepare_outbound_body(
@@ -531,7 +599,11 @@ impl Bridge for ClinepassBridge {
         aisix_core::Adapter::Openai.wire_protocol()
     }
 
-    async fn chat(&self, req: &ChatFormat, ctx: &BridgeContext) -> Result<ChatResponse, BridgeError> {
+    async fn chat(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         self.core.chat_accumulate(req, ctx).await
     }
 
@@ -554,7 +626,11 @@ impl Bridge for ClineBridge {
         aisix_core::Adapter::Openai.wire_protocol()
     }
 
-    async fn chat(&self, req: &ChatFormat, ctx: &BridgeContext) -> Result<ChatResponse, BridgeError> {
+    async fn chat(
+        &self,
+        req: &ChatFormat,
+        ctx: &BridgeContext,
+    ) -> Result<ChatResponse, BridgeError> {
         self.core.chat_accumulate(req, ctx).await
     }
 
@@ -657,7 +733,9 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/refresh"))
-            .respond_with(ResponseTemplate::new(400).set_body_string(r#"{"error":{"code":"invalid_grant"}}"#))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string(r#"{"error":{"code":"invalid_grant"}}"#),
+            )
             .mount(&server)
             .await;
         let err = exchange_refresh_token(
