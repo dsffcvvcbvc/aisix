@@ -270,7 +270,9 @@ fn upstream_model(ctx: &BridgeContext) -> Result<&str, BridgeError> {
         .ok_or_else(|| BridgeError::InvalidUpstreamConfig("model.model_name missing".into()))
 }
 
-async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
+/// Shared with the sibling vendor bridges in this crate (`clinepass`,
+/// `qoder`): same error-envelope contract, one parse site.
+pub(crate) async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> BridgeError {
     aisix_gateway::capture_upstream_error_http(
         status,
         resp,
@@ -314,7 +316,11 @@ fn parse_openai_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErr
 }
 
 /// Wrap a future in the optional deadline. `None` → no timeout.
-async fn with_deadline<T, F>(
+///
+/// `pub(crate)` for the sibling vendor bridges (`clinepass`, `qoder`,
+/// `grok_cli`, `codex`), which honour `BridgeContext::deadline` the
+/// same way.
+pub(crate) async fn with_deadline<T, F>(
     deadline: Option<Duration>,
     started: Instant,
     fut: F,
@@ -342,7 +348,10 @@ where
 /// (response side flag, but it transforms the *request* body before
 /// send when the upstream only accepts string content per the common
 /// gateway convention). Anything not configured is a no-op.
-fn prepare_outbound_body<T: serde::Serialize>(
+///
+/// `pub(crate)` for the OpenAI-wire sibling bridges (`clinepass`,
+/// `qoder`) so operator overrides behave identically there.
+pub(crate) fn prepare_outbound_body<T: serde::Serialize>(
     typed: &T,
     reasoning_model: bool,
     request: Option<&RequestOverrides>,
@@ -836,7 +845,10 @@ where
 /// whatever the upstream put at the configured path (e.g.
 /// DeepSeek's `delta.reasoning_content` is already canonical and
 /// requires no lift; a hypothetical future `delta.thinking` would).
-fn parse_stream_chunk(
+///
+/// `pub(crate)` for the OpenAI-wire sibling bridges (`clinepass`,
+/// `qoder`), which parse the same chunk shape.
+pub(crate) fn parse_stream_chunk(
     payload: &str,
     reasoning_path: Option<&str>,
 ) -> Result<OpenAiStreamChunk, BridgeError> {

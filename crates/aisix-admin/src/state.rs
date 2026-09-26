@@ -14,6 +14,7 @@ use aisix_core::{AdminConfig, AisixSnapshot};
 use aisix_etcd::WatchStatus;
 use aisix_proxy::{HealthTracker, LivezState, ModelRuntimeStatusTracker};
 use axum::Router;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::store::ConfigStore;
@@ -23,6 +24,11 @@ pub struct AdminState {
     pub snapshot: SnapshotHandle<AisixSnapshot>,
     pub admin_keys: Arc<[String]>,
     pub store: Arc<dyn ConfigStore>,
+    /// Standalone file source path (`config.resources_file`) used by
+    /// `POST /admin/v1/resources` for durable persistence. `None` in
+    /// etcd mode — the handler then falls back to `AISIX_RESOURCES_PATH`
+    /// / `resources.yaml` for standalone-style deployments.
+    pub resources_file: Option<PathBuf>,
     /// Shared in-process health tracker from the proxy. Used by the
     /// `/admin/v1/health` endpoint to report per-model health status.
     pub health_tracker: Option<Arc<HealthTracker>>,
@@ -54,12 +60,20 @@ impl AdminState {
             snapshot,
             admin_keys: Arc::from(cfg.admin_keys.clone()),
             store,
+            resources_file: None,
             health_tracker: None,
             runtime_status_tracker: None,
             watch_status: None,
             livez_state: Arc::new(LivezState::new()),
             proxy_router: None,
         }
+    }
+
+    /// Wire the standalone `resources_file` path so the resources write
+    /// endpoint persists to the same file the gateway booted from.
+    pub fn with_resources_file(mut self, path: Option<PathBuf>) -> Self {
+        self.resources_file = path;
+        self
     }
 
     /// Attach the watch supervisor's freshness status. When set, the

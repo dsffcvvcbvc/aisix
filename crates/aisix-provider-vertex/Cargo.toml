@@ -28,6 +28,7 @@ bytes.workspace = true
 futures.workspace = true
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 reqwest.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

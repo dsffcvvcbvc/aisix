@@ -1,0 +1,52 @@
+name: Release Binary Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_profile:
+        description: 'Build profile (release or release-lto)'
+        required: false
+        default: 'release'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build-release:
+    name: Build aisix Linux amd64 (Release)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.1
+          components: llvm-tools-preview
+
+      - name: Setup Protoc
+        uses: ./.github/actions/setup-protoc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: aisix-release-cache
+
+      - name: Build Release Binary
+        run: |
+          cargo build --release -p aisix-server --bin aisix
+
+      - name: Verify Binary
+        run: |
+          ls -lh target/release/aisix
+          file target/release/aisix
+
+      - name: Upload Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aisix-linux-amd64
+          path: target/release/aisix
+          if-no-files-found: error
+          retention-days: 7

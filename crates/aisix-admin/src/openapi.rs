@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the read-only operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, and drive the playground.\n\nResource write endpoints were removed in favor of declarative configuration: declare resources in a `resources_file` (`resources.yaml`) and reload with SIGHUP, or write them to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
+    "description": "The AISIX Admin API is the operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, drive the playground, and apply declarative resources via `POST /admin/v1/resources`.\n\n`POST /admin/v1/resources` validates a `resources.yaml` payload, hot-reloads it in memory, and persists it to the configured `resources_file` (`AISIX_RESOURCES_PATH` / `resources.yaml` fallback). Other resource writes stay declarative: edit the `resources_file` (`resources.yaml`, reloaded on SIGHUP) or write to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
   },
   "paths": {
     "/livez": {
@@ -1212,6 +1212,75 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ]
       }
     },
+    "/admin/v1/resources": {
+      "post": {
+        "summary": "Apply Declarative Resources",
+        "description": "Validate a declarative resources document, hot-reload it in memory, and persist it to the configured resources file.",
+        "requestBody": {
+          "description": "Declarative resources document (YAML or JSON) with `_format_version` and resource collections.",
+          "required": true,
+          "content": {
+            "application/yaml": {
+              "schema": {
+                "type": "string"
+              }
+            },
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resources validated, applied in memory, and persisted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Empty payload or validation failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Resource persistence failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Resources"
+        ]
+      }
+    },
     "/playground/chat/completions": {
       "post": {
         "summary": "Create Playground Chat Completion",
@@ -1991,6 +2060,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
     {
       "name": "Playground",
       "description": "In-process proxy playground endpoint for chat completions."
+    },
+    {
+      "name": "Resources",
+      "description": "Declarative resources document validation and application."
     }
   ]
 }"##;
@@ -2640,6 +2713,7 @@ mod tests {
             "/admin/v1/observability_exporters",
             "/admin/v1/observability_exporters/{id}",
             "/admin/v1/health",
+            "/admin/v1/resources",
             "/playground/chat/completions",
         ] {
             assert!(
@@ -2727,6 +2801,7 @@ mod tests {
             "/admin/v1/observability_exporters",
             "/admin/v1/observability_exporters/{id}",
             "/admin/v1/health",
+            "/admin/v1/resources",
             "/playground/chat/completions",
         ]);
 
@@ -2738,9 +2813,9 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_documents_no_admin_write_operations() {
-        // The resource write path was removed: the published reference
-        // must document GET-only resource routes (the playground POST is
-        // the sole non-GET operation, and it is not under /admin/v1/).
+        // Only `POST /admin/v1/resources` writes; every other `/admin/v1/`
+        // resource route stays GET-only (the playground POST is not under
+        // `/admin/v1/`).
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
         let paths = parsed["paths"]
@@ -2754,10 +2829,17 @@ mod tests {
                     continue;
                 }
                 if path.starts_with("/admin/v1/") {
-                    assert_eq!(
-                        method, "get",
-                        "{method} {path}: resource routes are read-only after write removal"
-                    );
+                    if path == "/admin/v1/resources" {
+                        assert_eq!(
+                            method, "post",
+                            "{method} {path}: the resources write route is POST-only"
+                        );
+                    } else {
+                        assert_eq!(
+                            method, "get",
+                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources"
+                        );
+                    }
                 }
                 assert!(
                     op.get("deprecated").is_none(),

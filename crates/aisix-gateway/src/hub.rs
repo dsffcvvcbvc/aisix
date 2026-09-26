@@ -56,10 +56,19 @@ pub const UPSTREAM_PROTOCOL_UNKNOWN: &str = "unknown";
 /// per request (`usage_attr::ResolvedPk`) and has no Hub in hand.
 pub fn upstream_protocol(pk: &ProviderKey) -> &'static str {
     match pk.provider.as_str() {
-        // The two vendors `build_hub()` registers a specialized bridge
-        // for. Both speak their own name on the wire.
+        // Vendors `build_hub()` registers a specialized bridge for.
+        // `openai`/`anthropic` speak their own name on the wire;
+        // `antigravity`/`agy` speak the Vertex wire shape.
         "openai" => Adapter::Openai.wire_protocol(),
         "anthropic" => Adapter::Anthropic.wire_protocol(),
+        "antigravity" | "agy" => Adapter::Vertex.wire_protocol(),
+        // Yellow-zone CLI bridges (`build_hub()` in aisix-server):
+        // `cline`/`clinepass` and `qoder` speak plain OpenAI chat
+        // completions; `grok-cli`/`codex` speak the Responses API,
+        // which is an OpenAI-family wire — and the closed `Adapter`
+        // enum has no responses variant, so they report `openai`
+        // exactly like the bridges' own `wire_protocol()`.
+        "cline" | "clinepass" | "qoder" | "grok-cli" | "codex" => Adapter::Openai.wire_protocol(),
         _ => pk
             .adapter
             .map(Adapter::wire_protocol)
@@ -121,6 +130,13 @@ impl Hub {
         self.family_bridges.get(&adapter).map(|r| r.clone())
     }
 
+    /// Alias for [`Hub::family_bridge_for`] kept for the
+    /// `hub.get_family(adapter)` call shape used by dispatch docs
+    /// (`aisix-proxy/src/dispatch.rs`). Delegates without new logic.
+    pub fn get_family(&self, adapter: Adapter) -> Option<Arc<dyn Bridge>> {
+        self.family_bridge_for(adapter)
+    }
+
     /// The vendor strings a specialized bridge is registered for.
     ///
     /// Exposed so `upstream_protocol_label_matches_dispatched_bridge`
@@ -144,7 +160,7 @@ impl Hub {
             return Some(b.clone());
         }
         let adapter = pk.adapter?;
-        self.family_bridges.get(&adapter).map(|r| r.clone())
+        self.get_family(adapter)
     }
 }
 

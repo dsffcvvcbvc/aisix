@@ -1,4 +1,5 @@
-//! aisix-admin — Admin API + Playground (:3001).
+//! aisix-admin — Admin API + Playground (conventionally :3001; see
+//! `AdminConfig` for the code default).
 //!
 //! Public admin-listener endpoints:
 //! - `GET  /livez`
@@ -9,8 +10,8 @@
 //! lives on the dedicated metrics listener (see [`metrics_router`]),
 //! identical in standalone and managed mode.
 //!
-//! Admin-key protected routes (read-only — every resource route serves
-//! GET; `api_keys` is also served at the former `apikeys` spelling):
+//! Admin-key protected routes (resource reads serve GET; `api_keys` is
+//! also served at the former `apikeys` spelling):
 //! - `GET /admin/v1/models` and `GET /admin/v1/models/:id`
 //! - `GET /admin/v1/api_keys` and `GET /admin/v1/api_keys/:id`
 //! - `GET /admin/v1/provider_keys` and `GET /admin/v1/provider_keys/:id`
@@ -23,14 +24,17 @@
 //! - `GET /admin/v1/passthrough_routes` and
 //!   `GET /admin/v1/passthrough_routes/:id`
 //! - `GET /admin/v1/models/status`, `GET /admin/v1/health`
+//! - `POST /admin/v1/resources` (validate + hot-reload + persist)
 //!
-//! The resource write endpoints (POST/PUT/DELETE, including api-key
-//! rotate) were removed in favor of the declarative configuration
-//! paths — a `resources_file` source (`resources.yaml`, reloaded on
-//! SIGHUP) or direct etcd writes. Writes to the routes above answer
-//! 405; the rotate path is gone (404). The storage layer stays
-//! pluggable via the read-only [`ConfigStore`] trait; production wires
-//! etcd or the file-snapshot store, tests use [`InMemoryStore`].
+//! `POST /admin/v1/resources` validates a declarative payload via
+//! `aisix_core::filesource::load_from_str`, commits it with an RCU
+//! update, and persists it to the configured `resources_file`
+//! (`AISIX_RESOURCES_PATH` / `resources.yaml` fallback). Other resource
+//! writes (PUT/DELETE, api-key rotate) remain unavailable: use the
+//! declarative file (reloaded on SIGHUP) or direct etcd writes. The
+//! storage layer stays pluggable via the [`ConfigStore`] trait;
+//! production wires etcd or the file-snapshot store, tests use
+//! [`InMemoryStore`].
 //!
 //! Errors follow the simple admin envelope: `{"error_msg": "..."}`,
 //! distinct from the proxy's OpenAI-style envelope.
@@ -55,6 +59,7 @@ mod openapi;
 mod passthrough_routes_handlers;
 mod playground_handler;
 mod provider_keys_handlers;
+mod resources_handler;
 mod state;
 pub mod store;
 
@@ -111,6 +116,18 @@ pub fn build_router(state: AdminState) -> Router {
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
         .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
+        .route(
+            "/admin/v1/resources",
+            post(resources_handler::update_resources),
+        )
+        .route(
+            "/dashboard",
+            get(resources_handler::serve_dashboard_index),
+        )
+        .route(
+            "/dashboard/*path",
+            get(resources_handler::serve_dashboard_asset),
+        )
         .route(
             "/admin/v1/models",
             get(models_handlers::list_models),
@@ -1532,9 +1549,10 @@ mod tests {
 
     // ──────────────────── Removed write path ────────────────────
 
-    /// The resource write path was removed: every collection and `:id`
+    /// Per-resource writes were removed: every collection and `:id`
     /// route serves GET only, so POST/PUT/DELETE answer 405 with an
     /// `Allow: GET` header — regardless of store backend or auth.
+    /// `POST /admin/v1/resources` is the sole write exception.
     #[tokio::test]
     async fn removed_resource_writes_answer_405_with_allow_get() {
         // The FULL matrix — every route spelling × every write method.

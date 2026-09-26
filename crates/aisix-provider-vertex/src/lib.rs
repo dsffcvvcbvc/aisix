@@ -55,5 +55,7 @@
 mod bridge;
 mod token_mint;
 mod wire;
+pub mod antigravity;
 
 pub use bridge::{VertexBridge, VertexPublisher};
+pub use antigravity::{AntigravityBridge, AntigravityTokenMint};

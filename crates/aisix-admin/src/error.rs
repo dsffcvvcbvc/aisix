@@ -22,6 +22,8 @@ pub enum AdminError {
     Unauthorized,
     #[error("resource not found")]
     NotFound,
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("store error: {0}")]
     Store(String),
 }
@@ -31,6 +33,7 @@ impl AdminError {
         match self {
             AdminError::Unauthorized => StatusCode::UNAUTHORIZED,
             AdminError::NotFound => StatusCode::NOT_FOUND,
+            AdminError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AdminError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

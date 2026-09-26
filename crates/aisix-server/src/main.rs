@@ -81,6 +81,9 @@ use aisix_provider_anthropic::AnthropicBridge;
 use aisix_provider_azure_openai::AzureOpenAiBridge;
 use aisix_provider_bedrock::BedrockBridge;
 use aisix_provider_openai::OpenAiBridge;
+use aisix_provider_openai::{
+    ClineBridge, ClinepassBridge, CodexBridge, GrokCliBridge, QoderBridge,
+};
 use aisix_provider_vertex::VertexBridge;
 use aisix_proxy::background::run_background_model_check_once;
 use aisix_proxy::budget::BudgetClient;
@@ -1413,6 +1416,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     };
     let admin_serve_handle = if let Some(admin_store) = admin_store.filter(|_| cfg.admin.enabled) {
         let mut admin_state = AdminState::new(snapshot_handle.clone(), admin_store, &cfg.admin)
+            .with_resources_file(file_source_path.clone())
             // Share the health tracker so /admin/v1/health reflects live
             // per-model upstream failure counts.
             .with_health_tracker(health_tracker)
@@ -2201,7 +2205,30 @@ fn build_hub() -> Hub {
     // openai` and resolve through the family tier above instead.
     hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
     hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
-
+    hub.register_specialized(
+        "antigravity",
+        Arc::new(aisix_provider_vertex::AntigravityBridge::new()),
+    );
+    hub.register_specialized(
+        "agy",
+        Arc::new(aisix_provider_vertex::AntigravityBridge::new()),
+    );
+    // ─── Yellow-zone CLI bridges (AGENT.md §4.3, Law 1) ──────────────
+    //
+    // `cline` / `clinepass`: Cline chat-completions host with the
+    // `workos:` dual-auth + Cline client headers
+    // (`aisix_provider_openai::clinepass`).
+    // `qoder`: Alibaba DashScope compat endpoint with the Qwen-OAuth
+    // header profile + `{statusCodeValue}` envelope unwrap
+    // (`aisix_provider_openai::qoder`).
+    // `grok-cli` / `codex`: Responses-API proxies (xAI cli-chat-proxy
+    // / ChatGPT backend) with their vendor client identities
+    // (`aisix_provider_openai::{grok_cli, codex}`).
+    hub.register_specialized("clinepass", Arc::new(ClinepassBridge::new()));
+    hub.register_specialized("cline", Arc::new(ClineBridge::new()));
+    hub.register_specialized("qoder", Arc::new(QoderBridge::new()));
+    hub.register_specialized("grok-cli", Arc::new(GrokCliBridge::new()));
+    hub.register_specialized("codex", Arc::new(CodexBridge::new()));
     hub
 }
 
@@ -4074,6 +4101,39 @@ managed:
             "anthropic",
             "specialized 'anthropic' MUST be `AnthropicBridge::new()` (bridge name 'anthropic')",
         );
+    }
+
+    /// Yellow-zone CLI vendors (AGENT.md §4.3) resolve to their
+    /// dedicated bridges, not to the `Adapter::Openai` family bridge:
+    /// each carries vendor auth/headers the family bridge does not
+    /// speak (`workos:` dual-auth, DashScope compat headers, Responses
+    /// client identities). The metric-label agreement sweep above
+    /// covers these vendors automatically via `specialized_vendors()`;
+    /// this pins the dispatch target itself.
+    #[test]
+    fn build_hub_registers_yellow_zone_cli_bridges() {
+        let hub = build_hub();
+        for (vendor, bridge_name) in [
+            ("clinepass", "clinepass"),
+            ("cline", "cline"),
+            ("qoder", "qoder"),
+            ("grok-cli", "grok-cli"),
+            ("codex", "codex"),
+        ] {
+            let bridge = hub
+                .get_specialized(vendor)
+                .unwrap_or_else(|| panic!("{vendor} vendor must be registered as specialized"));
+            assert_eq!(
+                bridge.name(),
+                bridge_name,
+                "specialized '{vendor}' dispatches to the wrong bridge",
+            );
+            assert_eq!(
+                bridge.wire_protocol(),
+                "openai",
+                "specialized '{vendor}' must report the openai wire protocol",
+            );
+        }
     }
 
     /// One accept path, and it has to keep setting `TCP_NODELAY`.

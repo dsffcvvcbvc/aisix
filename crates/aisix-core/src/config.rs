@@ -1136,6 +1136,11 @@ pub struct AdminConfig {
     #[serde(default = "AdminConfig::default_enabled")]
     pub enabled: bool,
     #[serde(default = "AdminConfig::default_addr")]
+    /// Socket address the admin listener binds, e.g. `127.0.0.1:3001`.
+    /// The code default is the non-routable `127.0.0.1:0` (ephemeral port,
+    /// forces an explicit override in real configs); the operational
+    /// convention in `config.example.yaml` and the Admin API docs is
+    /// `127.0.0.1:3001`.
     pub addr: String,
     /// Statically-provisioned admin keys. A request is authorised if it
     /// presents any of these via `Authorization: Bearer <k>` or `x-api-key`.
@@ -1147,9 +1152,10 @@ pub struct AdminConfig {
 
 impl AdminConfig {
     fn default_addr() -> String {
-        // Intentionally non-routable. Managed-mode configs never bind
-        // this; standalone configs are rejected by `Config::validate`
-        // if they leave it at the default without overriding.
+        // Intentionally non-routable (`127.0.0.1:0`, ephemeral). Managed-mode
+        // configs never bind this; standalone configs must override it —
+        // the operational default is `127.0.0.1:3001` (see
+        // `config.example.yaml` and the Admin API reference).
         "127.0.0.1:0".into()
     }
 
