@@ -59,6 +59,34 @@ const CACHED = "aisix_llm_cached_input_tokens_total";
 const USAGE = { prompt_tokens: 21, completion_tokens: 6, total_tokens: 27 };
 const CACHED_PROMPT_TOKENS = 13;
 
+/**
+ * The chat requests that reached one mock, ignoring everything else.
+ *
+ * `GET /v1/models` — the readiness gate every spec uses — makes the gateway
+ * ask each Provider Key's `api_base` for its catalog, so a mock's
+ * `receivedRequests` is never only this spec's chat traffic. Counting the
+ * whole array asserts a coincidence of how often the gate polled (the full
+ * suite left 22 recorded requests where a standalone run left 1). Counting
+ * the chat path asserts the subject.
+ */
+function chatsTo(mock: OpenAiUpstream, path: string) {
+  return mock.receivedRequests.filter((r) => r.path === path);
+}
+
+/**
+ * The chat path a vendor's `api_base` produces, from the same expression
+ * the seed uses. Derived rather than written out twice: the two copies
+ * drifted once, and a filter on a path nothing ever requests silently
+ * counts zero — which reads as "the upstream was never called" and inverts
+ * the meaning of every assertion built on it.
+ */
+const chatPath = (vendor: string) => `/v-${vendor}/chat/completions`;
+
+/** The 429 mock's chat traffic — the counts the cooldown test reasons about. */
+function rateLimitedChats(mock: OpenAiUpstream) {
+  return chatsTo(mock, chatPath(VENDOR_COOLDOWN));
+}
+
 /** Two real catalog ids, chosen because neither is Cohere. */
 const VENDOR_PRIMARY = "groq";
 const VENDOR_SECONDARY = "deepseek";
@@ -250,10 +278,10 @@ describe("preset-catalog vendors under routing: failover on 5xx, cooldown on 429
     // Asserting only the 200 would pass against a gateway that answered
     // from nowhere.
     expect(
-      failing.receivedRequests.filter((r) => r.path === `/v-${VENDOR_PRIMARY}/chat/completions`),
+      chatsTo(failing!, chatPath(VENDOR_PRIMARY)),
     ).toHaveLength(1);
     expect(
-      healthy.receivedRequests.filter((r) => r.path === `/v-${VENDOR_SECONDARY}/chat/completions`),
+      chatsTo(healthy!, chatPath(VENDOR_SECONDARY)),
     ).toHaveLength(1);
 
     // Per-ATTEMPT counters, filed under the target each attempt hit. The
@@ -305,13 +333,21 @@ describe("preset-catalog vendors under routing: failover on 5xx, cooldown on 429
       return;
     }
 
-    // Before: the target is healthy and the mock has never been called.
+    // Before: the target is healthy and no CHAT request has reached it.
+    //
+    // "No request at all" would be the wrong assertion and was the first
+    // version of it: the readiness gate is `GET /v1/models`, which the
+    // gateway answers by asking every Provider Key's `api_base` for its
+    // catalog, so this mock legitimately records those probes. Filtering to
+    // the chat path is what makes the counts mean what they claim — the
+    // whole-subject assertion that caught it was the full-suite run, where
+    // the gate polled often enough to leave 22 recorded requests.
     const before = await admin.listModelStatuses();
     const beforeRow = before.find((r) => r.display_name === MODEL_COOLDOWN);
     expect(beforeRow, `${MODEL_COOLDOWN} missing from /status/models`).toBeDefined();
     expect(beforeRow!.status).toBe("healthy");
     expect(beforeRow!.cooldown_until).toBeUndefined();
-    expect(rateLimited.receivedRequests).toHaveLength(0);
+    expect(rateLimitedChats(rateLimited!)).toHaveLength(0);
 
     // One 429, through the group. 429 is not retried by default
     // (`retry_on_429` defaults false and `fallback_on_statuses` is empty),
@@ -323,7 +359,7 @@ describe("preset-catalog vendors under routing: failover on 5xx, cooldown on 429
       messages: [{ role: "user", content: "get me cooled down" }],
     });
     expect(res.status, JSON.stringify(res.body)).toBe(429);
-    expect(rateLimited.receivedRequests).toHaveLength(1);
+    expect(rateLimitedChats(rateLimited!)).toHaveLength(1);
 
     // The state shows on the status listener, unauthenticated, as
     // `cooldown` plus the instant the target returns to rotation.
@@ -375,11 +411,11 @@ describe("preset-catalog vendors under routing: failover on 5xx, cooldown on 429
     ).toBe("served by secondary");
     // The decisive count: the cooled upstream was NOT called a second time.
     expect(
-      rateLimited.receivedRequests,
+      rateLimitedChats(rateLimited!),
       "the cooled target must be out of the candidate list",
     ).toHaveLength(1);
     expect(
-      healthy.receivedRequests.filter((r) => r.path === "/v-cooldown-fallback/chat/completions"),
+      chatsTo(healthy!, "/v-cooldown-fallback/chat/completions"),
     ).toHaveLength(1);
   });
 });
