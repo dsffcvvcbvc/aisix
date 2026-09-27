@@ -823,7 +823,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "summary": "Create a Combo",
         "description": "Create a combo. The resource id is derived from the combo name, as it is for a file-loaded model. The new combo is applied to the running configuration immediately and persisted to the active resources file.",
         "requestBody": {
-          "description": "One combo document. `name` and at least one entry in `models` are required; `strategy` is optional and defaults to `failover`.",
+            "description": "One combo document. `name` and at least one entry in `models` are required; `strategy` is optional and defaults to `failover`, and accepts either the gateway's own strategy names or the alternative names translated to them.",
           "required": true,
           "content": {
             "application/json": {
@@ -845,7 +845,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             }
           },
           "400": {
-            "description": "The document is not a valid combo, names a strategy this gateway does not implement, names a target that is not an existing direct model, or carries a field outside the combo contract",
+            "description": "The document is not a valid combo, names a strategy this gateway does not implement, names a target that is not an existing direct model, or carries a field outside the combo contract. A strategy the gateway does not dispatch is listed in the message, both as the names that are accepted and as the names that are deliberately refused",
             "content": {
               "application/json": {
                 "schema": {
@@ -2508,9 +2508,14 @@ const OPENAPI_JSON_BASE: &str = r##"{
               "failover",
               "least_cost",
               "least_latency",
-              "least_busy"
+              "least_busy",
+              "priority",
+              "weighted",
+              "round-robin",
+              "fill-first",
+              "cost-optimized"
             ],
-            "description": "How a request is routed to one of the combo's models: `round_robin` rotates by target `weight`, `consistent_hash` pins a request to the target its hash key lands on, `failover` always starts at the first target, `least_cost` starts at the cheapest, `least_latency` at the fastest, and `least_busy` at the least loaded. Omit the field to use `failover`.",
+            "description": "How a request is routed to one of the combo's models: `round_robin` rotates by target `weight`, `consistent_hash` pins a request to the target its hash key lands on, `failover` always starts at the first target, `least_cost` starts at the cheapest, `least_latency` at the fastest, and `least_busy` at the least loaded. Omit the field to use `failover`. The last five values are alternative names, translated on the way in to the strategy that implements them: `priority` and `fill-first` to `failover` (which starts at the first target, and where a target's `priority` decides which comes first), `weighted` and `round-robin` to `round_robin` (which rotates in proportion to target `weight`), and `cost-optimized` to `least_cost`. A stored combo reports the translated value, not the name that was sent, so a `priority` reads back as `failover`. Every other strategy name is refused with a `400` naming it, rather than mapped onto one of these.",
             "example": "round_robin"
           },
           "models": {

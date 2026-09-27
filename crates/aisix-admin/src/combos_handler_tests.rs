@@ -15,11 +15,23 @@
 //! - `every_strategy_the_model_schema_publishes_is_accepted` fails the
 //!   moment a strategy is added to the routing model without being listed
 //!   in the rejection message.
+//!
+//! The strategy-vocabulary block is written the same way. It has two
+//! vocabularies on the wire (the gateway's own six and the combo
+//! template's twenty) and one stored value, and every way that can go
+//! wrong is silent: a mapping pointed at the wrong strategy, a template
+//! name stored verbatim into a file the loader refuses, a refused name
+//! quietly accepted, a template name nobody classified. So
+//! `the_two_strategy_vocabularies_partition_the_template_list` is a census —
+//! it fails when a template strategy is neither honoured nor refused, or
+//! both — and
+//! `an_honoured_template_strategy_is_stored_as_the_strategy_that_implements_it`
+//! drives each accepted name end to end through the persisted file.
 
 use crate::auth::AdminAuth;
 use crate::combos_handler::{
     create_combo, delete_combo, get_combo, list_combos, render_resources_document, update_combo,
-    SUPPORTED_STRATEGIES,
+    REFUSED_TEMPLATE_STRATEGIES, SUPPORTED_STRATEGIES, TEMPLATE_STRATEGIES,
 };
 use crate::error::AdminError;
 use crate::state::AdminState;
@@ -799,14 +811,7 @@ async fn a_combo_round_trips_through_its_own_get_view() {
 /// fails this rather than leaving a message that lies.
 #[test]
 fn every_strategy_the_model_schema_publishes_is_accepted() {
-    let schema = aisix_core::models::schema::resource_root_schema("model", true);
-    let published: std::collections::BTreeSet<String> = schema["definitions"]["RoutingStrategy"]
-        ["oneOf"]
-        .as_array()
-        .expect("RoutingStrategy is a oneOf in the model schema")
-        .iter()
-        .filter_map(|branch| branch["enum"][0].as_str().map(str::to_string))
-        .collect();
+    let published = published_routing_strategies();
 
     let listed: std::collections::BTreeSet<String> = SUPPORTED_STRATEGIES
         .iter()
@@ -823,6 +828,431 @@ fn every_strategy_the_model_schema_publishes_is_accepted() {
         serde_json::from_value::<RoutingStrategy>(json!(name))
             .unwrap_or_else(|e| panic!("{name} is published but does not parse: {e}"));
     }
+}
+
+/// The six strategy spellings the routing model publishes, read out of the
+/// model schema rather than restated — the same source the drift check
+/// above uses, factored out so the alias table can be checked against it.
+fn published_routing_strategies() -> std::collections::BTreeSet<String> {
+    let schema = aisix_core::models::schema::resource_root_schema("model", true);
+    schema["definitions"]["RoutingStrategy"]["oneOf"]
+        .as_array()
+        .expect("RoutingStrategy is a oneOf in the model schema")
+        .iter()
+        .filter_map(|branch| branch["enum"][0].as_str().map(str::to_string))
+        .collect()
+}
+
+// ── strategy vocabularies ─────────────────────────────────────────────
+
+/// The combo template's full strategy list, transcribed from
+/// `omniroute/src/shared/constants/routingStrategies.ts` (`ROUTING_STRATEGY_VALUES`,
+/// lines 1-22) on 2026-09-27. It is a literal here because the two repos
+/// cannot read each other at build time; [`the_two_strategy_vocabularies_partition_the_template_list`]
+/// is what keeps it honest, so a name the template adds fails this build
+/// until it has been classified rather than being left unclassified by
+/// omission.
+///
+/// Note the count is **20**, not the 19 the template's own `AGENTS.md` prose
+/// lists: that prose omits `quota-weighted`, which the array does carry.
+const TEMPLATE_STRATEGY_NAMES: &[&str] = &[
+    "priority",
+    "weighted",
+    "round-robin",
+    "context-relay",
+    "fill-first",
+    "p2c",
+    "random",
+    "least-used",
+    "cost-optimized",
+    "reset-aware",
+    "reset-window",
+    "headroom",
+    "quota-weighted",
+    "strict-random",
+    "auto",
+    "lkgp",
+    "context-optimized",
+    "cache-optimized",
+    "fusion",
+    "pipeline",
+];
+
+#[test]
+fn the_two_strategy_vocabularies_partition_the_template_list() {
+    let honoured: std::collections::BTreeSet<&str> =
+        TEMPLATE_STRATEGIES.iter().map(|(name, _)| *name).collect();
+    let refused: std::collections::BTreeSet<&str> =
+        REFUSED_TEMPLATE_STRATEGIES.iter().copied().collect();
+    let published = published_routing_strategies();
+
+    // Every template name is accounted for, exactly once. A name in neither
+    // set would be refused by accident (as an unparseable value) rather than
+    // by decision; a name in both would be accepted *and* advertised as
+    // refused, which is the worst of the two.
+    let classified: std::collections::BTreeSet<&str> = honoured.union(&refused).copied().collect();
+    let template: std::collections::BTreeSet<&str> =
+        TEMPLATE_STRATEGY_NAMES.iter().copied().collect();
+    assert_eq!(
+        classified, template,
+        "every template strategy must be either honoured or refused by name; \
+         a name in neither is refused by accident, and a name in both is \
+         accepted while advertised as unsupported"
+    );
+    // Named separately from the equality above, because it is the property
+    // that matters most: a name in both sets would be accepted on the write
+    // path while the message advertised it as unsupported. (The equality
+    // implies it too — a name in both collapses the union below the template
+    // set — but the property is worth stating in its own right rather than
+    // leaving the reader to derive it.)
+    assert!(
+        honoured.is_disjoint(&refused),
+        "a name must be either honoured or refused, never both: \
+         honoured={honoured:?} refused={refused:?}"
+    );
+
+    // Each honoured name dispatches as a strategy the model really
+    // publishes — an alias pointing at a variant that does not exist would
+    // validate here and fail on the request path.
+    for (name, strategy) in TEMPLATE_STRATEGIES {
+        let spelling = serde_json::to_value(strategy).unwrap();
+        assert!(
+            published.contains(spelling.as_str().unwrap_or_default()),
+            "{name} maps to {spelling}, which the model schema does not publish"
+        );
+    }
+
+    // And a template name never shadows a gateway spelling, so every
+    // accepted string has exactly one meaning: the enum arm always wins,
+    // and a name that were also an enum value would translate only on one
+    // code path.
+    for (name, _) in TEMPLATE_STRATEGIES {
+        assert!(
+            !published.contains(*name),
+            "{name} is both a template alias and a published gateway spelling"
+        );
+    }
+}
+
+/// The mapping, restated as a literal.
+///
+/// [`an_honoured_template_strategy_is_stored_as_the_strategy_that_implements_it`]
+/// checks the table is *applied*; it reads the expected value out of the
+/// table, so on its own it cannot notice a table that maps a name to the
+/// wrong strategy. This is the anchor that can: it is a second, independent
+/// statement of what each template name is justified as, and it disagrees
+/// with the table loudly if either is edited carelessly. Each pair carries
+/// the reason in the comment beside it — a mapping that has to be defended
+/// in prose on both sides is a mapping worth this much ceremony.
+#[test]
+fn the_honoured_mapping_is_the_one_the_semantics_justify() {
+    let justified: &[(&str, &str)] = &[
+        // "prefer the higher priority, fall through on failure"
+        ("priority", "failover"),
+        // "a share proportional to each target's weight" — and this
+        // gateway's round_robin is smooth *weighted* round-robin.
+        ("weighted", "round_robin"),
+        ("round-robin", "round_robin"),
+        // "keep filling in priority order" — the template's own fill-first
+        // branch preserves priority order and does nothing else.
+        ("fill-first", "failover"),
+        // "cheapest first", ranked by resolved price.
+        ("cost-optimized", "least_cost"),
+    ];
+    let actual: std::collections::BTreeMap<&str, String> = TEMPLATE_STRATEGIES
+        .iter()
+        .map(|(name, strategy)| {
+            (
+                *name,
+                serde_json::to_value(strategy)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        })
+        .collect();
+
+    let expected: std::collections::BTreeMap<&str, String> = justified
+        .iter()
+        .map(|(name, spelling)| (*name, (*spelling).to_string()))
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "the honoured mapping has drifted from the one justified in \
+         TEMPLATE_STRATEGIES and in this file's comments; re-derive it from the \
+         template's own semantics before changing it"
+    );
+}
+
+/// The published Admin API spec is the reference a caller writes against, so
+/// its `Combo.strategy` enum has to be the set the endpoint really accepts —
+/// gateway spellings plus the template names translated onto them. A spec
+/// that lists only the six would send every template name into a `400` that
+/// the same deployment's own docs say is valid.
+#[test]
+fn the_published_combo_strategy_enum_is_the_accepted_set() {
+    let spec: Value =
+        serde_json::from_str(crate::openapi::merged_openapi()).expect("the merged spec parses");
+    let published: std::collections::BTreeSet<String> = spec["components"]["schemas"]["Combo"]
+        ["properties"]["strategy"]["enum"]
+        .as_array()
+        .expect("Combo.strategy publishes an enum")
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+
+    let expected: std::collections::BTreeSet<String> = SUPPORTED_STRATEGIES
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(
+            TEMPLATE_STRATEGIES
+                .iter()
+                .map(|(name, _)| (*name).to_string()),
+        )
+        .collect();
+    assert_eq!(
+        published, expected,
+        "the published Combo.strategy enum has drifted from what the endpoint accepts"
+    );
+}
+
+/// A patch has to work on both vocabularies, and the refused names on both
+/// paths — the two handlers each call `read_strategy`, and a name accepted
+/// by `POST` but refused by `PATCH` (or the reverse) is a half-shipped
+/// surface that only shows up on the update a customer makes second.
+#[tokio::test]
+async fn both_vocabularies_behave_identically_on_create_and_patch() {
+    let dir = TempDir::new().unwrap();
+    let state = state_in(&dir);
+    let id = aisix_core::filesource::derive_id("models", "c");
+    assert_eq!(create(&state, combo_body("c")).await.0, StatusCode::CREATED);
+
+    for (template, strategy) in TEMPLATE_STRATEGIES {
+        let (status, body) = patch(&state, &id, json!({"strategy": template}).to_string()).await;
+        assert_eq!(status, StatusCode::OK, "{template} must patch: {body}");
+        let expected = serde_json::to_value(strategy).unwrap();
+        assert_eq!(body["combo"]["strategy"], expected);
+    }
+    for refused in REFUSED_TEMPLATE_STRATEGIES {
+        let (status, body) = patch(&state, &id, json!({"strategy": refused}).to_string()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{refused} must be refused on patch too: {body}"
+        );
+        assert!(body["error_msg"].as_str().unwrap().contains(refused));
+    }
+}
+
+/// The whole point of the two vocabularies: each honoured template name is
+/// accepted **and stored as the strategy that implements it**, and the
+/// stored model reports the gateway spelling — never the template name,
+/// which the resources file would refuse to load back.
+#[tokio::test]
+async fn an_honoured_template_strategy_is_stored_as_the_strategy_that_implements_it() {
+    for (index, (template, strategy)) in TEMPLATE_STRATEGIES.iter().enumerate() {
+        let dir = TempDir::new().unwrap();
+        let state = state_in(&dir);
+        let name = format!("combo-{index}");
+
+        let (status, body) = create(
+            &state,
+            json!({
+                "name": name,
+                "strategy": template,
+                "models": [{"model": "alpha", "weight": 3}, {"model": "beta"}],
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{template} must be accepted: {body}"
+        );
+
+        // The stored model dispatches as the mapped strategy — this is the
+        // assertion that fails if a mapping is ever pointed at the wrong
+        // variant.
+        let id = aisix_core::filesource::derive_id("models", &name);
+        let snapshot = state.snapshot.load();
+        let stored = snapshot
+            .models
+            .get_by_id(&id)
+            .expect("the combo must be published");
+        let routing = stored
+            .value
+            .routing
+            .as_ref()
+            .expect("a combo is a routing model");
+        assert_eq!(
+            routing.strategy, *strategy,
+            "{template} must dispatch as {strategy:?}, not as {:?}",
+            routing.strategy
+        );
+
+        // And the view reports the gateway spelling, so what the caller is
+        // shown is what the combo actually is.
+        let expected = serde_json::to_value(strategy).unwrap();
+        assert_eq!(
+            body["combo"]["strategy"], expected,
+            "{template} must read back as its gateway spelling"
+        );
+
+        // The persisted file is loadable, which is what forces the
+        // translation: a stored `strategy: "priority"` would not be.
+        let persisted = std::fs::read_to_string(dir.path().join("resources.yaml")).unwrap();
+        assert!(
+            !persisted.contains(&format!("\"{template}\"")),
+            "{template} must not reach the resources file: {persisted}"
+        );
+        load_from_str(&persisted, "test", 1, &|n: &str| std::env::var(n).ok())
+            .unwrap_or_else(|e| panic!("the file carrying {template} must load: {e:?}"));
+    }
+}
+
+/// The crux of the mapping, pinned on its own: `weighted` is honest here
+/// *because* this gateway's `round_robin` is smooth weighted round-robin.
+/// The property that makes it honest is the proxy's, and it is pinned there
+/// (`wrr_distribution_matches_weights_exactly`, `wrr_interleaves_rather_than_bursting`
+/// in `crates/aisix-proxy/src/routing.rs`); what this asserts is that
+/// `weighted` reaches that strategy rather than a plain unweighted cycle.
+#[tokio::test]
+async fn weighted_is_dispatched_as_weighted_round_robin_not_a_plain_cycle() {
+    let dir = TempDir::new().unwrap();
+    let state = state_in(&dir);
+
+    let (status, body) = create(
+        &state,
+        json!({
+            "name": "weighted-pool",
+            "strategy": "weighted",
+            "models": [{"model": "alpha", "weight": 7}, {"model": "beta", "weight": 3}],
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+    let stored = state
+        .snapshot
+        .load()
+        .models
+        .get_by_id(&aisix_core::filesource::derive_id(
+            "models",
+            "weighted-pool",
+        ))
+        .unwrap()
+        .value
+        .routing
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert_eq!(stored.strategy, RoutingStrategy::RoundRobin);
+    // The weights the operator set have to survive the translation, or the
+    // strategy is weighted over a set of ones.
+    assert_eq!(stored.targets[0].weight, Some(7));
+    assert_eq!(stored.targets[1].weight, Some(3));
+}
+
+/// Every refused name still 400s **by name**, and creates nothing. The
+/// message has to name the rejected value or a caller picking from a
+/// longer dashboard list cannot tell which of their inputs was the problem.
+#[tokio::test]
+async fn every_refused_template_strategy_is_rejected_by_name() {
+    for template in REFUSED_TEMPLATE_STRATEGIES {
+        let dir = TempDir::new().unwrap();
+        let state = state_in(&dir);
+
+        let (status, body) = create(
+            &state,
+            json!({
+                "name": "refused",
+                "strategy": template,
+                "models": [{"model": "alpha"}],
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{template} must be refused, not silently accepted: {body}"
+        );
+        let message = body["error_msg"].as_str().unwrap();
+        assert!(
+            message.contains(template),
+            "the refusal must name {template}: {message}"
+        );
+        // Nothing was written: a refusal that still created a model would
+        // leave a combo the operator believes is configured.
+        assert_eq!(
+            state.snapshot.load().models.len(),
+            2,
+            "{template} was written"
+        );
+        assert!(
+            !dir.path().join("resources.yaml").exists(),
+            "{template} persisted"
+        );
+    }
+}
+
+/// The refusal message is the only place a caller learns what *is*
+/// supported, so it has to carry both halves truthfully: the gateway
+/// spellings, the template names accepted as translations, and the refused
+/// names. A list that omits the refused ones leaves a caller who picked one
+/// from a dashboard list with nothing to act on.
+#[tokio::test]
+async fn the_refusal_message_names_what_is_accepted_and_what_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let state = state_in(&dir);
+
+    let (status, body) = create(
+        &state,
+        json!({"name": "c", "strategy": "fusion", "models": [{"model": "alpha"}]}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    let message = body["error_msg"].as_str().unwrap();
+    for supported in SUPPORTED_STRATEGIES {
+        assert!(message.contains(supported), "omits {supported}: {message}");
+    }
+    for (template, _) in TEMPLATE_STRATEGIES {
+        assert!(message.contains(template), "omits {template}: {message}");
+    }
+    for refused in REFUSED_TEMPLATE_STRATEGIES {
+        assert!(message.contains(refused), "omits {refused}: {message}");
+    }
+}
+
+/// A template name has to work on the update path too — the two entrypoints
+/// share `read_strategy`, and a name that only creates is a name an operator
+/// cannot change a combo to.
+#[tokio::test]
+async fn a_patch_accepts_a_template_strategy_name() {
+    let dir = TempDir::new().unwrap();
+    let state = state_in(&dir);
+    let id = aisix_core::filesource::derive_id("models", "c");
+    assert_eq!(create(&state, combo_body("c")).await.0, StatusCode::CREATED);
+
+    let (status, body) = patch(&state, &id, json!({"strategy": "priority"}).to_string()).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    // The response reports the stored strategy, not the one that was sent.
+    assert_eq!(body["combo"]["strategy"], "failover");
+    let stored = state
+        .snapshot
+        .load()
+        .models
+        .get_by_id(&id)
+        .unwrap()
+        .value
+        .routing
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert_eq!(stored.strategy, RoutingStrategy::Failover);
 }
 
 // ── durable file ─────────────────────────────────────────────────────

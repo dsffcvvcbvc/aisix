@@ -45,6 +45,43 @@
 //! Those fields have no home on a routing model, and saying so is more
 //! useful than inventing one.
 //!
+//! # Strategy names: two vocabularies, one stored value
+//!
+//! `strategy` accepts **either** the gateway's own six spellings
+//! ([`SUPPORTED_STRATEGIES`]) **or** a name from the combo template a
+//! dashboard offers its users ([`TEMPLATE_STRATEGIES`]). A template name is
+//! translated to the strategy that implements it and the routing model
+//! stores the gateway spelling, so `{"strategy": "priority"}` is accepted,
+//! dispatched as `failover`, and reads back as `failover` — the response
+//! reports what the combo *is*, not what it was asked for.
+//!
+//! Five template names are honoured, and only because each one names an
+//! algorithm this gateway genuinely runs (the reasoning per name, and the
+//! divergences, are on the table). `weighted` is the one that looks wrong
+//! and is not: `round_robin` here is *smooth weighted* round-robin, and the
+//! standalone `weighted` enum value was removed and folded into it on
+//! purpose.
+//!
+//! The other fifteen template names are **refused by name**, not mapped:
+//! `random`, `strict-random`, `p2c`, `least-used`, `headroom`,
+//! `context-relay`, `context-optimized`, `cache-optimized`, `reset-aware`,
+//! `reset-window`, `quota-weighted`, `auto`, `lkgp`, `fusion`, `pipeline`.
+//! Every one of them is refused because the algorithm it names is one this
+//! gateway does not run, and the nearest strategy that *does* run computes
+//! something different — a randomized pick mapped onto a deterministic
+//! picker, a cumulative request count onto an instantaneous in-flight
+//! gauge, a context *transfer* onto a context *pin*. A caller who picked one
+//! of these from a dashboard list would be told it was configured while a
+//! different policy served their traffic, which is worse than a 400 that
+//! names the value. [`REFUSED_TEMPLATE_STRATEGIES`] carries the per-name
+//! reason.
+//!
+//! This is a data-plane half only. The paired control-plane change each
+//! accepted template name implies — schema enum, Go model, etcd projection,
+//! dashboard dropdown, en/zh i18n — is specified in `CP_COMBOS_PROJECT.md`;
+//! the control-plane repository is not reachable from here, so none of it
+//! ships with this change.
+//!
 //! # Validation
 //!
 //! The same two gates the declarative file source uses, in the same order:
@@ -114,8 +151,8 @@ const COMBO_FIELDS: &[&str] = &["name", "strategy", "models"];
 /// leave behind a file no reload accepts.
 const COMBO_MODEL_FIELDS: &[&str] = &["model", "weight", "priority", "tags"];
 
-/// The strategy spellings, named only so a rejection can list them. The
-/// accepted set itself is the enum — a request is parsed through
+/// The gateway strategy spellings, named only so a rejection can list them.
+/// The accepted set itself is the enum — a request is parsed through
 /// [`RoutingStrategy`] — and a test pins this list against the enum values
 /// the model schema publishes, so a new strategy cannot be accepted while
 /// this message still claims a shorter list.
@@ -126,6 +163,139 @@ const SUPPORTED_STRATEGIES: &[&str] = &[
     "least_cost",
     "least_latency",
     "least_busy",
+];
+
+/// The combo-template strategy names this gateway honours, and the strategy
+/// each one is dispatched as.
+///
+/// A name lands here only when the routing model that answers to it does what
+/// the template's own name promises. `weighted` is the case that looks
+/// dishonest and is not: this gateway's `round_robin` is *smooth weighted*
+/// round-robin (the nginx algorithm — `aisix-proxy/src/routing.rs::wrr_pick`),
+/// and the separate `weighted` enum value was removed and folded into it on
+/// purpose (AISIX-Cloud#1206; the removal is pinned by
+/// `removed_weighted_strategy_and_sticky_flag_are_rejected` in
+/// `aisix-core/src/models/routing.rs`). A name whose algorithm the gateway
+/// does not implement is refused instead — see [`REFUSED_TEMPLATE_STRATEGIES`]
+/// for that list and the reason each one is on it.
+const TEMPLATE_STRATEGIES: &[(&str, RoutingStrategy)] = &[
+    // "Prefer the higher priority, fall through on failure." `failover` starts
+    // at the first target and only moves later on failure, and the routing
+    // model partitions every target list into priority tiers first
+    // (`partition_by_priority`), so a combo that sets `priority` per target
+    // gets exactly this. Divergence: the tiering is not what `failover` alone
+    // means — it is a property of the model, so a target list with no explicit
+    // `priority` is a single tier and behaves as plain first-then-failover.
+    ("priority", RoutingStrategy::Failover),
+    // "Send a share of the traffic proportional to each target's weight." The
+    // gateway's `round_robin` is smooth weighted round-robin, whose long-run
+    // share is exactly that. Divergence, stated rather than hidden: the
+    // template draws per request from `secureRandomFloat() * totalWeight`
+    // (`open-sse/services/combo/targetSorters.ts::selectWeightedTarget`),
+    // which is independent, while smooth WRR is a deterministic rotation. The
+    // shares over time are the same; the per-request selection law is not, and
+    // the template's `stickyWeightedLimit` knob has no equivalent here.
+    ("weighted", RoutingStrategy::RoundRobin),
+    // The same name for the same algorithm. The template's `stickyRoundRobinLimit`
+    // is the one thing it adds, and this gateway spells stickiness as its own
+    // strategy (`consistent_hash`) rather than a per-combo knob.
+    ("round-robin", RoutingStrategy::RoundRobin),
+    // The template's own branch for it preserves priority order and nothing
+    // else (`open-sse/services/combo/applyStrategyOrdering.ts`, the
+    // `fill-first` arm logs "preserving priority order" and leaves the list
+    // untouched), so it is `failover` under a second name.
+    ("fill-first", RoutingStrategy::Failover),
+    // Cheapest resolved price first, ascending — the same rule the template
+    // applies in `sortTargetsByCost`, against the same per-model price.
+    ("cost-optimized", RoutingStrategy::LeastCost),
+];
+
+/// The template strategy names this gateway refuses, and why each one is a
+/// refusal rather than a translation.
+///
+/// They are not omissions to be papered over with a nearby name. A
+/// name-level mapping that changes which target serves a request is worse
+/// than an honest 400, because the operator reads the dashboard, believes
+/// they configured a policy, and gets a different one — the exact "configured
+/// and does nothing" outcome this surface exists to prevent.
+///
+/// * **`random` / `strict-random` / `p2c`** are all *stochastic*: a shuffle, a
+///   without-replacement deck, and a two-sample quality draw respectively.
+///   Every strategy they could borrow here is deterministic — `round_robin`
+///   rotates on a counter, `consistent_hash` pins a key to one target for as
+///   long as it is healthy. Mapping a random pick onto a deterministic picker
+///   is the dishonest swap in its purest form: the operator asked for
+///   spreading traffic and gets stickiness, or vice versa.
+/// * **`p2c`** is additionally not a load metric at all: the template scores
+///   `success_rate + 1/log10(latency+10)` minus a breaker penalty
+///   (`targetSorters.ts::getP2CTargetScore`), while `least_busy` ranks by
+///   in-flight ÷ weight and `least_latency` by a latency EWMA. Neither is the
+///   score p2c computes, and neither keeps the randomization that makes p2c
+///   avoid herding on the global-minimum target.
+/// * **`least-used`** counts requests *cumulatively, for the life of the
+///   combo* (`sortTargetsByUsage` over `metrics.byTarget[].requests`). The
+///   gateway tracks no such counter — `least_busy` reads the instantaneous
+///   in-flight gauge (`ModelRuntimeStatusTracker::in_flight`). A target that
+///   served a million requests an hour ago reads as idle, which is the
+///   opposite of what the name claims.
+/// * **`headroom`** is remaining *rate-limit* budget:
+///   `1 − max(util_5h, util_7d)` over plan-window saturation
+///   (`open-sse/services/combo/headroomRanking.ts`). `least_busy` measures
+///   concurrent requests. "Most free capacity" and "fewest in flight" are
+///   different signals, and only one of them is a queue depth.
+/// * **`context-relay`** *transfers* a conversation across a failover: it
+///   selects message history, summarizes it through a handoff model, and
+///   injects the summary into the new target
+///   (`open-sse/services/contextHandoff.ts`). `consistent_hash` sidesteps the
+///   problem instead of solving it, by pinning the session so there is no
+///   handoff — promising a relay and delivering a pin is a lie about the
+///   mechanism, and the handoff config (`handoffModel`,
+///   `handoffThreshold`, `maxMessagesForSummary`, `relayMode`) would be
+///   accepted-and-ignored.
+/// * **`reset-aware` / `reset-window` / `quota-weighted`** order by live quota
+///   state per connection — reset timestamps, plan-window saturation, quota
+///   share in flight (`open-sse/services/combo/quotaStrategies.ts`). The
+///   gateway's targets are models, and it holds no per-connection quota
+///   snapshot to order them by.
+/// * **`auto`** is a 16-factor scorer that picks one of `rules`/`score`/
+///   `cost`/`eco`/`latency`/`fast`/`sla-aware`/`sla`/`lkgp` per request
+///   (`open-sse/services/autoCombo/`, `resolveAutoStrategy.ts`). It is a
+///   strategy *chooser*, not a strategy; accepting it would mean accepting
+///   nine more names behind it, or silently picking one.
+/// * **`lkgp`** promotes the last-known-good *provider+connection*
+///   (`getLKGP` in `@/lib/db/settings`). This gateway has no provider accounts
+///   to remember a good one from — its targets are models, and "last known
+///   good" is a fact about a credential this surface does not hold.
+/// * **`context-optimized`** orders by the target's *context limit*,
+///   largest first (`sortTargetsByContextSize`).
+/// * **`cache-optimized`** pins a target by prompt-cache affinity so a
+///   repeated prefix stays on one upstream (`promptCacheAffinity.ts`).
+///   `consistent_hash` pins by the request's hash key, which is the wrong
+///   key: a cache key is the prompt, a routing key is the caller's session.
+/// * **`fusion`** fans out to a panel in parallel and has a *judge model*
+///   synthesize one answer (`open-sse/services/fusion.ts`); it is the
+///   ensemble shape, not a target-selection order.
+/// * **`pipeline`** is a multi-step DAG where each step may name a different
+///   model (`dispatchPrelude.ts:587`) — a request shape, not a strategy.
+///
+/// Every one of these is refused **by name** through [`read_strategy`], so the
+/// caller is told which value was rejected and what is accepted instead.
+const REFUSED_TEMPLATE_STRATEGIES: &[&str] = &[
+    "cache-optimized",
+    "context-optimized",
+    "context-relay",
+    "fusion",
+    "headroom",
+    "least-used",
+    "lkgp",
+    "pipeline",
+    "p2c",
+    "quota-weighted",
+    "random",
+    "reset-aware",
+    "reset-window",
+    "strict-random",
+    "auto",
 ];
 
 /// `GET /admin/v1/combos` — list every combo in the configuration.
@@ -460,31 +630,82 @@ fn apply_patch(
 
 /// Read and validate the `strategy` field, defaulting to the routing
 /// model's own default when the field is absent.
+///
+/// Two spellings are accepted, and they mean different things to the caller:
+///
+/// * the gateway's own ([`SUPPORTED_STRATEGIES`]) — what a stored routing
+///   model carries, and what a `GET` response hands back, so a view read
+///   from this surface patches straight back in;
+/// * a combo-template name ([`TEMPLATE_STRATEGIES`]) — the vocabulary an
+///   operator picks from in a dashboard. It is **translated on the way in**
+///   and the routing model stores the gateway spelling, because the
+///   template's name is not a strategy this gateway implements and the
+///   persisted file has to load back through the file source, which only
+///   knows the gateway's six.
+///
+/// So `{"strategy": "priority"}` is accepted, dispatched as `failover`, and
+/// reads back as `failover`. The response is the stored truth; a caller
+/// that needs the name it sent should remember it, because the combo view
+/// reports what the combo *is*, not what it was asked for.
+///
+/// Anything else is refused by name — see [`REFUSED_TEMPLATE_STRATEGIES`]
+/// for why each remaining template strategy is a refusal rather than a
+/// translation.
 fn read_strategy(value: Option<&Value>) -> Result<Value, AdminError> {
     let Some(value) = value else {
-        return Ok(json!("failover"));
+        return Ok(gateway_spelling(RoutingStrategy::default()));
     };
     let Value::String(name) = value else {
         return Err(AdminError::BadRequest("`strategy` must be a string".into()));
     };
-    // Parsed through the enum itself rather than against a hand-kept list,
-    // so the accepted set is exactly the strategies this build implements.
-    // The rejected value is echoed back capped: it is caller-supplied, and
-    // this string lands in the API response verbatim.
+    let strategy = match serde_json::from_value::<RoutingStrategy>(value.clone()) {
+        Ok(strategy) => strategy,
+        Err(_) => *TEMPLATE_STRATEGIES
+            .iter()
+            .find(|(template, _)| *template == name.as_str())
+            .map(|(_, strategy)| strategy)
+            .ok_or_else(|| refuse_strategy(name))?,
+    };
+    Ok(gateway_spelling(strategy))
+}
+
+/// The stored spelling of a strategy — the one the routing model and the
+/// resources file both use. Infallible for a fieldless enum; the expect
+/// names the invariant rather than papering over it, because the
+/// alternative (`unwrap_or(Value::Null)`) would write a `null` strategy into
+/// a model and fail later, somewhere that no longer knows why.
+fn gateway_spelling(strategy: RoutingStrategy) -> Value {
+    serde_json::to_value(strategy).expect("a fieldless enum always serialises")
+}
+
+/// The 400 for a strategy this gateway will not dispatch as.
+///
+/// Both halves of the truth are in it: what is accepted (with the template
+/// names marked as translations, so a caller does not expect a `priority`
+/// to read back as one), and what is deliberately not, so a caller who
+/// picked a name from a longer list is told it is a refusal and not an
+/// oversight. The rejected value is echoed back capped: it is caller-
+/// supplied, and this string lands in the API response verbatim.
+fn refuse_strategy(name: &str) -> AdminError {
     const MAX_ECHO_CHARS: usize = 64;
-    serde_json::from_value::<RoutingStrategy>(value.clone()).map_err(|_| {
-        let echo: String = name.chars().take(MAX_ECHO_CHARS).collect();
-        let truncated = if name.chars().count() > MAX_ECHO_CHARS {
-            format!("{echo}…")
-        } else {
-            echo
-        };
-        AdminError::BadRequest(format!(
-            "{truncated:?} is not a routing strategy. Supported strategies: {}.",
-            SUPPORTED_STRATEGIES.join(", ")
-        ))
-    })?;
-    Ok(value.clone())
+    let echo: String = name.chars().take(MAX_ECHO_CHARS).collect();
+    let truncated = if name.chars().count() > MAX_ECHO_CHARS {
+        format!("{echo}…")
+    } else {
+        echo
+    };
+    let templates = TEMPLATE_STRATEGIES
+        .iter()
+        .map(|(template, _)| *template)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let refused = REFUSED_TEMPLATE_STRATEGIES.join(", ");
+    AdminError::BadRequest(format!(
+        "{truncated:?} is not a routing strategy. Supported strategies: {}. \
+         Template names accepted as translations of those: {templates}. \
+         Not implemented, and refused rather than mapped onto a different one: {refused}.",
+        SUPPORTED_STRATEGIES.join(", ")
+    ))
 }
 
 /// Read the `models` array into routing targets, checking each one names a
