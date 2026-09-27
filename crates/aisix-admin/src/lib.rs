@@ -229,6 +229,17 @@ pub fn build_router(state: AdminState) -> Router {
         )
         .route("/favicon.ico", get(resources_handler::serve_dashboard_path))
         .route("/favicon.svg", get(resources_handler::serve_dashboard_path))
+        // The export ships a service worker at its root and registers it as
+        // `/sw.js?v=<build stamp>`. Mounting it on the dashboard chokepoint
+        // would serve the export's file, which precaches this origin's own
+        // document into credential-blind Cache Storage — so the admin origin
+        // answers it with a script that registers and stands down instead.
+        // The whole reasoning, and what must not be re-added, is on the
+        // handler: `serve_service_worker_standing_down`.
+        .route(
+            "/sw.js",
+            get(resources_handler::serve_service_worker_standing_down),
+        )
         .route(
             "/apple-touch-icon.png",
             get(resources_handler::serve_dashboard_path),
@@ -827,6 +838,7 @@ mod tests {
             "/manifest.webmanifest",
             "/favicon.ico",
             "/favicon.svg",
+            "/sw.js",
             "/apple-touch-icon.png",
             "/icon-512.png",
             "/providers/claude.svg",
