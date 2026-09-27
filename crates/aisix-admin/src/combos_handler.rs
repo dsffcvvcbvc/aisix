@@ -469,9 +469,18 @@ fn read_strategy(value: Option<&Value>) -> Result<Value, AdminError> {
     };
     // Parsed through the enum itself rather than against a hand-kept list,
     // so the accepted set is exactly the strategies this build implements.
+    // The rejected value is echoed back capped: it is caller-supplied, and
+    // this string lands in the API response verbatim.
+    const MAX_ECHO_CHARS: usize = 64;
     serde_json::from_value::<RoutingStrategy>(value.clone()).map_err(|_| {
+        let echo: String = name.chars().take(MAX_ECHO_CHARS).collect();
+        let truncated = if name.chars().count() > MAX_ECHO_CHARS {
+            format!("{echo}…")
+        } else {
+            echo
+        };
         AdminError::BadRequest(format!(
-            "{name:?} is not a routing strategy. Supported strategies: {}.",
+            "{truncated:?} is not a routing strategy. Supported strategies: {}.",
             SUPPORTED_STRATEGIES.join(", ")
         ))
     })?;

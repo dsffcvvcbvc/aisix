@@ -4,7 +4,9 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
   EtcdClient,
   SeedClient,
+  metricDelta,
   pickFreePort,
+  scrapeMetrics,
   spawnApp,
   startOpenAiUpstream,
   waitConfigPropagation,
@@ -38,6 +40,16 @@ const CALLER_KEY_HASH = createHash("sha256")
 
 const INPUT_TOKENS = 17;
 const OUTPUT_TOKENS = 23;
+const CACHED_TOKENS = 5;
+
+// The label tuple both cache counters carry. Narrowed to the model so a
+// sibling test's traffic on the same app cannot move the delta.
+const CACHED_LABELS = {
+  endpoint: "/v1/responses",
+  inbound_protocol: "openai",
+  upstream_protocol: "openai",
+  model: "gpt-5-codex",
+};
 
 // Real Responses-API streaming wire shape: created → output_text deltas →
 // terminal `response.completed` carrying the authoritative `usage` block
@@ -55,7 +67,7 @@ const STREAM_EVENTS = [
         input_tokens: INPUT_TOKENS,
         output_tokens: OUTPUT_TOKENS,
         output_tokens_details: { reasoning_tokens: 4 },
-        input_tokens_details: { cached_tokens: 5 },
+        input_tokens_details: { cached_tokens: CACHED_TOKENS },
       },
     },
   }),
@@ -219,6 +231,7 @@ describe("responses streaming usage emission (#808)", () => {
       }
     });
 
+    const before = await scrapeMetrics(app!.metricsUrl);
     const res = await fetch(`${app.proxyUrl}/v1/responses`, {
       method: "POST",
       headers: {
@@ -246,6 +259,33 @@ describe("responses streaming usage emission (#808)", () => {
     const lastReq = upstream.receivedRequests.at(-1);
     expect(lastReq?.path).toBe("/v1/responses");
     expect((JSON.parse(lastReq!.body) as { stream?: unknown }).stream).toBe(true);
+
+    const after = await scrapeMetrics(app!.metricsUrl);
+
+    // The prompt-cache read the terminal event carried
+    // (`input_tokens_details.cached_tokens`) is reported on its own
+    // counter, in a real scrape. Before this was mapped the terminal event
+    // carried the field and nothing observed it: the counter stayed flat,
+    // which is indistinguishable from an upstream that never cached — so
+    // the whole prompt billed uncached while the dashboard showed no cache
+    // detail at all.
+    expect(
+      metricDelta(
+        before,
+        after,
+        "aisix_llm_cached_input_tokens_total",
+        CACHED_LABELS,
+      ),
+    ).toBe(CACHED_TOKENS);
+    // And the subset arithmetic holds on the wire: the cached tokens are
+    // INSIDE `input_tokens`, so the input total must not have grown by
+    // them. Asserted as a ceiling rather than an equality because the
+    // delta is "the input this request was charged for", and the property
+    // under test is only that the cache read was not added on top — which
+    // is what folding it in would do.
+    expect(
+      metricDelta(before, after, "aisix_llm_input_tokens_total", CACHED_LABELS),
+    ).toBeLessThanOrEqual(INPUT_TOKENS);
 
     // Exactly one UsageEvent for the streamed request (not zero, not a
     // double-emit), carrying the terminal-event token counts.

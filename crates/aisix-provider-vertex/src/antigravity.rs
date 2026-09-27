@@ -1181,25 +1181,87 @@ struct AntigravityUsage {
     completion_tokens: Option<u32>,
     #[serde(rename = "totalTokenCount")]
     total_tokens: Option<u32>,
+    /// Context-cache hits. Gemini reports these as a SUBSET of
+    /// `promptTokenCount` — the OpenAI accounting shape, so they map onto
+    /// `UsageStats::cached_prompt_tokens` and must NOT be added to the
+    /// prompt total. The sibling Gemini bridge
+    /// (`aisix_provider_vertex::GeminiBridge`) says so on its own
+    /// `cachedContentTokenCount` field; this bridge speaks the same
+    /// `usageMetadata` and was not reading it at all, so an Antigravity
+    /// request that came almost entirely out of the context cache was
+    /// indistinguishable on the dashboard from one that missed entirely —
+    /// and the whole prompt billed uncached.
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u32>,
     /// Folded into `completion_tokens` with `reasoning_tokens` naming
     /// the subset (`sseCollect.ts:147-155`).
     #[serde(rename = "thoughtsTokenCount", default)]
     thoughts_tokens: Option<u32>,
+    /// Tokens fed back to the model from tool results — INPUT that
+    /// `promptTokenCount` does not include, and a term in Gemini's own
+    /// `totalTokenCount` identity. This bridge does send tools (a response
+    /// can carry a `functionCall` part), so the term is real here and not
+    /// a hypothetical; leaving it out under-reports the prompt and, worse,
+    /// makes the beside-vs-subset identity below misfire.
+    #[serde(rename = "toolUsePromptTokenCount", default)]
+    tool_use_prompt_tokens: Option<u32>,
 }
 
-/// Build the client-facing usage from `usageMetadata`: `thoughtsTokenCount`
-/// is reported BESIDE `candidatesTokenCount`, so the folded completion is
-/// their sum and `reasoning_folded_into_completion` records the fold for
-/// the UsageEvent path (see `UsageStats` docs).
+/// Build the client-facing usage from `usageMetadata`.
+///
+/// The arithmetic is the sibling Gemini bridge's
+/// (`GeminiUsageMetadata::into_usage_stats`), deliberately not a second
+/// derivation: the two bridges read the same `usageMetadata` shape, and
+/// anything one settles differently from the other is a report this bridge
+/// makes about a call the other already reported.
+///
+/// `thoughtsTokenCount` is the subtle term. Gemini changed its mind about
+/// whether `candidatesTokenCount` includes it, so neither reading can be
+/// hard-coded and `totalTokenCount` settles it: the candidates still
+/// summing to the total means they already absorbed the thoughts, and
+/// folding them again would bill the thinking twice. The cited
+/// `sseCollect.ts:147-155` behaviour on this surface is the BESIDE case,
+/// which the identity below also identifies; what it does not cover is the
+/// inclusive case, which is the one a fold-everything rule gets wrong.
 fn usage_from_metadata(u: &AntigravityUsage) -> UsageStats {
+    let prompt_token_count = u.prompt_tokens.unwrap_or(0);
+    let tool_use_prompt_tokens = u.tool_use_prompt_tokens.unwrap_or(0);
+    let candidates = u.completion_tokens.unwrap_or(0);
     let thoughts = u.thoughts_tokens.unwrap_or(0);
+    let cached = u.cached_content_token_count.unwrap_or(0);
     let total = u.total_tokens.unwrap_or(0);
+
+    // Gemini's identity is `total = prompt + candidates + toolUsePrompt +
+    // thoughts`, so candidates summing to the total means they have already
+    // absorbed the thoughts.
+    let prompt_tokens = prompt_token_count.saturating_add(tool_use_prompt_tokens);
+    // `thoughts <= candidates` is part of the test, not a safety clamp: a
+    // streaming frame mid-thinking hits exactly that — thoughts accrue
+    // while `candidatesTokenCount` is still 0 and a `totalTokenCount` that
+    // has not caught up satisfies the sum. Reading that frame as inclusive
+    // would yield `reasoning_tokens > completion_tokens`, which cp-api
+    // rejects outright, dropping the request from Logs and billing it with
+    // only a warning.
+    let candidates_inclusive =
+        total > 0 && prompt_tokens.saturating_add(candidates) == total && thoughts <= candidates;
+    // Client-facing accounting only: the UsageEvent records Gemini's own
+    // counters, subtracting the fold back out (see `UsageStats`).
+    let reasoning_folded_into_completion = if candidates_inclusive { 0 } else { thoughts };
+    let completion_tokens = candidates.saturating_add(reasoning_folded_into_completion);
+
     UsageStats {
-        prompt_tokens: u.prompt_tokens.unwrap_or(0),
-        completion_tokens: u.completion_tokens.unwrap_or(0).saturating_add(thoughts),
-        total_tokens: total,
+        prompt_tokens,
+        completion_tokens,
+        // Recomputed rather than echoed, as the sibling does: an OpenAI
+        // client decomposes the total as prompt + completion, and relaying a
+        // total built under different accounting breaks that. The upstream's
+        // own count is preserved alongside it, for the UsageEvent.
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        // A SUBSET of `prompt_tokens`, so recorded beside it and never
+        // added in.
+        cached_prompt_tokens: cached,
         reasoning_tokens: thoughts,
-        reasoning_folded_into_completion: thoughts,
+        reasoning_folded_into_completion,
         upstream_total_tokens: total,
         ..Default::default()
     }
@@ -1998,6 +2060,10 @@ mod tests {
 
     #[test]
     fn thoughts_tokens_fold_into_completion() {
+        // Gemini reports `thoughtsTokenCount` BESIDE
+        // `candidatesTokenCount` on this surface (`sseCollect.ts:147-155`):
+        // 10 + 20 + 10 == 40, so the candidates do NOT already contain the
+        // thoughts and the fold is required.
         let usage = usage_from_metadata(
             &serde_json::from_value(serde_json::json!({
                 "promptTokenCount": 10,
@@ -2012,6 +2078,170 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, 10);
         assert_eq!(usage.reasoning_folded_into_completion, 10);
         assert_eq!(usage.upstream_total_tokens, 40);
+    }
+
+    #[test]
+    fn thoughts_already_inside_the_candidates_are_not_folded_again() {
+        // The other reading, and the one a fold-everything rule gets wrong:
+        // 10 + 30 == 40, so `candidatesTokenCount` already absorbed the 10
+        // thinking tokens. Folding them in again would bill the thinking
+        // twice and report a completion Google never charged for.
+        let usage = usage_from_metadata(
+            &serde_json::from_value(serde_json::json!({
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 30,
+                "totalTokenCount": 40,
+                "thoughtsTokenCount": 10,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(
+            usage.completion_tokens, 30,
+            "the candidates already contain the thoughts"
+        );
+        assert_eq!(usage.reasoning_tokens, 10, "the subset is still named");
+        assert_eq!(
+            usage.reasoning_folded_into_completion, 0,
+            "nothing was folded"
+        );
+        assert_eq!(usage.upstream_total_tokens, 40);
+    }
+
+    #[test]
+    fn a_frame_whose_thoughts_exceed_the_candidates_is_never_read_as_inclusive() {
+        // `thoughts <= candidates` is part of the beside-vs-subset test, not
+        // a safety clamp: a streaming frame mid-thinking can report more
+        // thinking than candidates while a `totalTokenCount` that has not
+        // caught up still satisfies `prompt + candidates == total`. Read as
+        // inclusive that frame yields
+        // `reasoning_tokens > completion_tokens`, which cp-api rejects
+        // outright — dropping the request from Logs and billing it with only
+        // a warning. The `candidates < thoughts` frame below is the shape
+        // that distinguishes the two readings; without the clause this
+        // assertion fails.
+        let usage = usage_from_metadata(
+            &serde_json::from_value(serde_json::json!({
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15,
+                "thoughtsTokenCount": 20,
+            }))
+            .unwrap(),
+        );
+        assert!(
+            usage.reasoning_tokens <= usage.completion_tokens,
+            "reasoning {} must not exceed completion {}",
+            usage.reasoning_tokens,
+            usage.completion_tokens
+        );
+        // The inclusive reading is ruled out by the clause, so the frame is
+        // treated as beside — the reading that is also simply correct.
+        assert_eq!(usage.reasoning_folded_into_completion, 20);
+        assert_eq!(usage.completion_tokens, 25);
+    }
+
+    #[test]
+    fn cached_content_tokens_are_mapped_as_a_subset_of_the_prompt() {
+        // A context-cache hit, reported as a SUBSET of `promptTokenCount`
+        // (OpenAI accounting). Unmapped it read as "this request never
+        // cached", which is indistinguishable on the dashboard from a miss —
+        // and the whole prompt then bills uncached.
+        let usage = usage_from_metadata(
+            &serde_json::from_value(serde_json::json!({
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 10,
+                "totalTokenCount": 110,
+                "cachedContentTokenCount": 80,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            usage.prompt_tokens, 100,
+            "the cache hit is already inside the prompt"
+        );
+        assert_eq!(
+            usage.cached_prompt_tokens, 80,
+            "the cache read must be reported, not dropped"
+        );
+        // The subset arithmetic: the cache hit is never added to the prompt
+        // and never inflates the total.
+        assert!(usage.cached_prompt_tokens <= usage.prompt_tokens);
+        assert_eq!(usage.total_tokens, 110);
+        assert_eq!(usage.openai_cached_tokens(), 80);
+    }
+
+    #[test]
+    fn tool_use_prompt_tokens_join_the_prompt_count() {
+        // Tokens fed back from tool results are INPUT that
+        // `promptTokenCount` does not include, and a term in Gemini's own
+        // total identity. This bridge does send tools, so the term is real.
+        let usage = usage_from_metadata(
+            &serde_json::from_value(serde_json::json!({
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 10,
+                "toolUsePromptTokenCount": 5,
+                "totalTokenCount": 115,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(usage.prompt_tokens, 105);
+        // And with the term in the prompt, the beside-vs-subset identity
+        // is read against the right base: 105 + 10 == 115.
+        assert_eq!(usage.reasoning_folded_into_completion, 0);
+    }
+
+    #[test]
+    fn the_client_facing_total_is_the_prompt_plus_completion_decomposition() {
+        // An OpenAI client decomposes `total_tokens` as `prompt +
+        // completion`; a total built under other accounting breaks that,
+        // which is why the sibling recomputes it and this bridge now does
+        // too. The upstream's own count is preserved separately, and on
+        // every reading of the thoughts term the two agree — so this is a
+        // statement about which field is recomputed, not a change in the
+        // number a client sees.
+        use serde_json::json;
+        for (name, body) in [
+            (
+                "beside",
+                json!({"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 40, "thoughtsTokenCount": 10}),
+            ),
+            (
+                "inclusive",
+                json!({"promptTokenCount": 10, "candidatesTokenCount": 30, "totalTokenCount": 40, "thoughtsTokenCount": 10}),
+            ),
+            (
+                "plain",
+                json!({"promptTokenCount": 10, "candidatesTokenCount": 20, "totalTokenCount": 30}),
+            ),
+        ] {
+            let usage = usage_from_metadata(&serde_json::from_value(body).unwrap());
+            assert_eq!(
+                usage.total_tokens,
+                usage.prompt_tokens.saturating_add(usage.completion_tokens),
+                "{name}: the client-facing total must be the decomposition"
+            );
+            assert_eq!(usage.total_tokens, usage.upstream_total_tokens, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_usage_metadata_with_no_cache_counters_reports_no_cache_signal() {
+        // Absent is not zero. Both cache fields stay 0 because the upstream
+        // said nothing — which is the one case where a 0 is the honest
+        // answer, and it is why the mapping cannot be a fabricated 0 in
+        // every other case.
+        let usage = usage_from_metadata(
+            &serde_json::from_value(serde_json::json!({
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20,
+                "totalTokenCount": 30,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(usage.cached_prompt_tokens, 0);
+        assert_eq!(usage.reasoning_tokens, 0);
+        assert_eq!(usage.completion_tokens, 20);
     }
 
     #[test]

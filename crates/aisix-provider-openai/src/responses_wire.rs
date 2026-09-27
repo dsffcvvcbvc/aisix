@@ -200,6 +200,29 @@ fn responses_usage(value: &Value) -> UsageStats {
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0) as u32;
+    // `input_tokens_details.cached_tokens` is the Responses spelling of the
+    // Chat Completions `prompt_tokens_details.cached_tokens` this crate
+    // already mapped in `wire::into_usage`, and it carries the SAME
+    // accounting: a SUBSET already inside `input_tokens`, never a counter
+    // added on top. Left unmapped it read as "this provider never cached",
+    // so the whole prompt billed uncached on a request that came almost
+    // entirely out of the upstream cache. The singular
+    // `input_token_details` spelling some proxies emit is tolerated for
+    // the same reason `output_token_details` is above.
+    //
+    // This is the Responses half of the pair
+    // `UsageStats::openai_cached_tokens` names in its own contract ("OpenAI
+    // `prompt_tokens_details.cached_tokens` / Responses
+    // `input_tokens_details.cached_tokens`"): the projection read both
+    // spellings, and only one of them was ever populated.
+    let cached = usage
+        .and_then(|u| {
+            u.get("input_tokens_details")
+                .or_else(|| u.get("input_token_details"))
+        })
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
     // Beside-vs-subset: the Responses backends that report reasoning
     // BESIDE `output_tokens` state `total == prompt + output + reasoning`
     // (Gemini-shape, cf. Antigravity `usage_from_metadata`); the ones
@@ -214,6 +237,7 @@ fn responses_usage(value: &Value) -> UsageStats {
             output
         },
         total_tokens: total,
+        cached_prompt_tokens: cached,
         reasoning_tokens: reasoning,
         reasoning_folded_into_completion: if beside { reasoning } else { 0 },
         upstream_total_tokens: total,
@@ -473,6 +497,102 @@ mod tests {
         assert_eq!(resp.usage.reasoning_tokens, 8);
         assert_eq!(resp.usage.reasoning_folded_into_completion, 0);
         assert_eq!(resp.usage.upstream_total_tokens, 30);
+    }
+
+    /// The Responses spelling of the Chat Completions
+    /// `prompt_tokens_details.cached_tokens` this crate already mapped in
+    /// `wire::into_usage`. Unmapped, a Responses upstream that cached the
+    /// prompt read exactly like one that never cached it — and the whole
+    /// prompt billed uncached.
+    #[test]
+    fn input_token_details_cached_tokens_map_to_the_cache_read() {
+        let raw = serde_json::json!({
+            "id": "resp-cached",
+            "model": "codex",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "total_tokens": 120,
+                "input_tokens_details": {"cached_tokens": 80}
+            }
+        });
+        let resp = response_into_chat_response(&raw, "req-1", "fallback");
+        // The SUBSET arithmetic, both halves: the cache read is recorded
+        // and it is not added into the prompt.
+        assert_eq!(
+            resp.usage.prompt_tokens, 100,
+            "the cache read is already inside the input"
+        );
+        assert_eq!(resp.usage.cached_prompt_tokens, 80);
+        assert_eq!(resp.usage.openai_cached_tokens(), 80);
+        assert!(resp.usage.openai_cached_tokens() <= resp.usage.openai_prompt_tokens());
+        // And it never inflates the total.
+        assert_eq!(resp.usage.total_tokens, 120);
+    }
+
+    /// Some Responses proxies emit the singular `input_token_details`
+    /// spelling. Tolerated for the same reason `output_token_details` is.
+    #[test]
+    fn the_singular_input_token_details_spelling_is_tolerated() {
+        let raw = serde_json::json!({
+            "id": "resp-singular",
+            "model": "codex",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {
+                "input_tokens": 50,
+                "output_tokens": 5,
+                "total_tokens": 55,
+                "input_token_details": {"cached_tokens": 40}
+            }
+        });
+        let resp = response_into_chat_response(&raw, "req-1", "fallback");
+        assert_eq!(resp.usage.cached_prompt_tokens, 40);
+    }
+
+    /// The projection `UsageStats::openai_cached_tokens` documents as
+    /// reading BOTH OpenAI spellings — Chat Completions
+    /// `prompt_tokens_details.cached_tokens` (mapped in `wire::into_usage`,
+    /// pinned there) and Responses `input_tokens_details.cached_tokens`
+    /// (mapped here). This is the Responses half, asserted through the
+    /// projection rather than the raw field so the contract under test is
+    /// the one a client-facing renderer actually reads.
+    #[test]
+    fn the_cached_projection_sees_the_responses_spelling() {
+        let resp = response_into_chat_response(
+            &serde_json::json!({
+                "id": "r", "model": "m",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "x"}]}],
+                "usage": {
+                    "input_tokens": 100, "output_tokens": 1, "total_tokens": 101,
+                    "input_tokens_details": {"cached_tokens": 70}
+                }
+            }),
+            "req-1",
+            "fallback",
+        );
+        assert_eq!(resp.usage.openai_cached_tokens(), 70);
+        assert_eq!(resp.usage.openai_prompt_tokens(), 100);
+        // The subset invariant the projection promises, which is also the
+        // one cp-api validates an incoming usage event against.
+        assert!(resp.usage.openai_cached_tokens() <= resp.usage.openai_prompt_tokens());
+    }
+
+    /// Absent is not the same as zero-with-a-cache-hit, and a bridge that
+    /// reports nothing must not invent a signal: with no `input_tokens_details`
+    /// the projection stays 0, which cp-api reads as "no distinct cache
+    /// rate" and prices at the prompt rate.
+    #[test]
+    fn no_input_token_details_reports_no_cache_signal() {
+        let raw = serde_json::json!({
+            "id": "resp-nocache",
+            "model": "codex",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        });
+        let resp = response_into_chat_response(&raw, "req-1", "fallback");
+        assert_eq!(resp.usage.cached_prompt_tokens, 0);
+        assert_eq!(resp.usage.openai_cached_tokens(), 0);
     }
 
     #[test]
