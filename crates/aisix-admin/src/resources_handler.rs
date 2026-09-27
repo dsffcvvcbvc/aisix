@@ -8,6 +8,9 @@
 //!   exported documents request without the `dashboard` prefix
 //! - `GET /` and the origin-root app routes: the export's own non-dashboard
 //!   surface, resolved by the same chokepoint as the two above
+//! - `GET /providers/*path`: the vendor-logo tree, whose contents are a
+//!   property of the catalog rather than of the build, so it is mounted as a
+//!   tree — see [`PROVIDERS_DIR`]
 
 use std::path::{Path, PathBuf};
 
@@ -430,6 +433,45 @@ pub(crate) const ORIGIN_ROOT_ROUTES: &[&str] = &[
 /// constant rather than two spellings that can drift.
 const NEXT_STATIC_DIR: &str = "_next/static";
 
+/// The export's vendor-logo tree, at its root, because `assetPrefix` is empty
+/// in the export and a document draws a vendor as `<img src="/providers/<id>.svg">`.
+///
+/// Mounted as a TREE and not as a list of names, and that is the whole point:
+/// the tree's contents are a property of the vendor catalog, not of the build,
+/// so a name list is a list that rots silently against every catalog change —
+/// the mounted-by-name form left 136 of the 141 shipped logos 404ing on
+/// `/dashboard/providers/openai`, which is a grid of empty logo frames and
+/// nothing on the page that says why. Measured from the deployed export
+/// artifact: 141 files, every one of them `.svg`, no subdirectory, no
+/// symlink.
+///
+/// Because the mount answers for whatever is in the directory, it is bounded
+/// to what a logo tree is for — see [`is_provider_logo`].
+const PROVIDERS_DIR: &str = "providers";
+
+/// Whether a file inside [`PROVIDERS_DIR`] is one this mount may serve: what
+/// the mime table classifies as an image.
+///
+/// The alternative — answering for every file in the tree — would put
+/// whatever a future export drops into `providers/` on the admin origin,
+/// which is the origin `/admin/v1/*` answers on. A `.js` or an `.html` there
+/// would be served as a script or a document, and the refusal is deliberately
+/// decided on the TYPE the response would carry rather than on the name of a
+/// second extension list: an extension is servable here exactly when the one
+/// mime table already in this file gives it an `image/*` type. So admitting a
+/// new image format is one line in [`mime_for_path`] — the same line the
+/// artifact census already requires — and there is no second list to fall
+/// out of step. The default arm is `application/octet-stream`, so an
+/// extension the table does not know is not an image either.
+///
+/// Cost against the measured tree: none (141/141 are `.svg`). What it costs a
+/// future export that puts a non-image in a logo directory is a 404 saying
+/// the path is not part of the build — which is the honest answer, and a
+/// better one than serving it.
+fn is_provider_logo(path: &Path) -> bool {
+    mime_for_path(path).starts_with("image/")
+}
+
 /// The export root's own document: a null-rendering `EntryRedirector` whose
 /// whole job is to `router.replace('/dashboard')`. Addressable by exactly one
 /// URL shape — a request that reduces to an empty remainder — so that no
@@ -537,6 +579,9 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
         return no_build(rel.at_entry);
     }
 
+    // A candidate the logo bound rejected is remembered, so the answer for the
+    // request does not fall out of which mount spelled it: see the bound below.
+    let mut logo_bound_refused = false;
     for candidate in dashboard_candidates(&real_root, &rel) {
         if !candidate.is_file() {
             continue;
@@ -545,19 +590,49 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
         // anything. Re-check where it actually lives, not where it was
         // spelled: `starts_with` compares whole components, so `<root>-evil`
         // cannot pass for `<root>`.
-        return match candidate.canonicalize() {
-            Ok(real) if real.starts_with(&real_root) => DashboardResolution::File {
-                // Decided here, next to the resolution, so the caching
-                // contract cannot drift from the layout it describes:
-                // `_next/static/**` is build-id-scoped and content-hashed, so
-                // it is immutable; every other dashboard file keeps a stable
-                // name whose bytes change on the next export and must be
-                // revalidated.
-                immutable: real.starts_with(real_root.join(NEXT_STATIC_DIR)),
-                path: real,
-            },
-            _ => DashboardResolution::Refused,
+        let Ok(real) = candidate.canonicalize() else {
+            return DashboardResolution::Refused;
         };
+        if !real.starts_with(&real_root) {
+            return DashboardResolution::Refused;
+        }
+        // The logo tree is mounted as a tree, so it is bounded to what a logo
+        // tree holds. Decided on the RESOLVED path, not on how the URL spelled
+        // the request, so neither the re-rooted `/dashboard/providers/x.svg`
+        // form nor a symlink into the tree can present a file the tree is not
+        // for — and so the app-route documents under `dashboard/providers/`
+        // (`openai.html`, `openai.txt`, the per-segment files), which are a
+        // different tree at a different place, are untouched by it.
+        if real.starts_with(real_root.join(PROVIDERS_DIR)) && !is_provider_logo(&real) {
+            logo_bound_refused = true;
+            continue;
+        }
+        // Decided here, next to the resolution, so the caching contract cannot
+        // drift from the layout it describes: `_next/static/**` is
+        // build-id-scoped and content-hashed, so it is immutable; every other
+        // dashboard file keeps a stable name whose bytes change on the next
+        // export and must be revalidated. A logo is the second kind — a
+        // stable name, redeployed bytes.
+        return DashboardResolution::File {
+            immutable: real.starts_with(real_root.join(NEXT_STATIC_DIR)),
+            path: real,
+        };
+    }
+
+    // The bound refused a file that IS in the build, so the request is not
+    // asking for a route this build does not have and its absence indicts
+    // nothing either: it is asking for something the logo mount does not
+    // serve. Answering from the artifact classification below would make a
+    // perfectly complete build answer 500 "the build is incomplete" — and log
+    // it — for a URL no document emits, on a request anyone can make. `debug`
+    // is the same reasoning as `refused_response`: this is an unauthenticated
+    // surface and a prober must not be able to fill the log.
+    if logo_bound_refused {
+        tracing::debug!(
+            url_path,
+            "a file in the provider-logo tree is not a logo and was not served"
+        );
+        return DashboardResolution::RouteAbsent;
     }
 
     // A build IS deployed; it just does not carry this path. Which of the
@@ -877,9 +952,10 @@ mod tests {
         )
         .unwrap();
         fs::create_dir_all(root.join("providers")).unwrap();
-        // The five provider logos the origin-root documents link to. The
-        // export ships 141 files in this directory; the five are the ones a
-        // document asks for, and they are mounted by name.
+        // The provider logos, a sample of the tree the mount now answers for
+        // as a whole. The export ships 141 of them; the five below are the ones
+        // an origin-root document links to, and the sixth is one NO document
+        // links to — which is the case the named mount left 404ing.
         for (name, body) in [
             ("claude.svg", &b"<svg id='claude'/>"[..]),
             ("cline.svg", &b"<svg id='cline'/>"[..]),
@@ -889,6 +965,25 @@ mod tests {
                 "kimi-logomark-light.svg",
                 &b"<svg id='kimi-logomark-light'/>"[..],
             ),
+            ("baidu.svg", &b"<svg id='baidu'/>"[..]),
+        ] {
+            fs::write(root.join("providers").join(name), body).unwrap();
+        }
+        // The tree a wildcard newly invites: files that are in the build and
+        // are not logos. A future export could drop any of these into
+        // `providers/`, and none of them may be served — see `is_provider_logo`.
+        for (name, body) in [
+            (
+                "catalog.js",
+                &b"console.log('aisix-provider-logo-escape')"[..],
+            ),
+            (
+                "catalog.html",
+                &b"<html>aisix-provider-logo-escape</html>"[..],
+            ),
+            ("notes.txt", &b"aisix-provider-logo-escape"[..]),
+            ("brand.wasm", b"\0asm\x01\0\0\0aisix-provider-logo-escape"),
+            ("blob.xyzzy", b"aisix-provider-logo-escape"),
         ] {
             fs::write(root.join("providers").join(name), body).unwrap();
         }
@@ -1926,6 +2021,11 @@ mod tests {
             "codex.svg",
             "cursor.svg",
             "kimi-logomark-light.svg",
+            // The one no document links to. Named mounts serve exactly the set
+            // a document references, so this is the shape that was 404ing —
+            // and a test that only walked the five referenced names could not
+            // have seen it.
+            "baidu.svg",
         ] {
             let uri = format!("/providers/{name}");
             let (status, body, headers) = get(dashboard_app(), &uri).await;
@@ -2053,6 +2153,18 @@ mod tests {
             // which truncates the path at the syscall.
             "/login/..%5c..%5ccanary.txt",
             "/login/canary.txt%00.png",
+            // The logo tree, which is a mount by NAME WILDECARD and so is the
+            // first surface where a path segment is whatever the request says
+            // it is. Every spelling of the same escape, on the new mount.
+            "/providers/../canary.txt",
+            "/providers/..%2f..%2fcanary.txt",
+            "/providers/%2e%2e%2fcanary.txt",
+            "/providers/%2E%2E%2Fcanary.txt",
+            "/providers/..%5c..%5ccanary.txt",
+            "/providers/canary.txt%00.svg",
+            "/providers/hop/../../../canary.txt",
+            "/providers/./../../canary.txt",
+            "/providers//..%2fcanary.txt",
         ] {
             let (status, body, headers) = get(dashboard_app(), uri).await;
             // 400, not 404: the request is malformed or hostile, and a 404
@@ -2209,6 +2321,540 @@ mod tests {
             Some("application/octet-stream"),
             "the default arm moved"
         );
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    // ── The vendor-logo tree ───────────────────────────────────────────────
+    //
+    // The mount answers for a DIRECTORY, so these are not the five names a
+    // document happens to link to. What a wildcard newly invites has to be
+    // measured rather than assumed: a file that is in the tree and is not a
+    // logo, a symlinked file, a symlinked directory segment, and the same
+    // containment the other mounts already have.
+
+    /// The servability fact itself, derived rather than restated: a file in the
+    /// logo tree is servable exactly when the ONE mime table gives it an
+    /// `image/*` type. Enumerated both ways, because a one-way assertion is the
+    /// shape that cannot fail — "it is not servable" passes for every extension
+    /// nobody thought about, including the next one the table learns.
+    #[test]
+    fn every_extension_the_table_names_decides_whether_a_logo_is_servable() {
+        for extension in BUILD_ARTIFACT_EXTENSIONS {
+            let path = PathBuf::from(format!("{PROVIDERS_DIR}/vendor.{extension}"));
+            let mime = mime_for_path(&path);
+            assert_eq!(
+                is_provider_logo(&path),
+                mime.starts_with("image/"),
+                ".{extension} is {mime} but servability says otherwise"
+            );
+        }
+        // The extensions the logo bound must refuse, named — an `.js` and an
+        // `.html` in this tree would be a script and a document on the origin
+        // `/admin/v1/*` answers on, which is the whole reason the bound is
+        // here. Pinned by name so the arms that make it a decision cannot be
+        // deleted quietly.
+        for refused in [
+            "html",
+            "js",
+            "mjs",
+            "json",
+            "map",
+            "txt",
+            "wasm",
+            "webmanifest",
+            "xml",
+            "yaml",
+            "css",
+            "woff",
+            "woff2",
+            "ttf",
+        ] {
+            let path = PathBuf::from(format!("{PROVIDERS_DIR}/vendor.{refused}"));
+            assert!(
+                !is_provider_logo(&path),
+                ".{refused} became servable from the logo tree"
+            );
+        }
+        // And the images the bound admits — every one the export can ship a
+        // logo in, so adding a format to the table admits it here with no
+        // second edit.
+        for served in ["svg", "png", "jpg", "jpeg", "webp", "ico"] {
+            let path = PathBuf::from(format!("{PROVIDERS_DIR}/vendor.{served}"));
+            assert!(
+                is_provider_logo(&path),
+                ".{served} is not servable from the logo tree"
+            );
+        }
+        // The default arm: an extension the table has never heard of is a
+        // download, so it is not a logo either.
+        assert!(!is_provider_logo(Path::new("providers/vendor.xyzzy")));
+        assert!(!is_provider_logo(Path::new("providers/README")));
+    }
+
+    /// The whole tree answers, not the sample a document links to: a census
+    /// over the fixture's own `providers/` directory, so a file that is there
+    /// and is servable cannot be silently unmounted.
+    #[tokio::test]
+    async fn the_whole_logo_tree_answers_with_its_own_bytes() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        let logos: Vec<String> = fs::read_dir(root.path().join(PROVIDERS_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".svg"))
+            .collect();
+        assert!(
+            logos.len() > 1,
+            "the fixture carries no logo tree, so this would pass while serving nothing"
+        );
+        for name in &logos {
+            let uri = format!("/{PROVIDERS_DIR}/{name}");
+            let on_disk = fs::read(root.path().join(PROVIDERS_DIR).join(name)).unwrap();
+            let (status, body, headers) = request(dashboard_app(), "GET", &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {status}");
+            // Byte-identical, not merely "a 200 with something in it": a logo
+            // the browser cannot parse renders as an empty frame, which is the
+            // exact failure this mount exists to remove.
+            assert_eq!(body, on_disk, "{uri} served other bytes");
+            assert_eq!(
+                content_type(&headers),
+                Some("image/svg+xml"),
+                "{uri} content-type"
+            );
+            // A logo keeps a stable name and is redeployed, so it must be
+            // revalidated — the same contract as every other non-hashed file.
+            assert_eq!(
+                headers.get("cache-control").map(String::as_str),
+                Some("no-cache"),
+                "{uri} cache-control",
+            );
+            // The `HEAD` probe an image decider issues, so it cannot be the
+            // one request form that 404s.
+            let (status, body, headers) = head(dashboard_app(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {uri} answered {status}");
+            assert!(body.is_empty(), "HEAD {uri} carried a body");
+            assert_eq!(
+                content_type(&headers),
+                Some("image/svg+xml"),
+                "HEAD {uri} content-type"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// A file that is in the logo tree and is not a logo is not served. The
+    /// whole point of the mount being a directory rather than a name list is
+    /// that nothing decides which files are in it by name — so the bound is on
+    /// the TYPE the response would carry, and it is asserted on the body: a
+    /// 200 that leaked a script is the failure that matters, and a status
+    /// check alone would call that green.
+    #[tokio::test]
+    async fn a_non_logo_in_the_tree_is_not_served_from_the_admin_origin() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        for name in [
+            "catalog.js",
+            "catalog.html",
+            "notes.txt",
+            "brand.wasm",
+            "blob.xyzzy",
+        ] {
+            let uri = format!("/{PROVIDERS_DIR}/{name}");
+            let (status, body, headers) = get(dashboard_app(), &uri).await;
+            assert!(
+                status.is_client_error(),
+                "{uri} is in the build and was served: {status} {body:?}"
+            );
+            assert!(
+                !body.contains("aisix-provider-logo-escape"),
+                "{uri} leaked its content: {body:?}"
+            );
+            // Never a document, never the shell.
+            assert!(
+                !body.contains("<html>"),
+                "{uri} answered a document: {body:?}"
+            );
+            // Whatever the status, the answer is this surface's own plain
+            // explanation. Asserting the type is what rules out the failure
+            // that matters: a 200 carrying `application/javascript` or
+            // `text/html` from the origin `/admin/v1/*` answers on. The type of
+            // a 404 is not a defect, so the type of a 2xx is pinned by
+            // `every_extension_the_table_names_decides_whether_a_logo_is_servable`
+            // instead of by a list of types to avoid.
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri} carried a content type other than the explanation's"
+            );
+        }
+
+        // A non-logo in the tree is answered EXACTLY as an absent one is, so
+        // the mount is not an existence oracle over the export tree. (The
+        // build's contents are no secret from this origin anyway — every
+        // document in it is served by name — but a mount that answered two
+        // ways for the same question would be answering one nobody asked.)
+        for name in ["catalog.js", "catalog.html", "absent.svg", "absent.js"] {
+            let present = get(dashboard_app(), &format!("/{PROVIDERS_DIR}/{name}")).await;
+            let absent = get(
+                dashboard_app(),
+                &format!("/{PROVIDERS_DIR}/never-shipped-{name}"),
+            )
+            .await;
+            assert_eq!(
+                (present.0, content_type(&present.2), present.1.is_empty()),
+                (absent.0, content_type(&absent.2), absent.1.is_empty()),
+                "{name} is distinguishable from a file that is not in the build"
+            );
+        }
+
+        // The tree's own two directory spellings answer the surface's honest
+        // 404 rather than the router's bare one, which is the reason they are
+        // mounted at all (`matchit` 0.7.3, `tree.rs:519`).
+        for uri in ["/providers", "/providers/"] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri} answered {body:?}");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri} answered the router's bare 404, not the honest one"
+            );
+            assert!(
+                body.contains("not part of the deployed dashboard build"),
+                "{uri} body was {body:?}"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The bound is on the RESOLVED file, not on how the URL spelled the
+    /// request. Every spelling that reaches the tree reaches the same verdict,
+    /// and the app-route documents under `dashboard/providers/` — a different
+    /// tree at a different place — are untouched by it.
+    #[tokio::test]
+    async fn the_logo_bound_lands_on_the_file_and_not_on_the_spelling() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        // The re-rooted form reaches the same bytes, because the export puts
+        // the tree at its root and the mount reads it from either mount.
+        for name in ["claude.svg", "baidu.svg"] {
+            let origin = request(dashboard_app(), "GET", &format!("/providers/{name}")).await;
+            let rerooted = request(
+                dashboard_app(),
+                "GET",
+                &format!("/dashboard/providers/{name}"),
+            )
+            .await;
+            assert_eq!(origin.0, StatusCode::OK, "/providers/{name}");
+            assert_eq!(rerooted.0, origin.0, "/dashboard/providers/{name}");
+            assert_eq!(rerooted.1, origin.1, "/dashboard/providers/{name} bytes");
+        }
+
+        // …and the bound follows the file through that same spelling: the
+        // re-rooted form of a non-logo is refused too, not served because the
+        // URL said `/dashboard/`.
+        for name in ["catalog.js", "catalog.html"] {
+            let (status, body, _) =
+                get(dashboard_app(), &format!("/dashboard/providers/{name}")).await;
+            assert!(
+                status.is_client_error(),
+                "/dashboard/providers/{name} was served: {status} {body:?}"
+            );
+            assert!(
+                !body.contains("aisix-provider-logo-escape"),
+                "/dashboard/providers/{name} leaked its content: {body:?}"
+            );
+        }
+
+        // The app-route tree that shares the SEGMENT NAME is unaffected: those
+        // are route documents, served as documents, exactly as before. A bound
+        // that keyed on the path's first segment would have broken every one
+        // of them, which is why it is decided on the resolved file.
+        for (uri, expected) in [
+            (
+                "/dashboard/providers/openai",
+                "<html>openai</html>".to_string(),
+            ),
+            (
+                "/dashboard/providers/openai.txt",
+                "RSC FLIGHT PAYLOAD".to_string(),
+            ),
+            (
+                "/dashboard/providers/acme.corp",
+                "<html>acme corp</html>".to_string(),
+            ),
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {body:?}");
+            assert_eq!(body, expected, "{uri} body");
+            assert!(
+                content_type(&headers).is_some_and(|value| value.starts_with("text/")),
+                "{uri} content-type was {:?}",
+                content_type(&headers)
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The logo tree is the first mount here whose shape is a WILDCARD, so the
+    /// surface it can reach is proven rather than assumed. Two things are
+    /// asserted, and both on the body: every path the admin listener already
+    /// owned answers what it answered, and the export is planted with a DECOY
+    /// file for each of them — so a mount that intercepted one would answer 200
+    /// with those bytes, which a status check alone would call a pass.
+    #[tokio::test]
+    async fn the_logo_mount_cannot_intercept_a_path_the_admin_surface_owns() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        // A decoy for every protected path, at the exact place the dashboard
+        // chokepoint would look if the router ever sent it there. Byte-distinct
+        // from anything the surface legitimately serves.
+        const DECOY: &[u8] = b"AISIX-LOGO-MOUNT-DECOY";
+        //
+        // NOT `status/*`: `/status` is an entry of `ORIGIN_ROOT_ROUTES`, and
+        // that loop derives a `/status/*path` mount from it, so a file at
+        // `<root>/status/<name>` is legitimately addressable and a decoy there
+        // would be served BY THAT mount. The real export's `status/` carries
+        // only `__next.status.__PAGE__.txt` and `__next._tree.txt`, which is
+        // why the assertion below is a 404 against a build shaped like it.
+        // `admin/v1/typo` is here for the sharpest case of all: a path NO route
+        // claims, which is precisely what a catch-all fallback would answer.
+        for decoy in [
+            "admin/v1/models",
+            "admin/v1/combos",
+            "admin/v1/typo",
+            "livez",
+            "readyz",
+            "dashboard/providers/baidu.html",
+            "_next/static/chunks/decoy.js",
+        ] {
+            let path = root.path().join(decoy);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, DECOY).unwrap();
+        }
+        // And one in the logo tree itself, so a path that IS a logo answers
+        // with the logo and nothing else can.
+        fs::write(
+            root.path().join("providers/baidu.svg"),
+            b"<svg id='baidu'/>",
+        )
+        .unwrap();
+        let previous = with_test_dashboard_root(root.path());
+
+        // Each path's own answer, as this surface gave it before the mount
+        // existed. `/status/*` is the metrics listener's on another address and
+        // the export ships no such file, so the admin listener's answer for it
+        // is the surface's own 404 — asserted rather than assumed.
+        for (uri, expected) in [
+            ("/admin/v1/models", StatusCode::UNAUTHORIZED),
+            ("/admin/v1/combos", StatusCode::UNAUTHORIZED),
+            ("/livez", StatusCode::OK),
+            ("/admin/openapi.json", StatusCode::OK),
+            ("/admin/openapi-scalar", StatusCode::OK),
+            ("/status/config", StatusCode::NOT_FOUND),
+            ("/status/ready", StatusCode::NOT_FOUND),
+            ("/status/models", StatusCode::NOT_FOUND),
+        ] {
+            let (status, body, _) = get(dashboard_app(), uri).await;
+            assert_eq!(status, expected, "{uri} answered {status} with {body:?}");
+            assert!(
+                !body.contains("AISIX-LOGO-MOUNT-DECOY"),
+                "{uri} was intercepted by the dashboard mount: {body:?}"
+            );
+        }
+        // `/admin/v1/typo` is claimed by no route, so its status alone cannot
+        // tell the router's own 404 from a fallback that answered out of the
+        // export. The DECOY is what tells them apart: a fallback would return
+        // it, 200, on this path.
+        {
+            let (status, body, _) = get(dashboard_app(), "/admin/v1/typo").await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "/admin/v1/typo");
+            assert!(
+                !body.contains("AISIX-LOGO-MOUNT-DECOY"),
+                "a path no route claims was answered out of the export: {body:?}"
+            );
+        }
+        // `/readyz` is 200 or 503 on a configuration that has not been
+        // applied, so it is asserted on the property and not the code.
+        let (status, body, _) = get(dashboard_app(), "/readyz").await;
+        assert!(
+            matches!(status, StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE),
+            "/readyz answered {status} with {body:?}"
+        );
+        assert!(
+            !body.contains("AISIX-LOGO-MOUNT-DECOY"),
+            "/readyz was intercepted"
+        );
+
+        // `/_next/*` still resolves the real chunk, and the app-route tree
+        // under `/dashboard/*` still resolves the real document — a decoy
+        // planted at each is never what answers.
+        for (uri, expected) in [
+            ("/_next/static/chunks/app.js", "console.log(1)"),
+            ("/dashboard/providers/baidu", "AISIX-LOGO-MOUNT-DECOY"),
+        ] {
+            let (status, body, _) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {status}");
+            assert_eq!(body, expected, "{uri} body");
+        }
+        // The app-route decoy is the route's own file, and it answers as a
+        // DOCUMENT — the logo bound, which keys on the resolved path, did not
+        // reach into the tree that merely shares the segment name.
+        let (status, _, headers) = get(dashboard_app(), "/dashboard/providers/baidu").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            content_type(&headers),
+            Some("text/html; charset=utf-8"),
+            "a route document under dashboard/providers/ was answered as a logo"
+        );
+
+        // The CSRF gate is hoisted over the whole router and the auth gate is
+        // per-route; both are asserted here because a wildcard mount is
+        // exactly the kind of change that can quietly displace one. With a
+        // cross-origin `Origin` the method is refused BEFORE the credential is
+        // ever looked at (403); with none it authenticates and refuses (401).
+        for (method, uri) in [
+            ("POST", "/admin/v1/resources"),
+            ("PATCH", "/admin/v1/combos/some-uuid"),
+            ("DELETE", "/admin/v1/combos/some-uuid"),
+        ] {
+            // `None` sends NO declaration, which is the case the gate
+            // deliberately lets through (no browser produces it for an unsafe
+            // request); `Some` sends a cross-origin one, which it refuses
+            // before the credential is looked at.
+            for (origin, expected) in [
+                (Some("https://evil.example"), StatusCode::FORBIDDEN),
+                (None, StatusCode::UNAUTHORIZED),
+            ] {
+                let mut builder = Request::builder().method(method).uri(uri);
+                if let Some(origin) = origin {
+                    builder = builder.header(axum::http::header::ORIGIN, origin);
+                }
+                let resp = dashboard_app()
+                    .oneshot(builder.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    status, expected,
+                    "{method} {uri} with origin {origin:?} answered {status}"
+                );
+                assert!(
+                    !bytes.windows(DECOY.len()).any(|window| window == DECOY),
+                    "{method} {uri} with origin {origin:?} was intercepted by the dashboard mount"
+                );
+            }
+        }
+        // A method an endpoint does not have is still 405, on the admin surface
+        // and on the new mount alike — the mount takes GET and HEAD only, so no
+        // unsafe method on it can reach a handler that mutates anything.
+        for (method, uri) in [
+            ("PUT", "/admin/v1/resources"),
+            ("POST", "/providers/claude.svg"),
+            ("DELETE", "/providers/baidu.svg"),
+        ] {
+            let (status, bytes, _) = request(dashboard_app(), method, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {uri} answered {status}"
+            );
+            assert!(
+                !bytes.windows(DECOY.len()).any(|window| window == DECOY),
+                "{method} {uri} was intercepted by the dashboard mount"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// A symlink inside the logo tree, in both shapes the previous mounts    /// A symlink inside the logo tree, in both shapes the previous mounts
+    /// already covered: the file, and a directory SEGMENT. Both are given a
+    /// `.svg` name so they pass the logo bound — otherwise a green result
+    /// would prove nothing about the containment check, only about the bound.
+    #[tokio::test]
+    async fn a_symlink_in_the_logo_tree_is_refused() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let (dir, _canary) = export_root_with_a_canary_beside_it();
+        let root = dir.path().join("out");
+        // A symlinked FILE, and a symlinked DIRECTORY SEGMENT with a logo in
+        // it, both pointing beside the root.
+        std::os::unix::fs::symlink(
+            dir.path().join("canary.txt"),
+            root.join("providers/escape.svg"),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+        fs::write(
+            dir.path().join("elsewhere/leaf.svg"),
+            b"aisix-traversal-canary",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("providers/hop"))
+            .unwrap();
+        // And one INSIDE the root, which must be served — the check is
+        // containment, not "is it a symlink".
+        fs::write(root.join("providers/real.svg"), b"<svg id='real'/>").unwrap();
+        std::os::unix::fs::symlink(
+            root.join("providers/real.svg"),
+            root.join("providers/alias.svg"),
+        )
+        .unwrap();
+
+        let previous = with_test_dashboard_root(&root);
+
+        for uri in ["/providers/escape.svg", "/providers/hop/leaf.svg"] {
+            let (status, body, _) = get(dashboard_app(), uri).await;
+            assert!(
+                status.is_client_error(),
+                "{uri} answered {status} with {body:?}"
+            );
+            assert!(
+                !body.contains("aisix-traversal-canary"),
+                "{uri} leaked file content through a symlink: {body:?}"
+            );
+        }
+
+        // Both in-root symlinks still serve their bytes, so the two refusals
+        // above are about leaving the root and not about being a symlink.
+        for name in ["real.svg", "alias.svg"] {
+            let uri = format!("/providers/{name}");
+            let (status, body, headers) = get(dashboard_app(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {body:?}");
+            assert_eq!(body, "<svg id='real'/>", "{uri} body");
+            assert_eq!(
+                content_type(&headers),
+                Some("image/svg+xml"),
+                "{uri} content-type"
+            );
+        }
 
         let mut guard = TEST_DASHBOARD_ROOT
             .lock()
