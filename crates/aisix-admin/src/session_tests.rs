@@ -180,6 +180,35 @@ async fn the_cookie_carries_the_documented_attributes() {
     assert_eq!(parts.len(), 3, "unexpected cookie attributes: {set_cookie}");
 }
 
+/// The `204` has no body at all, so the token cannot be echoed into one
+/// and the SPA has nothing to mis-handle. A body is the one place a
+/// second copy of a credential would naturally end up.
+#[tokio::test]
+async fn the_exchange_response_carries_no_body() {
+    let state = state(&admin_cfg(false));
+    let (status, response) = post_session(router(&state), KEY).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // A zero `Content-Length` is hyper's, not ours, and is what actually
+    // comes back on the wire. RFC 7230 §3.3.2 says a server must not send
+    // it on a 204, so this is arguably hyper being non-conformant — but it
+    // is harmless (an empty body either way) and asserting its absence
+    // would be asserting on the transport, not on this handler. The
+    // property that matters is that the body is empty and the declared
+    // length agrees.
+    let declared_length = response
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .map(|v| v.as_bytes() == b"0");
+    assert_ne!(
+        declared_length,
+        Some(false),
+        "unexpected Content-Length on a 204: {:?}",
+        response.headers().get(header::CONTENT_LENGTH)
+    );
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(bytes.is_empty(), "204 must not carry a body: {bytes:?}");
+}
+
 /// A TLS admin listener marks the cookie `Secure`, so the token never
 /// crosses a cleartext hop.
 #[tokio::test]
