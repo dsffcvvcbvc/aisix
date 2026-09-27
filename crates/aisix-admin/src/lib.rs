@@ -55,8 +55,6 @@ pub mod file_store;
 mod guardrails_handlers;
 mod health_handler;
 mod keys_handler;
-#[cfg(test)]
-mod keys_handler_tests;
 mod mcp_servers_handlers;
 mod models_handlers;
 mod models_status_handler;

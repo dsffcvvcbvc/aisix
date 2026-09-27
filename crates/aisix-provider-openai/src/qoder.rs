@@ -125,7 +125,7 @@ fn dashscope_headers(token: &str) -> Result<HeaderMap, BridgeError> {
         headers.insert(
             HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| BridgeError::Config(format!("bad qoder header name: {name}")))?,
-            HeaderValue::from_str(&value).map_err(|_| {
+            HeaderValue::from_str(value).map_err(|_| {
                 BridgeError::InvalidUpstreamCredentials(
                     "qoder credential is not a valid header value".into(),
                 )

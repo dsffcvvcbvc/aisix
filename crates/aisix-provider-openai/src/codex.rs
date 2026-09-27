@@ -118,7 +118,7 @@ fn caller_codex_version(client_headers: Option<&http::HeaderMap>) -> Option<Stri
         }
     }
     let ua = pick("user-agent")?;
-    version_in_codex_user_agent(&ua)
+    version_in_codex_user_agent(ua)
 }
 
 /// Find the first `codex…/x.y.z` token in a User-Agent value

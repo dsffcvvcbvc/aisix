@@ -398,7 +398,7 @@ fn flatten_namespace_child(
 /// Rename namespaced `function_call` history items to their flattened
 /// wire names (`flattenNamespacedHistory`,
 /// `grokCliNamespaceTools.ts:55-67`).
-fn flatten_namespaced_history(input: &mut Vec<Value>) -> bool {
+fn flatten_namespaced_history(input: &mut [Value]) -> bool {
     let mut changed = false;
     for item in input.iter_mut() {
         let Some(obj) = item.as_object_mut() else {

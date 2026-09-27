@@ -26,11 +26,11 @@
 //!   drive a browser session, not an API; a bearer-shaped preset would be a
 //!   lie about what the caller must do.
 //! * **Already-bridged vendors** — the yellow zone (`cline`,
-//! `clinepass`, `qoder`, `grok-cli`, `codex`, `agy`,
-//!   `antigravity`) plus their registry twins (`xai-oauth`,
-//!   `devin-cli`, `devin-desktop`, `codebuddy-cn`). They already have
-//!   `Bridge` impls in this workspace; a second, weaker description of the
-//!   same vendor is a second thing to keep in sync.
+//!   `clinepass`, `qoder`, `grok-cli`, `codex`, `agy`, `antigravity`) plus
+//!   their registry twins (`xai-oauth`, `devin-cli`, `devin-desktop`,
+//!   `codebuddy-cn`). They already have `Bridge` impls in this workspace; a
+//!   second, weaker description of the same vendor is a second thing to keep
+//!   in sync.
 //! * **OAuth-only upstreams** — `github`, `gitlab-duo`, `kilocode`,
 //!   `trae`, `openference`. `PresetAuth` models "where does the key go",
 //!   and OAuth needs a token-exchange lifecycle no variant can express.

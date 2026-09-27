@@ -974,16 +974,6 @@ fn function_calling_config(req: &ChatFormat) -> AntigravityFunctionCallingConfig
     }
 }
 
-/// Project for the envelope: per-key `ProviderKey.project` wins when
-/// set; otherwise the shared default. Trims the stored value so a
-/// whitespace-only override falls back instead of 400ing upstream.
-fn resolve_project(key: &aisix_core::ProviderKey) -> &str {
-    match key.project.as_deref() {
-        Some(p) if !p.trim().is_empty() => p.trim(),
-        _ => ANTIGRAVITY_DEFAULT_PROJECT,
-    }
-}
-
 // ─── Project discovery (`loadCodeAssist` analogue) ──────────────────────────
 
 /// In-memory per-access-token project cache, keyed by the same refresh-
@@ -1849,7 +1839,7 @@ mod tests {
         req.extra
             .insert("tool_choice".to_string(), serde_json::json!("required"));
         let env = convert_chat_format(&req, "model", "cred", ANTIGRAVITY_DEFAULT_PROJECT);
-        let config_value = serde_json::to_value(&env.request.tool_config.unwrap()).unwrap();
+        let config_value = serde_json::to_value(env.request.tool_config.unwrap()).unwrap();
         assert_eq!(
             config_value["functionCallingConfig"]["mode"],
             serde_json::json!("ANY")
@@ -1895,18 +1885,24 @@ mod tests {
         assert!(config.get("thinkingConfig").is_none());
     }
 
-    #[test]
-    fn project_prefers_provider_key_over_default() {
-        let key: aisix_core::ProviderKey =
-            serde_json::from_str(r#"{"display_name":"k","secret":"s"}"#).unwrap();
-        assert_eq!(resolve_project(&key), ANTIGRAVITY_DEFAULT_PROJECT);
+    #[tokio::test]
+    async fn project_prefers_provider_key_over_default() {
+        // An explicit per-key project short-circuits discovery entirely.
         let key: aisix_core::ProviderKey =
             serde_json::from_str(r#"{"display_name":"k","secret":"s","project":"custom-proj"}"#)
                 .unwrap();
-        assert_eq!(resolve_project(&key), "custom-proj");
+        assert_eq!(
+            resolve_project_owned(&key, "unreachable-token").await,
+            "custom-proj"
+        );
+        // A whitespace-only override is not an override: it falls through to
+        // discovery, which fails open to the shared default.
         let key: aisix_core::ProviderKey =
             serde_json::from_str(r#"{"display_name":"k","secret":"s","project":"   "}"#).unwrap();
-        assert_eq!(resolve_project(&key), ANTIGRAVITY_DEFAULT_PROJECT);
+        assert_eq!(
+            resolve_project_owned(&key, "unreachable-token").await,
+            ANTIGRAVITY_DEFAULT_PROJECT
+        );
     }
 
     #[test]
