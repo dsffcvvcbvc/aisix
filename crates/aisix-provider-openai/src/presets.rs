@@ -18,22 +18,32 @@
 //! # Scope — what is deliberately NOT here
 //!
 //! `base_url`/`auth`/`headers` describe an endpoint that answers a normal
-//! OpenAI chat request over HTTP(S). That excludes four classes, each for a
-//! concrete reason rather than by taste:
+//! OpenAI chat request over HTTP(S) with the caller's own API key. That
+//! excludes four classes, each for a concrete reason rather than by taste:
 //!
 //! * **Web scrapers** — `chatgpt-web`, `grok-web`, `tinycms-web`, the
-//!   cookie-auth entries, and the `wss://` / headless-Chromium ports. These
-//!   drive a browser session, not an API; a bearer-shaped preset would be a
-//!   lie about what the caller must do.
+//!   cookie-auth entries (`udio`, `hyperagent`, `zenmux-free`), and the
+//!   `wss://` / stdio / headless-Chromium ports (`auggie`,
+//!   `zcode`). These drive a browser session, not an API; a bearer-shaped
+//!   preset would be a lie about what the caller must do. `maxai` belongs
+//!   here too and is the clearest case in the table: the source registry
+//!   records it with a plain `baseUrl` and `apikey`/`bearer`, but its
+//!   executor reproduces the web app's *signed* request with a
+//!   per-request signature, Firefox identity headers and an OAuth token
+//!   minted by a browser-login flow, over a residential IP only — a
+//!   datacentre address is bot-banned. The registry's `baseUrl` is a
+//!   constant it ignores, not an endpoint it serves.
 //! * **Already-bridged vendors** — the yellow zone (`cline`,
-//!   `clinepass`, `qoder`, `grok-cli`, `codex`, `agy`, `antigravity`) plus
-//!   their registry twins (`xai-oauth`, `devin-cli`, `devin-desktop`,
-//!   `codebuddy-cn`). They already have `Bridge` impls in this workspace; a
-//!   second, weaker description of the same vendor is a second thing to keep
-//!   in sync.
+//!   `clinepass`, `qoder`, `grok-cli`, `codex`, `agy`, `antigravity`)
+//!   plus their registry twins and siblings (`xai-oauth`, `codebuddy-cn`,
+//!   `devin-cli`, `devin-cli-agentic`, `devin-desktop`, `codex-app-server`,
+//!   `cursor`, `cursor-api`, `kiro`, `ghe-copilot`, `zed-hosted`). They
+//!   already have `Bridge` impls in this workspace; a second, weaker
+//!   description of the same vendor is a second thing to keep in sync.
 //! * **OAuth-only upstreams** — `github`, `gitlab-duo`, `kilocode`,
-//!   `trae`, `openference`. `PresetAuth` models "where does the key go",
-//!   and OAuth needs a token-exchange lifecycle no variant can express.
+//!   `trae`, `openference`, `claude`. `PresetAuth` models "where does the
+//!   key go", and OAuth needs a token-exchange lifecycle no variant can
+//!   express.
 //! * **Non-REST / non-callable `base_url`** — `cloudflare-ai` (the executor
 //!   splices an account id into the path), `snowflake` and `databricks`
 //!   (`{account}` / all-zeros placeholder hosts), `bedrock` (no URL at
@@ -42,6 +52,62 @@
 //!   Chromium driving a `cf_agent` WebSocket), `uc` (a Clerk-JWT socket
 //!   minted from a browser login) and `promptql` (a reverse-engineered
 //!   GraphQL playground endpoint).
+//!
+//! **Non-OpenAI wire formats** are excluded on the same grounds: the
+//! entries whose registry `format` is `claude` (`anthropic`, `agentrouter`,
+//! `bailian-coding-plan`, `tabitoken`, `wafer`, `zai`), `gemini`
+//! (`gemini`, `vertex`), `clova` (`clova-studio`), `custom` (`deepai`) or
+//! `magnific-image` (`magnific`) do not answer an OpenAI-shaped request,
+//! and a `base_url` that 400s on the first real call is worse than no row.
+//!
+//! **A second id for an endpoint already listed** is excluded last, and it
+//! is the smallest class with the most explanatory power: `kimi-k3` is a
+//! registry entry whose `base_url` and auth are byte-identical to the rows
+//! the table already carries under `kimi` and `moonshot`. It is a model
+//! tier, not a vendor.
+//!
+//! # Reconciling the count — 190, and why
+//!
+//! An architecture spec claimed **216** "standard REST providers" (78% of
+//! a claimed 274 total). The table here is **190**, and 190 is the correct
+//! number; the 216 is a stale snapshot, not 26 missing vendors. Reproduced
+//! against the source registry (`open-sse/config/providers/registry/*/index.ts`)
+//! at the time of writing:
+//!
+//! ```text
+//! registry entries (256 directories; `mlx/` and `tinycms/` each hold an
+//!   entry under a second id, and `devin`/`segmind`/`stability-ai` hold
+//!   none)                                            257
+//!   less already-bridged vendors and registry twins   -18
+//!   less web scrapers / cookie-auth / browser ports  -24
+//!   less non-OpenAI wire formats                      -11
+//!   less oauth-only upstreams                         -6
+//!   less non-REST or non-callable `base_url`          -7
+//!   less a second id for an endpoint already listed   -1
+//!                                                    -----
+//! PRESET_PROVIDERS                                    190
+//! ```
+//!
+//! Three facts make the 216 unreproducible rather than merely optimistic:
+//!
+//! * **The set is closed.** Every one of the 190 ids is a registry entry
+//!   id, and the registry contributes nothing that is not accounted for
+//!   above — so there is no pool of 26 un-added vendors to draw from. A
+//!   count larger than its source is not a count of a subset.
+//! * **The source has moved.** The registry the 216 was measured against
+//!   predates the current one; the same spec's total-provider figure is
+//!   stale in the same way.
+//! * **The registry counts aliases separately.** `kimi-k3` is a second
+//!   entry id for an endpoint the table already carries twice (`kimi` and
+//!   `moonshot`, byte-identical `base_url` and auth). Counting it as a
+//!   vendor inflates the total without adding a reachable endpoint — which
+//!   is the shape several of the differences between the two numbers have.
+//!
+//! So the number is pinned as a decision with a derivation rather than as a
+//! bare count: `presets_tests` asserts the total, asserts every row is a
+//! well-formed REST endpoint, and asserts that no id belonging to an
+//! excluded class has crept in — the guard that makes padding the table
+//! fail rather than merely look better.
 //!
 //! A consequence worth knowing: no entry here uses `PresetAuth::None`. The
 //! only `authType: "none"` vendors in the registry are the browser/socket

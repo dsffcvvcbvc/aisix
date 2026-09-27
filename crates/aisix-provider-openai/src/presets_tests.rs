@@ -362,24 +362,273 @@ fn the_none_auth_shape_is_representable() {
     assert!(PRESET_PROVIDERS.iter().all(|p| p.auth != PresetAuth::None));
 }
 
+/// Vendors the source registry carries that the catalog deliberately
+/// leaves out, by exclusion class. The point of this list is not to
+/// document the classes — the module docs do that — but to make the
+/// decision *mechanically* checkable: a row added from one of these classes
+/// fails here, so the catalog cannot be padded toward a number without a
+/// test going red. Kept in the same order as the module's exclusion
+/// bullets, with the per-class counts the reconciliation is derived from.
+const EXCLUDED_IDS: &[(&str, &[&str])] = &[
+    // already-bridged vendors and their registry twins (18)
+    (
+        "already-bridged",
+        &[
+            "agy",
+            "antigravity",
+            "cline",
+            "clinepass",
+            "codebuddy-cn",
+            "codex",
+            "codex-app-server",
+            "cursor",
+            "cursor-api",
+            "devin-cli",
+            "devin-cli-agentic",
+            "devin-desktop",
+            "ghe-copilot",
+            "grok-cli",
+            "kiro",
+            "qoder",
+            "xai-oauth",
+            "zed-hosted",
+        ],
+    ),
+    // web scrapers / cookie-auth entries / browser-driven ports (24)
+    (
+        "web-scraper",
+        &[
+            "adapta-web",
+            "auggie",
+            "chatgpt-web",
+            "chatgpt-web-codex",
+            "conol-web",
+            "copilot-m365-web",
+            "copilot-web",
+            "duckduckgo-web",
+            "grok-web",
+            "huggingchat",
+            "hyperagent",
+            "lmarena",
+            "maxai",
+            "muse-spark-web",
+            "notion-web",
+            "t3-web",
+            "tencent-aistudio-web",
+            "tinycms-web",
+            "udio",
+            "veoaifree-web",
+            "yuanbao-web",
+            "zai-web",
+            "zcode",
+            "zenmux-free",
+        ],
+    ),
+    // non-OpenAI wire formats (11)
+    (
+        "non-openai-format",
+        &[
+            "agentrouter",
+            "anthropic",
+            "bailian-coding-plan",
+            "clova-studio",
+            "deepai",
+            "gemini",
+            "magnific",
+            "tabitoken",
+            "vertex",
+            "wafer",
+            "zai",
+        ],
+    ),
+    // oauth-only upstreams (6)
+    (
+        "oauth-only",
+        &[
+            "claude",
+            "github",
+            "gitlab-duo",
+            "kilocode",
+            "openference",
+            "trae",
+        ],
+    ),
+    // non-REST or non-callable `base_url` (7)
+    (
+        "non-callable-url",
+        &[
+            "bedrock",
+            "cloudflare-ai",
+            "cloudflare-playground",
+            "databricks",
+            "promptql",
+            "snowflake",
+            "uc",
+        ],
+    ),
+    // a second id for an endpoint the catalog already carries (1). The
+    // registry spells this vendor twice; counting it as another vendor
+    // inflates the total without adding a reachable endpoint, and it is
+    // the concrete shape several of the differences between a raw registry
+    // count and a vendor count take.
+    ("duplicate-endpoint", &["kimi-k3"]),
+];
+
+/// Ids that share one `base_url` on purpose: the source registry spells
+/// each of these vendors twice. Every repeated endpoint in the catalog is
+/// one of these pairs — an unexplained duplicate is a row that inflates
+/// the total without adding reachability, which is the whole reason a raw
+/// registry count and a vendor count disagree.
+const ENDPOINT_FAMILIES: &[&[&str]] = &[
+    &["alibaba", "qwen-cloud"],
+    &["baidu", "qianfan"],
+    &["doubao", "volcengine"],
+    &["iflytek", "sparkdesk"],
+    &["kimi", "moonshot"],
+    &["naga-ac", "naga-ai"],
+];
+
 #[test]
-fn the_catalog_covers_the_documented_vendor_count() {
-    // Not a magic number to keep in sync by hand: it is a floor, so a
-    // truncated or accidentally emptied table fails here instead of quietly
-    // shipping a dashboard that lists a handful of vendors.
-    assert!(
-        PRESET_PROVIDERS.len() >= 150,
-        "expected at least 150 preset vendors, found {}",
-        PRESET_PROVIDERS.len()
-    );
-    assert!(
-        PRESET_PROVIDERS.len() <= 220,
-        "catalog outgrew its documented range"
-    );
+fn the_catalog_is_the_reconciled_size() {
+    // A decision, not a placeholder: the module's "Reconciling the count"
+    // section derives 190 from the source registry by subtracting each
+    // exclusion class. A count larger than the source is not a count of a
+    // subset, so there is no pool of "missing" vendors to add — and the
+    // assertions below are what make that a hard failure rather than a
+    // comment.
     assert_eq!(
         PRESET_PROVIDERS.len(),
         super::presets::PRESET_PROVIDER_COUNT
     );
+    assert_eq!(
+        PRESET_PROVIDERS.len(),
+        190,
+        "the catalog size changed; update the reconciliation table in the module docs in the same \
+         commit, with the per-class counts that justify the new number"
+    );
+}
+
+#[test]
+fn the_excluded_classes_are_still_excluded() {
+    for (class, ids) in EXCLUDED_IDS {
+        for id in *ids {
+            assert!(
+                find_preset(id).is_none(),
+                "{id:?} belongs to the {class:?} exclusion class and must not be in the catalog; \
+                 if it now qualifies, delete it from EXCLUDED_IDS and say why in the module docs"
+            );
+        }
+    }
+    // The duplicate-endpoint class is not just an exclusion: `kimi-k3`
+    // resolves nowhere NEW. The ids it shadows are present, and present
+    // the same endpoint — which is what makes it a model tier rather than
+    // a vendor.
+    let shadowed = ["kimi", "moonshot"];
+    let endpoints: std::collections::BTreeSet<&str> = shadowed
+        .iter()
+        .map(|canonical| {
+            find_preset(canonical)
+                .unwrap_or_else(|| {
+                    panic!("{canonical:?} is named as the canonical row for kimi-k3")
+                })
+                .base_url
+        })
+        .collect();
+    assert_eq!(
+        endpoints.len(),
+        1,
+        "kimi-k3 duplicates {} — which do not share one endpoint",
+        shadowed.join(", ")
+    );
+    // The guarded sets must sum to what the module's reconciliation table
+    // claims, so the documented arithmetic cannot drift from them.
+    let excluded: usize = EXCLUDED_IDS.iter().map(|(_, ids)| ids.len()).sum();
+    assert_eq!(
+        excluded, 67,
+        "the exclusion classes no longer sum to the 67 the module docs subtract"
+    );
+    assert_eq!(
+        EXCLUDED_IDS.len(),
+        6,
+        "a new exclusion class needs a matching bullet in the module docs"
+    );
+}
+
+#[test]
+fn every_row_is_a_plain_rest_endpoint() {
+    // The mechanical half of the "non-REST / non-callable" exclusion: a
+    // socket, a stdio bridge, a custom scheme or an un-substituted
+    // placeholder host is a row whose `base_url` a provider key cannot be
+    // pointed at, so it fails on the first real request.
+    for p in PRESET_PROVIDERS {
+        assert!(
+            p.base_url.starts_with("https://") || p.base_url.starts_with("http://localhost"),
+            "{}: base_url {:?} is not a plain REST endpoint",
+            p.id,
+            p.base_url
+        );
+        assert!(
+            !p.base_url.contains('{')
+                && !p.base_url.contains('<')
+                && !p.base_url.contains("00000000"),
+            "{}: base_url {:?} still carries a placeholder host or path",
+            p.id,
+            p.base_url
+        );
+        // A fabricated no-op credential reads as "this vendor needs no
+        // key", which is a different — and wrong — answer.
+        assert_ne!(
+            p.auth,
+            PresetAuth::None,
+            "{}: no preset uses PresetAuth::None; the keyless ports are all excluded",
+            p.id
+        );
+    }
+}
+
+#[test]
+fn every_repeated_endpoint_is_a_known_vendor_family() {
+    let mut by_url: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for p in PRESET_PROVIDERS {
+        by_url.entry(p.base_url).or_default().push(p.id);
+    }
+    let families: std::collections::BTreeSet<&str> = ENDPOINT_FAMILIES
+        .iter()
+        .flat_map(|f| f.iter().copied())
+        .collect();
+    for (url, mut ids) in by_url {
+        if ids.len() < 2 {
+            continue;
+        }
+        ids.sort_unstable();
+        for id in &ids {
+            assert!(
+                families.contains(id),
+                "{url:?} is offered under {} but {id:?} is not a member of a declared vendor \
+                 family; a second id for one endpoint inflates the vendor count without adding \
+                 reachability — declare the family in ENDPOINT_FAMILIES or use a distinct URL",
+                ids.join(", ")
+            );
+        }
+    }
+    // And every declared family really is one family, so the allowlist
+    // cannot rot into permitting a duplicate.
+    for family in ENDPOINT_FAMILIES {
+        let urls: std::collections::BTreeSet<&str> = family
+            .iter()
+            .map(|id| {
+                find_preset(id)
+                    .unwrap_or_else(|| panic!("ENDPOINT_FAMILIES names unknown id {id:?}"))
+                    .base_url
+            })
+            .collect();
+        assert_eq!(
+            urls.len(),
+            1,
+            "{} is declared a family but its members do not share one endpoint",
+            family.join(", ")
+        );
+    }
 }
 
 #[test]
