@@ -786,6 +786,342 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ]
       }
     },
+    "/admin/v1/combos": {
+      "get": {
+        "summary": "List Combos",
+        "description": "List every combo in the current configuration, ordered by name. A combo is a virtual routing model, so this is the subset of the model list that routes across other models rather than dispatching to an upstream of its own.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ComboEntry"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Combos"
+        ]
+      },
+      "post": {
+        "summary": "Create a Combo",
+        "description": "Create a combo. The resource id is derived from the combo name, as it is for a file-loaded model. The new combo is applied to the running configuration immediately and persisted to the active resources file.",
+        "requestBody": {
+          "description": "One combo document. `name` and at least one entry in `models` are required; `strategy` is optional and defaults to `failover`.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Combo"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComboWriteResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The document is not a valid combo, names a strategy this gateway does not implement, names a target that is not an existing direct model, or carries a field outside the combo contract",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A model with this name already exists, or the active resources file holds resources a per-combo write cannot re-emit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The resources file could not be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Combos"
+        ]
+      }
+    },
+    "/admin/v1/combos/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          },
+          "description": "Combo resource ID, as assigned by the active resource source (a UUIDv5 derived from the combo name in file mode; the etcd key's ID segment otherwise).",
+          "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
+        }
+      ],
+      "get": {
+        "summary": "Get Combo by ID",
+        "description": "Read one combo by its resource ID. Every field but `id` is a valid `PATCH` body, so the response can be edited and sent back.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComboEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The ID names a model that is not a combo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such combo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Combos"
+        ]
+      },
+      "patch": {
+        "summary": "Update a Combo",
+        "description": "Update a combo. Only the fields the request names are changed; every other model setting on the stored combo is left as it is. A field outside the combo contract is refused with a `400` naming it, never accepted and ignored.",
+        "requestBody": {
+          "description": "The combo fields to change. A field left out keeps its stored value.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Combo"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComboWriteResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The patch is not a valid combo change, or the ID names a model that is not a combo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such combo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A model with the requested name already exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The resources file could not be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Combos"
+        ]
+      },
+      "delete": {
+        "summary": "Delete a Combo",
+        "description": "Delete a combo. Refused with `409` while another combo, ensemble model or semantic model still routes to it, so a live group is never left pointing at a model that no longer exists.",
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status",
+                    "id"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "deleted"
+                      ]
+                    },
+                    "id": {
+                      "type": "string",
+                      "description": "The deleted combo's resource ID."
+                    },
+                    "version": {
+                      "type": "integer",
+                      "description": "The published configuration version observed after the deletion was applied."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The ID names a model that is not a combo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such combo",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The combo is still referenced by another routing group, ensemble model or semantic model",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The resources file could not be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Combos"
+        ]
+      }
+    },
     "/admin/v1/mcp_servers": {
       "get": {
         "summary": "List MCP Servers",
@@ -2021,6 +2357,142 @@ const OPENAPI_JSON_BASE: &str = r##"{
         },
         "description": "Stored Admin API resource entry."
       },
+      "Combo": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "models"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Unique name the combo is addressed by. The caller sends this name in `model` on a request to route across the group, and it is the name the combo appears under on `GET /v1/models`.",
+            "example": "fast-coding"
+          },
+          "strategy": {
+            "type": "string",
+            "default": "failover",
+            "enum": [
+              "round_robin",
+              "consistent_hash",
+              "failover",
+              "least_cost",
+              "least_latency",
+              "least_busy"
+            ],
+            "description": "How a request is routed to one of the combo's models: `round_robin` rotates by target `weight`, `consistent_hash` pins a request to the target its hash key lands on, `failover` always starts at the first target, `least_cost` starts at the cheapest, `least_latency` at the fastest, and `least_busy` at the least loaded. Omit the field to use `failover`.",
+            "example": "round_robin"
+          },
+          "models": {
+            "type": "array",
+            "minItems": 1,
+            "description": "The direct models this combo routes across, in declaration order. Each entry must name a direct model that already exists in the configuration; a combo target may not be another virtual model.",
+            "items": {
+              "$ref": "#/components/schemas/ComboModel"
+            }
+          }
+        },
+        "description": "A named group of models a request is routed across. A combo is a virtual routing model: it is created, metered, rate-limited and guardrailed by the gateway's model machinery, and can be addressed as `model` on any request that accepts a model name. Fields a combo document may carry that this gateway does not model — `description`, `displayName`, `config`, `allowedProviders`, `allowedModelFamilies`, `system_message`, `tool_filter_regex`, `context_cache_protection`, `context_length`, `dimensions`, `isActive`, `isHidden` — are refused with a `400` naming the field, never accepted and ignored."
+      },
+      "ComboModel": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "model"
+        ],
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Display name of the direct model this entry routes to.",
+            "example": "gpt-4o"
+          },
+          "weight": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Relative share of this target's weight, used by `round_robin` (rotation share), `consistent_hash` (share of the hash ring) and `least_busy` (in-flight requests divided by the weight). Omit the field for a weight of 1. The other strategies accept the field and do not use it.",
+            "example": 3
+          },
+          "priority": {
+            "type": "integer",
+            "description": "Priority tier, defaulting to `0`; a higher value is preferred. The strategy orders targets within a tier, and a lower tier is only reached when every target in a higher tier failed or is unavailable.",
+            "example": 0
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "description": "Tags that make this target eligible only for requests carrying a matching routing tag. A target tagged `default` is the fallback for untagged requests and for requests no tag matches."
+          }
+        },
+        "description": "One model a combo routes across."
+      },
+      "ComboEntry": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "models"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID, as assigned by the active resource source. The `PATCH` and `DELETE` routes address a combo by this id.",
+            "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
+          },
+          "name": {
+            "type": "string",
+            "description": "The combo's name, the same value a create request sends as `name`."
+          },
+          "strategy": {
+            "type": "string",
+            "description": "The combo's routing strategy."
+          },
+          "models": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ComboModel"
+            },
+            "description": "The combo's targets, in declaration order."
+          }
+        },
+        "description": "A combo as this surface stores and serves it. Every field but `id` is a valid `PATCH` body, so a combo read from this endpoint can be updated by sending the response back."
+      },
+      "ComboWriteResult": {
+        "type": "object",
+        "required": [
+          "id",
+          "combo",
+          "revision",
+          "version"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Resource ID of the combo that was written."
+          },
+          "combo": {
+            "$ref": "#/components/schemas/ComboEntry",
+            "description": "The combo as stored, after the write was applied."
+          },
+          "revision": {
+            "type": "integer",
+            "description": "Revision stamped onto the stored combo. The etcd mod_revision of the entry, or the load generation in file mode.",
+            "example": 1844
+          },
+          "version": {
+            "type": "integer",
+            "description": "The published configuration version observed after the write was applied. Two concurrent writes to the same combo both apply and the later one wins.",
+            "example": 42
+          }
+        },
+        "description": "The result of creating or updating a combo."
+      },
       "McpServerEntry": {
         "type": "object",
         "required": [
@@ -2289,6 +2761,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
     {
       "name": "Provider Keys",
       "description": "Upstream provider credentials referenced by models."
+    },
+    {
+      "name": "Combos",
+      "description": "Named groups of models a request is routed across."
     },
     {
       "name": "MCP Servers",
@@ -2958,6 +3434,8 @@ mod tests {
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
             "/admin/v1/preset_providers",
+            "/admin/v1/combos",
+            "/admin/v1/combos/{id}",
             "/admin/v1/mcp_servers",
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
@@ -2995,6 +3473,10 @@ mod tests {
             "ProviderKeyEntry",
             "McpServer",
             "McpServerEntry",
+            "Combo",
+            "ComboModel",
+            "ComboEntry",
+            "ComboWriteResult",
             "A2aAgent",
             "A2aAgentEntry",
             "PassthroughRoute",
@@ -3047,6 +3529,8 @@ mod tests {
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
             "/admin/v1/preset_providers",
+            "/admin/v1/combos",
+            "/admin/v1/combos/{id}",
             "/admin/v1/mcp_servers",
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
@@ -3095,17 +3579,19 @@ mod tests {
                         );
                     } else if path == "/admin/v1/provider_keys"
                         || path == "/admin/v1/provider_keys/{id}"
+                        || path == "/admin/v1/combos"
+                        || path == "/admin/v1/combos/{id}"
                     {
-                        // provider_keys regained native CRUD; the rest of
-                        // the resource surface stays GET-only.
+                        // provider_keys and combos regained native CRUD;
+                        // the rest of the resource surface stays GET-only.
                         assert!(
                             matches!(method.as_str(), "get" | "post" | "patch" | "delete"),
-                            "{method} {path}: unexpected method on a provider-key write route"
+                            "{method} {path}: unexpected method on a write route"
                         );
                     } else {
                         assert_eq!(
                             method, "get",
-                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources and provider-key CRUD"
+                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources, provider-key CRUD and combo CRUD"
                         );
                     }
                 }

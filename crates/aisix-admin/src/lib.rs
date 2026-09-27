@@ -18,6 +18,9 @@
 //! - `POST /admin/v1/provider_keys`, `PATCH|DELETE /admin/v1/provider_keys/:id`
 //!   (validate + hot-reload + persist)
 //! - `GET /admin/v1/preset_providers`
+//! - `GET /admin/v1/combos` and `GET /admin/v1/combos/:id`
+//! - `POST /admin/v1/combos`, `PATCH|DELETE /admin/v1/combos/:id`
+//!   (validate + hot-reload + persist; a combo is a virtual routing model)
 //! - `GET /admin/v1/guardrails` and `GET /admin/v1/guardrails/:id`
 //! - `GET /admin/v1/cache_policies` and `GET /admin/v1/cache_policies/:id`
 //! - `GET /admin/v1/observability_exporters` and
@@ -49,6 +52,7 @@ mod a2a_agents_handlers;
 mod apikeys_handlers;
 mod auth;
 mod cache_policies_handlers;
+mod combos_handler;
 mod error;
 pub mod etcd_store;
 pub mod file_store;
@@ -177,6 +181,16 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/admin/v1/preset_providers",
             get(keys_handler::list_preset_providers),
+        )
+        .route(
+            "/admin/v1/combos",
+            get(combos_handler::list_combos).post(combos_handler::create_combo),
+        )
+        .route(
+            "/admin/v1/combos/:id",
+            get(combos_handler::get_combo)
+                .patch(combos_handler::update_combo)
+                .delete(combos_handler::delete_combo),
         )
         .route(
             "/admin/v1/mcp_servers",
