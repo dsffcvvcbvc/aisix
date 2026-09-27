@@ -349,6 +349,13 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
     // a plain `test`. Deleting or weakening the assertions instead is how a
     // gap like this rots.
     //
+    // What `test.fails` deliberately does NOT cover: whether these six still
+    // dispatch at all. A failing test cannot tell "wrong auth shape" from
+    // "vendor unreachable", so a regression in dispatch would hide in here.
+    // That is covered by the plain `test` above — 200 from all 190, each on
+    // its own base path — so the only thing under `test.fails` is the auth
+    // SHAPE, which is the whole of the gap.
+    //
     // Why it is a gap: the OpenAI family bridge builds
     // `Authorization: Bearer <api_key>` unconditionally
     // (`crates/aisix-provider-openai/src/bridge.rs`, `build_request_headers`)
