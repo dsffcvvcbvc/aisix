@@ -509,7 +509,7 @@ enum DashboardResolution {
 /// | `/dashboard/_next/static/chunks/x.js` | `_next/static/chunks/x.js` | the re-rooted form under the mount |
 /// | `/favicon.ico`, `/manifest.webmanifest` | the same name at the export root | `public/` assets, referenced without a prefix |
 /// | `/` | `index.html` | the export's `EntryRedirector` shell, which `router.replace`s to `/dashboard` |
-/// | `/index.txt`, `/__next._tree.txt` | the same names at the export root | the RSC payload and the route tree of the root route itself |
+/// | `/index.txt`, `/__next._tree.txt`, `/__next.__PAGE__.txt` | the same names at the export root | the RSC payload, the route tree and the page segment of the root route itself |
 /// | `/dashboard.txt` | `dashboard.txt` | the payload of the `/dashboard` route, which the export puts at the ROOT |
 /// | `/login`, `/auth/callback` | `login.html`, `auth/callback.html` | an origin-root app route document |
 /// | `/login.txt` | `login.txt` | its RSC payload on a client-side navigation |
