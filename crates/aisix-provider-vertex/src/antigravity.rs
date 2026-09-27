@@ -40,6 +40,21 @@ const ANTIGRAVITY_RPC_URL: &str =
 /// layer; upstream HTTP rejections are not retried elsewhere.
 const ANTIGRAVITY_RPC_FALLBACK_URL: &str =
     "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+/// Env var naming the RPC endpoint(s) this bridge posts to, comma-separated
+/// and tried in order — the same ordered-hosts shape as the two consts it
+/// replaces. Operator override, same family as [`resolve_ide_version`]'s
+/// `ANTIGRAVITY_IDE_VERSION`: a deployment (or an e2e's mock upstream) that
+/// must reach a different Cloud Code front door names it here, and an unset
+/// (or blank) value keeps the shipped pair verbatim.
+///
+/// This is the seam the Antigravity e2e needs: with the URL compiled in, no
+/// test can stand an upstream for it, and every Antigravity assertion had to
+/// stop at unit level — including the cached-token counter, which stayed
+/// unshipped for exactly that reason. Deliberately NOT a `ProviderKey` field:
+/// the endpoint is not per-tenant, and a resource field would be a
+/// user-configurable surface with a control-plane half this repo cannot land
+/// alone.
+const ANTIGRAVITY_RPC_URL_ENV: &str = "ANTIGRAVITY_RPC_URL";
 /// IDE version embedded in the spoofed Antigravity `User-Agent`.
 /// Kept at `2.1.1` per spec; the header value is rendered from this
 /// single const (pinned by `user_agent_carries_ide_version`).
@@ -131,6 +146,34 @@ fn ide_version_from_env(raw: Option<String>) -> String {
 
 fn resolve_ide_version() -> String {
     ide_version_from_env(std::env::var("ANTIGRAVITY_IDE_VERSION").ok())
+}
+
+/// The ordered RPC hosts to try, per [`ANTIGRAVITY_RPC_URL_ENV`].
+///
+/// A blank entry is dropped rather than sent to, so an operator who clears
+/// the variable falls back to the shipped pair instead of getting a request
+/// aimed at the empty string. Takes the raw value rather than reading the
+/// environment itself, like [`ide_version_from_env`], so the parse is
+/// testable without a process-global.
+fn rpc_urls_from_env(raw: Option<String>) -> Vec<String> {
+    let override_urls: Vec<String> = raw
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if override_urls.is_empty() {
+        return vec![
+            ANTIGRAVITY_RPC_URL.to_string(),
+            ANTIGRAVITY_RPC_FALLBACK_URL.to_string(),
+        ];
+    }
+    override_urls
+}
+
+fn resolve_rpc_urls() -> Vec<String> {
+    rpc_urls_from_env(std::env::var(ANTIGRAVITY_RPC_URL_ENV).ok())
 }
 
 // ─── Token Mint ─────────────────────────────────────────────────────────────
@@ -1512,10 +1555,10 @@ impl Bridge for AntigravityBridge {
         let mut resp_opt = None;
         let mut last_error =
             BridgeError::Transport("antigravity RPC connect error: no hosts attempted".into());
-        for rpc_url in [ANTIGRAVITY_RPC_URL, ANTIGRAVITY_RPC_FALLBACK_URL] {
+        for rpc_url in resolve_rpc_urls() {
             match self
                 .client
-                .post(rpc_url)
+                .post(&rpc_url)
                 .headers(headers.clone())
                 .body(body_json.clone())
                 .send()
@@ -2020,6 +2063,33 @@ mod tests {
     fn user_agent_carries_ide_version() {
         let ua = format!("antigravity/ide/{ANTIGRAVITY_IDE_VERSION} darwin/arm64");
         assert_eq!(ua, "antigravity/ide/2.1.1 darwin/arm64");
+    }
+
+    #[test]
+    fn rpc_url_override_replaces_the_shipped_pair() {
+        assert_eq!(
+            rpc_urls_from_env(Some("http://127.0.0.1:9/rpc".into())),
+            vec!["http://127.0.0.1:9/rpc".to_string()]
+        );
+        // Ordered and both kept — the transport-only-fallback semantics the
+        // call site depends on, and a comma list is how a caller names more
+        // than one.
+        assert_eq!(
+            rpc_urls_from_env(Some("http://a/rpc , http://b/rpc".into())),
+            vec!["http://a/rpc".to_string(), "http://b/rpc".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_absent_or_blank_rpc_url_override_keeps_the_shipped_hosts() {
+        let shipped = vec![
+            ANTIGRAVITY_RPC_URL.to_string(),
+            ANTIGRAVITY_RPC_FALLBACK_URL.to_string(),
+        ];
+        for raw in [None, Some(String::new()), Some("  ,  ".to_string())] {
+            let label = format!("{raw:?}");
+            assert_eq!(rpc_urls_from_env(raw), shipped, "raw={label}");
+        }
     }
 
     #[test]

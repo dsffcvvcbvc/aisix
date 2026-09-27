@@ -18,6 +18,14 @@ export {
   type A2aReceivedRequest,
 } from "./upstream-a2a.js";
 export { startRestUpstream, type RestUpstream } from "./upstream-rest.js";
+export {
+  startAntigravityUpstream,
+  ANTIGRAVITY_RPC_PATH,
+  type AntigravityUpstream,
+  type AntigravityUpstreamOptions,
+  type AntigravityUsage,
+  type ReceivedAntigravityRequest,
+} from "./upstream-antigravity.js";
 export { pickFreePort, pickFreePorts } from "./ports.js";
 export {
   scrapeMetrics,
