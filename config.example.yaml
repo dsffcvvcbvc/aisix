@@ -555,3 +555,109 @@ shutdown:
 # the configured resource source: the `resources_file` above, direct
 # etcd writes, or the AISIX Cloud control plane. This file only
 # bootstraps the gateway.
+
+# ---------------------------------------------------------------------------
+# Provider OAuth client material (Yellow-Zone bridges: antigravity/agy,
+# grok-cli, codex, qoder).
+# ---------------------------------------------------------------------------
+# Все ниже — ТОЛЬКО комментарии: раскомментировать нечего, сами ключи
+# задаются переменными окружения процесса (см. точные имена в
+# `std::env::var` / `resolve_public_cred` ниже). Порядок разрешения везде
+# один (crates/aisix-gateway/src/public_creds.rs:45-67): первое непустое
+# значение env (после trim) побеждает, иначе — встроенный дефолт, если он
+# есть; если нет ни того ни другого — пустая строка и fail-closed ветка
+# моста. Маскированные XOR-байты в коде — обфускация от секрет-сканеров,
+# а не шифрование: значения публичные по дизайну (PKCE native-app).
+#
+# ANTIGRAVITY_OAUTH_CLIENT_ID / ANTIGRAVITY_OAUTH_CLIENT_SECRET
+#   Код: crates/aisix-provider-vertex/src/antigravity.rs:101-119
+#     (`resolve_oauth_client_id` читает ["ANTIGRAVITY_OAUTH_CLIENT_ID",
+#     "ANTIGRAVITY_CLIENT_ID"]; `resolve_oauth_client_secret` читает
+#     ["ANTIGRAVITY_OAUTH_CLIENT_SECRET", "ANTIGRAVITY_CLIENT_SECRET"]).
+#   Legacy-имена ANTIGRAVITY_CLIENT_ID / ANTIGRAVITY_CLIENT_SECRET —
+#   только Rust-совместимость; TS-реестр (open-sse/config/providers/
+#   registry/{antigravity,agy}/index.ts) читает только OAUTH-имена.
+#   Откуда взять: те же значения, что лежат в OmniRoute open-sse
+#     (`antigravity_id` / `antigravity_alt` в publicCreds) — публичный
+#     installed-app PKCE credential Google Cloud Code.
+#   Fail-closed: пустые id/secret дают
+#     `BridgeError::InvalidUpstreamCredentials
+#     ("ANTIGRAVITY_OAUTH_CLIENT_ID/SECRET not configured")`
+#     до сетевого вызова (antigravity.rs:200-208); `ya29.*` credential
+#     при этом проходит как есть, без refresh (antigravity.rs:188).
+#   Embedded default: ЕСТЬ (ANTIGRAVITY_MASKED_CLIENT_ID/SECRET,
+#     antigravity.rs:85-99) — без env мост работает на встроенном.
+#
+# ANTIGRAVITY_IDE_VERSION
+#   Код: `std::env::var("ANTIGRAVITY_IDE_VERSION")` в `resolve_ide_version`
+#     (antigravity.rs:120-137; зеркалит TS `antigravityVersion.ts`).
+#   Откуда взять: ниоткуда брать не нужно — по умолчанию на проводе
+#     `2.1.1` (константа ANTIGRAVITY_IDE_VERSION, antigravity.rs:46);
+#     env — только операторский оверрайд версии в спoofed
+#     `User-Agent: antigravity/ide/<ver> darwin/arm64` (контент-лицо,
+#     antigravity.rs:1064; token-refresh лицо шлёт `antigravity/<ver>
+#     darwin/arm64 google-api-nodejs-client/10.3.0`, antigravity.rs:226-233).
+#   Fail-closed: НЕТ (и не нужен) — пустое/отсутствующее значение после
+#     trim даёт fallback на константу; НЕпустое проходит как есть БЕЗ
+#     валидации формата, так что опечатка уедет на провод буквально.
+#   Embedded default: ЕСТЬ (`"2.1.1"`).
+#   Проект (к сведению, не env): цепочка `ProviderKey.project` (trimmed,
+#     пробелы = absent) → best-effort `loadCodeAssist`-discovery,
+#     мемоизированный по access token (`discover_project`,
+#     antigravity.rs:1052; `resolve_project_owned`, antigravity.rs:1113-1126) →
+#     fail-open fallback `aicode-consumers` (antigravity.rs:52-57).
+#
+# GROK_OAUTH_CLIENT_ID
+#   Код: crates/aisix-provider-openai/src/grok_cli.rs:82-89
+#     (`resolve_public_cred(&[], &["GROK_OAUTH_CLIENT_ID"])`, тот же env
+#     читает TS-реестр grok-cli/index.ts:65).
+#   Откуда взять: публичный client id Grok Build CLI (`grok_id` в
+#     open-sse publicCreds); свой не нужен — встроенного достаточно.
+#   Fail-closed: пустой id даёт `InvalidUpstreamCredentials
+#     ("grok OAuth client id is not configured (GROK_OAUTH_CLIENT_ID);
+#     re-authenticate the account")` (grok_cli.rs:512-517). На практике
+#     ветка недостижима: встроенный дефолт никогда не пуст.
+#   Embedded default: ЕСТЬ (`GROK_EMBEDDED_CLIENT_ID =
+#     "b1a00492-073a-47ea-816f-4c329264a828"`, grok_cli.rs:76, plain
+#     literal — не похож на секрет, маскировки нет).
+#   Token URL захардкожен (`https://auth.x.ai/oauth2/token`,
+#     grok_cli.rs:66) — через env не задаётся.
+#
+# QODER_OAUTH_CLIENT_ID / QODER_OAUTH_CLIENT_SECRET / QODER_OAUTH_TOKEN_URL
+#   Код: crates/aisix-provider-openai/src/qoder.rs:280-291
+#     (`QoderTokenMint::oauth_env` — три точных `std::env::var`).
+#   Откуда взять: регистрация Qoder OAuth-приложения, зеркалящая TS-
+#     реестр (open-sse/config/providers/registry/qoder/index.ts:14-16:
+#     clientIdEnv/clientSecretEnv + `process.env.QODER_OAUTH_TOKEN_URL`).
+#     `QODER_OAUTH_AUTHORIZE_URL` в TS есть (constants.ts:143), но Rust
+#     его НЕ читает — шлюзу нужен только token URL (browser-flow тут
+#     нет, refresh идёт Basic `base64(id:secret)` + form
+#     {grant_type, refresh_token, client_id, client_secret}, qoder.rs:189-257).
+#   Fail-closed: нужны ВСЕ ТРИ; если хоть одной нет — реактивный refresh
+#     на 401 тихо пропускается (`refresh_on_401`, qoder.rs:298-326,
+#     ветка `Ok(None)` — qoder.rs:310-312) и исходный 401 уходит
+#     вызывающему как есть. Никакого silent fallback на другой auth нет.
+#   Embedded default: НЕТ (сознательно — client secret не вшивается).
+#
+# CODEX_OAUTH_CLIENT_ID
+#   Код: crates/aisix-provider-openai/src/codex.rs:79-86
+#     (`resolve_public_cred(&[], &["CODEX_OAUTH_CLIENT_ID"])`, тот же env
+#     читает TS-реестр codex/index.ts:24).
+#   Откуда взять: публичный client id Codex CLI (`codex_id` в open-sse
+#     publicCreds); свой не нужен — встроенного достаточно.
+#   Fail-closed: пустой id даёт `InvalidUpstreamCredentials
+#     ("codex OAuth client id is not configured (CODEX_OAUTH_CLIENT_ID);
+#     re-authenticate the account")` (codex.rs:310-315). На практике
+#     ветка недостижима: встроенный дефолт никогда не пуст.
+#   Embedded default: ЕСТЬ (`CODEX_EMBEDDED_CLIENT_ID =
+#     "app_EMoamEEZ73f0CkXaXp7hrann"`, codex.rs:73, plain literal).
+#   Token URL захардкожен (`https://auth.openai.com/oauth/token`,
+#     codex.rs:63) — через env не задаётся. `CODEX_OAUTH_CLIENT_SECRET`
+#     в TS-реестре упомянут (codex/index.ts:26), но Rust-мост его НЕ
+#     читает (refresh шлёт только {grant_type, refresh_token, client_id}
+#     — Auth0 без scope, codex.rs:12-19).
+#
+# Clinepass для полноты: OAuth-env у него НЕТ вообще — мост работает на
+# stored credential (`workos:` Bearer / `sk_…` BYOK,
+# crates/aisix-provider-openai/src/clinepass.rs:10-24,114-130);
+# сюда его выносить нечего.

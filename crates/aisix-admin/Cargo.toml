@@ -27,11 +27,15 @@ async-trait.workspace = true
 dashmap.workspace = true
 etcd-client.workspace = true
 aisix-obs = { path = "../aisix-obs" }
+# The embedded OpenAI-compatible provider catalog behind
+# `GET /admin/v1/preset_providers`. Already in the build graph through
+# `aisix-proxy`; this is the direct edge, not a new crate.
+aisix-provider-openai = { path = "../aisix-provider-openai" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 testcontainers.workspace = true
 aisix-gateway = { path = "../aisix-gateway" }
-aisix-provider-openai = { path = "../aisix-provider-openai" }
 aisix-core = { path = "../aisix-core" }
 wiremock.workspace = true
+tempfile.workspace = true

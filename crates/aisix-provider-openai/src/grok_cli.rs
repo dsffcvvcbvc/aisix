@@ -28,10 +28,16 @@
 //!   credential is sent as the Bearer token, and on a 401 the bridge
 //!   attempts one reactive refresh (same credential as `refresh_token`)
 //!   and retries once.
-//! - Namespace-tool flatten/restore and foreign-reasoning replay need
-//!   cross-request tool identity maps; out of scope for the chat
-//!   projection (noted, not stubbed — the request still dispatches).
+//! - Namespace-tool flatten/restore runs on a per-request identity map
+//!   (the TS executor threads one map through `execute` the same way);
+//!   cross-request continuity (`previous_response_id` turns that never
+//!   re-declare tools) additionally falls back to the `mcp__`
+//!   wire-name split, mirroring `resolveRequestToolIdentity`.
+//! - Over-long (>64 char) flattened wire names are hash-truncated with
+//!   a std-only FNV-1a suffix instead of sha256 (same `_<7hex>` shape
+//!   and cap; no new dependency for one suffix).
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use aisix_gateway::url_cache::cached_endpoint_url;
@@ -292,6 +298,710 @@ fn sanitize_function_call_output(output: &Value) -> String {
     }
 }
 
+// ─── Namespace tools ────────────────────────────────────────────────
+// Ports `executors/grokCliNamespaceTools.ts` (+ the wire-name scheme
+// from `translator/request/openai-responses/namespaceFlatten.ts` and
+// the restore side from
+// `translator/response/openai-responses/functionCallIdentity.ts` /
+// `requestToolIdentity.ts` / `collaborationPlaintextMarker.ts`).
+//
+// Codex CLI declares MCP servers as Responses `{type: "namespace"}`
+// groups; Grok Build rejects the whole request with `422
+// tools[N].type: unknown variant 'namespace'`. Flatten each child
+// into a function tool before send, then restore the
+// `{namespace, name}` identity on the calls Grok returns.
+//
+// Adaptation: the bridge yields parsed [`ChatChunk`]s, not a raw
+// `Response`, so restore rewrites `function.name` + stamps
+// `namespace` on the chat-shape tool call instead of re-serializing
+// SSE frames. Runs only on this bridge — `responses_wire` is shared
+// with Codex and stays untouched.
+
+/// Wire name for one `namespace` child
+/// (`flattenNamespaceToolName`, `namespaceFlatten.ts:33-41`).
+fn flatten_namespace_tool_name(ns_name: &str, leaf: &str) -> String {
+    const MAX_TOOL_NAME_LEN: usize = 64;
+    if ns_name.is_empty() {
+        return leaf.to_string();
+    }
+    if leaf.contains("__") {
+        return leaf.to_string();
+    }
+    let qualified = if ns_name.ends_with("__") {
+        format!("{ns_name}{leaf}")
+    } else {
+        format!("{ns_name}__{leaf}")
+    };
+    if qualified.len() <= MAX_TOOL_NAME_LEN {
+        return qualified;
+    }
+    // Deterministic std-only stand-in for the TS sha256 suffix (see
+    // module docs): FNV-1a over the qualified name, same `_<7hex>`
+    // shape and 64-char cap.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in qualified.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let hex = format!("{hash:016x}");
+    let mut cut = MAX_TOOL_NAME_LEN - 8;
+    while !qualified.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}_{}", &qualified[..cut], &hex[..7])
+}
+
+/// One flattened child: `(tool, wire_name, namespace, leaf)`; `None`
+/// for children Grok must never see (non-`function` types like
+/// `custom`, or unnamed).
+fn flatten_namespace_child(
+    ns_name: &str,
+    child: &Value,
+) -> Option<(Value, String, String, String)> {
+    let child_obj = child.as_object()?;
+    if child_obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function")
+        != "function"
+    {
+        return None;
+    }
+    let leaf = child_obj.get("name").and_then(Value::as_str)?;
+    if leaf.is_empty() {
+        return None;
+    }
+    let wire_name = flatten_namespace_tool_name(ns_name, leaf);
+    let mut flat = serde_json::Map::new();
+    flat.insert("type".to_string(), Value::String("function".to_string()));
+    flat.insert("name".to_string(), Value::String(wire_name.clone()));
+    flat.insert(
+        "parameters".to_string(),
+        child_obj
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+    );
+    for key in ["description", "strict"] {
+        if let Some(value) = child_obj.get(key) {
+            flat.insert(key.to_string(), value.clone());
+        }
+    }
+    Some((
+        Value::Object(flat),
+        wire_name,
+        ns_name.to_string(),
+        leaf.to_string(),
+    ))
+}
+
+/// Rename namespaced `function_call` history items to their flattened
+/// wire names (`flattenNamespacedHistory`,
+/// `grokCliNamespaceTools.ts:55-67`).
+fn flatten_namespaced_history(input: &mut Vec<Value>) -> bool {
+    let mut changed = false;
+    for item in input.iter_mut() {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("function_call") {
+            continue;
+        }
+        let namespace = obj
+            .get("namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let name = obj
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if namespace.is_empty() || name.is_empty() {
+            continue;
+        }
+        obj.remove("namespace");
+        obj.insert(
+            "name".to_string(),
+            Value::String(flatten_namespace_tool_name(&namespace, &name)),
+        );
+        changed = true;
+    }
+    changed
+}
+
+/// `flattenGrokBuildNamespaceTools`
+/// (`grokCliNamespaceTools.ts:77-100`): namespace groups become flat
+/// function tools, namespaced history calls are renamed to match. The
+/// map is `Some` whenever a group was flattened (even one whose
+/// children all dropped — mirrors the truthy TS `Map`); `None`
+/// otherwise, in which case no restore runs downstream.
+fn flatten_grok_build_namespace_tools(
+    body: &mut Value,
+) -> Option<HashMap<String, (String, String)>> {
+    let obj = body.as_object_mut()?;
+    let mut identity_map: Option<HashMap<String, (String, String)>> = None;
+    let has_namespace = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| t.get("type").and_then(Value::as_str) == Some("namespace"))
+        });
+    if has_namespace {
+        let tools = obj.get("tools").and_then(Value::as_array).cloned()?;
+        let mut map = HashMap::new();
+        let mut flat_tools = Vec::with_capacity(tools.len());
+        for tool in &tools {
+            let is_namespace = tool.get("type").and_then(Value::as_str) == Some("namespace");
+            if !is_namespace {
+                flat_tools.push(tool.clone());
+                continue;
+            }
+            let ns_name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let children = tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for child in &children {
+                if let Some((flat, wire_name, ns, leaf)) = flatten_namespace_child(ns_name, child) {
+                    if !ns.is_empty() {
+                        map.insert(wire_name, (ns, leaf));
+                    }
+                    flat_tools.push(flat);
+                }
+            }
+        }
+        obj.insert("tools".to_string(), Value::Array(flat_tools));
+        identity_map = Some(map);
+    }
+    if let Some(Value::Array(input)) = obj.get_mut("input") {
+        flatten_namespaced_history(input);
+    }
+    identity_map
+}
+
+/// Resolve a flattened wire name back to `(namespace, leaf)`
+/// (`resolveRequestToolIdentity`, `requestToolIdentity.ts:59-83`):
+/// direct map hit, then the `namespace.leaf` dotted spelling some
+/// model parsers render, then the `mcp__` last-`__` split fallback
+/// (`#12996`).
+fn resolve_request_tool_identity(
+    map: &HashMap<String, (String, String)>,
+    tool_name: &str,
+) -> Option<(String, String)> {
+    if tool_name.is_empty() {
+        return None;
+    }
+    if let Some((ns, leaf)) = map.get(tool_name) {
+        return Some((ns.clone(), leaf.clone()));
+    }
+    for (ns, leaf) in map.values() {
+        if format!("{ns}.{leaf}") == tool_name {
+            return Some((ns.clone(), leaf.clone()));
+        }
+    }
+    if tool_name.starts_with("mcp__") {
+        if let Some(sep) = tool_name.rfind("__") {
+            let (ns, leaf) = (&tool_name[..sep], &tool_name[sep + 2..]);
+            if !ns.is_empty() && !leaf.is_empty() {
+                return Some((ns.to_string(), leaf.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Restore `{namespace, name}` on one chat-shape tool call
+/// (`restoreFunctionCall` + `applyFunctionCallIdentity` +
+/// `plaintextCollaborationFields`): the leaf goes back into
+/// `function.name`, the namespace rides alongside, and collaboration
+/// spawn/send/followup calls gain the `encrypted_function_args: []`
+/// plaintext marker Codex requires (`#14154`). Returns whether the
+/// call changed.
+fn restore_tool_call_namespace(call: &mut Value, map: &HashMap<String, (String, String)>) -> bool {
+    let already_namespaced = call
+        .get("namespace")
+        .and_then(Value::as_str)
+        .is_some_and(|ns| !ns.is_empty());
+    if already_namespaced {
+        return false;
+    }
+    let name = call
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return false;
+    }
+    let Some((ns, leaf)) = resolve_request_tool_identity(map, &name) else {
+        return false;
+    };
+    let Some(func) = call.get_mut("function").and_then(|f| f.as_object_mut()) else {
+        return false;
+    };
+    func.insert("name".to_string(), Value::String(leaf.clone()));
+    let Some(obj) = call.as_object_mut() else {
+        return false;
+    };
+    obj.insert("namespace".to_string(), Value::String(ns.clone()));
+    if ns == "collaboration"
+        && matches!(
+            leaf.as_str(),
+            "spawn_agent" | "send_message" | "followup_task"
+        )
+    {
+        obj.insert(
+            "encrypted_function_args".to_string(),
+            Value::Array(Vec::new()),
+        );
+    }
+    true
+}
+
+/// Rewrite flattened namespace calls on one outgoing chunk
+/// (`restoreGrokBuildNamespaceToolCalls` adapted to chunks — see the
+/// note on [`restore_tool_call_namespace`]). No-op without a map, so
+/// the shared `responses_wire` event mapping stays untouched.
+fn restore_chunk_tool_calls(
+    chunk: &mut ChatChunk,
+    map: Option<&HashMap<String, (String, String)>>,
+) {
+    let Some(map) = map else {
+        return;
+    };
+    let Some(calls) = chunk.delta.tool_calls.as_mut() else {
+        return;
+    };
+    for call in calls.iter_mut() {
+        restore_tool_call_namespace(call, map);
+    }
+}
+
+// ─── Foreign reasoning replay ─────────────────────────────────────────
+// Port of `stripForeignGrokBuildReasoning`
+// (`executors/grokCliReasoningReplay.ts`): a combo turn served by
+// another Responses provider leaves an `encrypted_content` blob Grok
+// cannot decrypt (`400 Could not decrypt the provided
+// encrypted_content`), wedging the conversation. Drop the blob from
+// every reasoning item Grok Build did not produce — its own items
+// are `rs_<uuid>` (or server-side tool reasoning with a `tco_`
+// id/blob prefix) — and ensure `summary: []` so the replay still
+// decodes. Fails closed by design: dropping one of Grok's own blobs
+// only costs continuity, forwarding a foreign one is a hard 400.
+
+/// `rs_<uuid>` (`GROK_BUILD_REASONING_ID_RE`): 8-4-4-4-12 hex.
+fn is_grok_build_reasoning_id(id: &str) -> bool {
+    let Some(hex) = id.strip_prefix("rs_") else {
+        return false;
+    };
+    let parts: Vec<&str> = hex.split('-').collect();
+    if parts.len() != 5 {
+        return false;
+    }
+    const LENS: [usize; 5] = [8, 4, 4, 4, 12];
+    parts
+        .iter()
+        .zip(LENS)
+        .all(|(p, len)| p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Whether a reasoning item carries Grok Build's own identity
+/// (`isGrokBuildReasoning`, `grokCliReasoningReplay.ts:30-38`).
+fn is_grok_build_reasoning(item: &Value) -> bool {
+    let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let blob = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    is_grok_build_reasoning_id(id) || id.starts_with("tco_") || blob.starts_with("tco_")
+}
+
+/// Strip one foreign blob; returns whether the item changed.
+fn strip_foreign_reasoning_item(item: &mut Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return false;
+    }
+    if item.get("encrypted_content").is_none() {
+        return false;
+    }
+    if is_grok_build_reasoning(item) {
+        return false;
+    }
+    let Some(obj) = item.as_object_mut() else {
+        return false;
+    };
+    obj.remove("encrypted_content");
+    if !obj.get("summary").is_some_and(|s| s.is_array()) {
+        obj.insert("summary".to_string(), Value::Array(Vec::new()));
+    }
+    true
+}
+
+// ─── Tool-schema root-union repair ────────────────────────────────────
+// Port of `normalizeGrokBuildToolSchemas`
+// (`executors/grokCliToolSchema.ts`): Grok Build refuses a function
+// tool whose `parameters` root is an `anyOf`/`oneOf` union with a
+// non-object branch (`400 [invalid_client_tool_schema]`, e.g. Codex
+// desktop's `automation_update` with `$ref` branches). Local `$ref`
+// branches are inlined (keywords next to the `$ref` combined with the
+// target), nested unions expanded, never-object branches dropped,
+// typeless object branches pinned to `type: "object"`, and the root's
+// shared `properties` / `required` / `additionalProperties` moved
+// into every branch. Unions inside `properties` / `$defs` are never
+// touched; schemas with non-`$defs` refs or over 64 root branches
+// pass through unchanged.
+
+const DEFINITION_REF_PREFIXES: &[&str] = &["#/$defs/", "#/definitions/"];
+const MAX_REF_HOPS: usize = 32;
+const MAX_UNION_DEPTH: usize = 8;
+const MAX_ROOT_BRANCHES: usize = 64;
+
+fn schema_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|i| i.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn schema_type_allows_object(ty: Option<&Value>) -> bool {
+    match ty {
+        None => true,
+        Some(Value::String(s)) => s == "object",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("object")),
+        Some(_) => false,
+    }
+}
+
+/// Whether a local `$ref` anywhere points outside `$defs` /
+/// `definitions` (`hasRootRelativeRef`).
+fn schema_has_root_relative_ref(node: &Value) -> bool {
+    match node {
+        Value::Array(items) => items.iter().any(schema_has_root_relative_ref),
+        Value::Object(map) => {
+            if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+                if reference.starts_with('#')
+                    && !DEFINITION_REF_PREFIXES
+                        .iter()
+                        .any(|prefix| reference.starts_with(prefix))
+                {
+                    return true;
+                }
+            }
+            map.values().any(schema_has_root_relative_ref)
+        }
+        _ => false,
+    }
+}
+
+/// Resolve a local JSON pointer (`#/$defs/Name`) against the schema
+/// root (`resolveLocalRef`).
+fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
+    if !reference.starts_with("#/") {
+        return None;
+    }
+    let mut node = root;
+    for segment in reference[2..].split('/') {
+        let key = segment.replace("~1", "/").replace("~0", "~");
+        node = node.as_object()?.get(&key)?;
+    }
+    Some(node)
+}
+
+/// Combine the keywords next to a `$ref` with its target
+/// (`mergeRefSiblings`): `properties` and `required` merge,
+/// annotations next to the `$ref` win.
+fn merge_ref_siblings(target: &Value, siblings: &serde_json::Map<String, Value>) -> Value {
+    let mut merged = target.as_object().cloned().unwrap_or_default();
+    for (key, value) in siblings {
+        merged.insert(key.clone(), value.clone());
+    }
+    if let (Some(Value::Object(target_props)), Some(Value::Object(sibling_props))) =
+        (target.get("properties"), siblings.get("properties"))
+    {
+        let mut props = target_props.clone();
+        for (key, value) in sibling_props {
+            props.insert(key.clone(), value.clone());
+        }
+        merged.insert("properties".to_string(), Value::Object(props));
+    }
+    let mut required = schema_string_list(target.get("required"));
+    for name in schema_string_list(siblings.get("required")) {
+        if !required.contains(&name) {
+            required.push(name);
+        }
+    }
+    if !required.is_empty() {
+        merged.insert(
+            "required".to_string(),
+            Value::Array(required.into_iter().map(Value::String).collect()),
+        );
+    }
+    Value::Object(merged)
+}
+
+/// Inline a branch's chain of local `$ref`s, each expanded at most
+/// once per root union (cycle guard); `None` for external, missing,
+/// cyclic or already-expanded references (`dereferenceBranch`).
+fn dereference_branch(
+    root: &Value,
+    branch: &Value,
+    expanded: &mut HashSet<String>,
+) -> Option<Value> {
+    let mut current = branch.clone();
+    let mut hops = 0;
+    while let Some(reference) = current
+        .get("$ref")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        if !expanded.insert(reference.clone()) {
+            return None;
+        }
+        hops += 1;
+        if hops > MAX_REF_HOPS {
+            return None;
+        }
+        let target = resolve_local_ref(root, &reference)?;
+        if !target.is_object() {
+            return None;
+        }
+        let mut siblings = current.as_object().cloned().unwrap_or_default();
+        siblings.remove("$ref");
+        current = merge_ref_siblings(target, &siblings);
+    }
+    Some(current)
+}
+
+/// Pin a branch to `type: "object"`, or `None` when it can never
+/// match a tool call's (always-object) arguments (`asObjectBranch`).
+fn as_object_branch(branch: &Value) -> Option<Value> {
+    const OBJECT_KEYWORDS: &[&str] = &[
+        "properties",
+        "required",
+        "additionalProperties",
+        "patternProperties",
+        "propertyNames",
+        "minProperties",
+        "maxProperties",
+    ];
+    const ANNOTATION_KEYWORDS: &[&str] =
+        &["title", "description", "$comment", "examples", "default"];
+    let obj = branch.as_object()?;
+    match obj.get("type") {
+        Some(Value::String(ty)) if ty == "object" => Some(branch.clone()),
+        Some(Value::Array(types)) if types.iter().any(|t| t.as_str() == Some("object")) => {
+            let mut next = obj.clone();
+            next.insert("type".to_string(), Value::String("object".to_string()));
+            Some(Value::Object(next))
+        }
+        Some(_) => None,
+        None => {
+            let describes_object = OBJECT_KEYWORDS.iter().any(|k| obj.contains_key(*k))
+                || obj
+                    .keys()
+                    .all(|k| ANNOTATION_KEYWORDS.contains(&k.as_str()));
+            if !describes_object {
+                return None;
+            }
+            let mut next = obj.clone();
+            next.insert("type".to_string(), Value::String("object".to_string()));
+            Some(Value::Object(next))
+        }
+    }
+}
+
+/// The branches of a schema that is nothing but an
+/// object-compatible `anyOf`/`oneOf` (`pureUnionBranches`).
+fn pure_union_branches(
+    schema: &serde_json::Map<String, Value>,
+) -> Option<(&'static str, Vec<Value>)> {
+    const UNION_ANNOTATION_KEYWORDS: &[&str] = &["type", "title", "description", "$comment"];
+    for keyword in ["anyOf", "oneOf"] {
+        if let Some(Value::Array(branches)) = schema.get(keyword) {
+            if !schema_type_allows_object(schema.get("type")) {
+                return None;
+            }
+            let pure = schema
+                .keys()
+                .all(|k| k == keyword || UNION_ANNOTATION_KEYWORDS.contains(&k.as_str()));
+            return pure.then(|| (keyword, branches.clone()));
+        }
+    }
+    None
+}
+
+/// Append the inline object schemas one root-union branch stands
+/// for (`collectObjectBranches`).
+fn collect_object_branches(
+    root: &Value,
+    branch: &Value,
+    depth: usize,
+    expanded: &mut HashSet<String>,
+    out: &mut Vec<Value>,
+) {
+    if out.len() > MAX_ROOT_BRANCHES {
+        return;
+    }
+    if !branch.is_object() {
+        return;
+    }
+    let Some(resolved) = dereference_branch(root, branch, expanded) else {
+        return;
+    };
+    let nested = resolved.as_object().and_then(pure_union_branches);
+    match nested {
+        None => {
+            if let Some(object_branch) = as_object_branch(&resolved) {
+                out.push(object_branch);
+            }
+        }
+        Some((_, branches)) => {
+            if depth >= MAX_UNION_DEPTH {
+                return;
+            }
+            for child in &branches {
+                collect_object_branches(root, child, depth + 1, expanded, out);
+            }
+        }
+    }
+}
+
+/// Add the root's shared object keywords to one branch (the branch's
+/// own win) — `withSharedShape`.
+fn with_shared_shape(
+    branch: &Value,
+    properties: &serde_json::Map<String, Value>,
+    required: &[String],
+    additional_properties: Option<&Value>,
+) -> Value {
+    let obj = branch.as_object().cloned().unwrap_or_default();
+    let add_additional =
+        additional_properties.is_some() && !obj.contains_key("additionalProperties");
+    if properties.is_empty() && required.is_empty() && !add_additional {
+        return branch.clone();
+    }
+    let mut next = obj;
+    if !properties.is_empty() {
+        let mut props = properties.clone();
+        if let Some(Value::Object(branch_props)) = next.get("properties") {
+            for (key, value) in branch_props {
+                props.insert(key.clone(), value.clone());
+            }
+        }
+        next.insert("properties".to_string(), Value::Object(props));
+    }
+    if !required.is_empty() {
+        let mut merged = required.to_vec();
+        for name in schema_string_list(next.get("required")) {
+            if !merged.contains(&name) {
+                merged.push(name);
+            }
+        }
+        next.insert(
+            "required".to_string(),
+            Value::Array(merged.into_iter().map(Value::String).collect()),
+        );
+    }
+    if add_additional {
+        next.insert(
+            "additionalProperties".to_string(),
+            additional_properties
+                .expect("guarded by add_additional")
+                .clone(),
+        );
+    }
+    Value::Object(next)
+}
+
+/// Rewrite one function tool's `parameters` root unions into the
+/// shape Grok Build accepts (`normalizeRootUnions`); returns the
+/// schema unchanged when there is nothing to reshape.
+fn normalize_root_unions(schema: &Value) -> Value {
+    const ROOT_OBJECT_KEYWORDS: &[&str] =
+        &["type", "properties", "required", "additionalProperties"];
+    let Some(obj) = schema.as_object() else {
+        return schema.clone();
+    };
+    let has_union = ["anyOf", "oneOf"]
+        .iter()
+        .any(|k| obj.get(*k).is_some_and(|v| v.is_array()));
+    if !has_union || schema_has_root_relative_ref(schema) {
+        return schema.clone();
+    }
+    let properties = obj
+        .get("properties")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let required = schema_string_list(obj.get("required"));
+    let additional_properties = obj.get("additionalProperties").cloned();
+    let mut changed = ROOT_OBJECT_KEYWORDS.iter().any(|k| obj.contains_key(*k));
+    let mut next = obj.clone();
+    for keyword in ["anyOf", "oneOf"] {
+        let Some(Value::Array(branches)) = obj.get(keyword) else {
+            continue;
+        };
+        let mut collected = Vec::new();
+        let mut expanded = HashSet::new();
+        for branch in branches {
+            collect_object_branches(schema, branch, 0, &mut expanded, &mut collected);
+        }
+        // Too wide to reshape safely: leave the schema as sent.
+        if collected.len() > MAX_ROOT_BRANCHES {
+            return schema.clone();
+        }
+        let kept: Vec<Value> = collected
+            .iter()
+            .map(|branch| {
+                with_shared_shape(
+                    branch,
+                    &properties,
+                    &required,
+                    additional_properties.as_ref(),
+                )
+            })
+            .collect();
+        if kept.len() != branches.len()
+            || kept
+                .iter()
+                .zip(branches.iter())
+                .any(|(kept_branch, branch)| kept_branch != branch)
+        {
+            changed = true;
+        }
+        if kept.is_empty() {
+            next.remove(keyword);
+        } else {
+            next.insert(keyword.to_string(), Value::Array(kept));
+        }
+    }
+    if !changed {
+        return schema.clone();
+    }
+    if ["anyOf", "oneOf"].iter().any(|k| next.contains_key(*k)) {
+        for keyword in ROOT_OBJECT_KEYWORDS {
+            next.remove(*keyword);
+        }
+    } else {
+        next.insert("type".to_string(), Value::String("object".to_string()));
+        if !next.get("properties").is_some_and(|v| v.is_object()) {
+            next.insert(
+                "properties".to_string(),
+                Value::Object(serde_json::Map::new()),
+            );
+        }
+    }
+    Value::Object(next)
+}
+
 /// `transformRequest` sanitization (`grok-cli.ts:340-388`) applied to
 /// the Responses body before send.
 fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
@@ -323,16 +1033,27 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
         let mut next_input = Vec::with_capacity(input.len());
         let mut changed = false;
         for mut item in input {
-            if let Some(obj) = item.as_object_mut() {
-                let item_type = obj
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if item_type == "reasoning" && obj.get("content").is_some_and(|c| c.is_null()) {
-                    obj.remove("content");
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if item_type == "reasoning" {
+                if let Some(obj) = item.as_object_mut() {
+                    if obj.get("content").is_some_and(|c| c.is_null()) {
+                        obj.remove("content");
+                        changed = true;
+                    }
+                }
+                // A combo turn served by another Responses provider
+                // replays its `encrypted_content` here; Grok cannot
+                // decrypt it, so the foreign blob is dropped (kept for
+                // Grok's own `rs_<uuid>` / `tco_` items).
+                if strip_foreign_reasoning_item(&mut item) {
                     changed = true;
-                } else if item_type == "function_call_output" {
+                }
+            } else if item_type == "function_call_output" {
+                if let Some(obj) = item.as_object_mut() {
                     let current = obj.get("output").cloned().unwrap_or(Value::Null);
                     let repaired = sanitize_function_call_output(&current);
                     let current_str = match &current {
@@ -402,7 +1123,9 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
         }
     }
     // `web_search` args Grok rejects (`external_web_access`,
-    // `search_context_size`) + the 200-tool cap.
+    // `search_context_size`), the 200-tool cap, then the root-union
+    // repair for function tool schemas (`grok-cli.ts:371-383` order:
+    // strip, cap, normalize).
     if let Some(Value::Array(tools)) = body.get("tools").cloned() {
         let mut next_tools = Vec::with_capacity(tools.len().min(MAX_TOOLS));
         let mut changed = tools.len() > MAX_TOOLS;
@@ -411,6 +1134,17 @@ fn sanitize_responses_body(mut body: Value, model: &str) -> Value {
                 if obj.get("type").and_then(Value::as_str) == Some("web_search") {
                     for arg in ["external_web_access", "search_context_size"] {
                         if obj.remove(arg).is_some() {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if tool.get("type").and_then(Value::as_str) == Some("function") {
+                if let Some(params) = tool.get("parameters").cloned().filter(|p| p.is_object()) {
+                    let next_params = normalize_root_unions(&params);
+                    if next_params != params {
+                        if let Some(obj) = tool.as_object_mut() {
+                            obj.insert("parameters".to_string(), next_params);
                             changed = true;
                         }
                     }
@@ -763,7 +1497,26 @@ impl Bridge for GrokCliBridge {
             .as_deref()
             .unwrap_or(&ctx.model.display_name);
         let raw_body = build_responses_body(req, upstream_model, true, Some(DEFAULT_EFFORT));
-        let body = sanitize_responses_body(raw_body, upstream_model);
+        // Namespace groups flatten before the request sanitizer
+        // (`GrokCliExecutor.execute` flattens before `transformRequest`;
+        // the sanitizer below then caps + normalizes the flat tools).
+        let mut pre_body = raw_body;
+        let namespace_map = flatten_grok_build_namespace_tools(&mut pre_body);
+        if namespace_map.is_some() {
+            if let Some(count) = pre_body
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(Vec::len)
+            {
+                if count > MAX_TOOLS {
+                    tracing::warn!(
+                        tools = count,
+                        "flattened namespace tools exceed the Grok Build limit: sending {MAX_TOOLS} of {count} tools"
+                    );
+                }
+            }
+        }
+        let body = sanitize_responses_body(pre_body, upstream_model);
         let headers = Self::build_headers(
             &credential,
             &ctx.request_id,
@@ -805,6 +1558,10 @@ impl Bridge for GrokCliBridge {
         let request_id = ctx.request_id.clone();
         if content_type.contains("text/event-stream") || content_type.is_empty() {
             let byte_stream = resp.bytes_stream();
+            // The identity map outlives the request the same way the TS
+            // executor's does (one map per `execute`); cloned for the
+            // stream generator below and the JSON branch after it.
+            let stream_map = namespace_map.clone();
             let stream = async_stream::try_stream! {
                 let mut decoder = SseDecoder::new();
                 let mut stream = Box::pin(byte_stream);
@@ -814,7 +1571,8 @@ impl Bridge for GrokCliBridge {
                         match event {
                             SseEvent::Done => break,
                             SseEvent::Data(payload) => {
-                                if let Some(chunk) = stream_event_into_chat_chunk(&payload, &model_owned, &request_id) {
+                                if let Some(mut chunk) = stream_event_into_chat_chunk(&payload, &model_owned, &request_id) {
+                                    restore_chunk_tool_calls(&mut chunk, stream_map.as_ref());
                                     yield chunk;
                                 }
                             }
@@ -822,7 +1580,8 @@ impl Bridge for GrokCliBridge {
                     }
                 }
                 if let Some(SseEvent::Data(payload)) = decoder.finish().map_err(|e| BridgeError::UpstreamDecode(e.to_string()))? {
-                    if let Some(chunk) = stream_event_into_chat_chunk(&payload, &model_owned, &request_id) {
+                    if let Some(mut chunk) = stream_event_into_chat_chunk(&payload, &model_owned, &request_id) {
+                        restore_chunk_tool_calls(&mut chunk, stream_map.as_ref());
                         yield chunk;
                     }
                 }
@@ -833,7 +1592,15 @@ impl Bridge for GrokCliBridge {
                 .json()
                 .await
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
-            let response = response_into_chat_response(&raw, &request_id, &model_owned);
+            let mut response = response_into_chat_response(&raw, &request_id, &model_owned);
+            if let Some(map) = namespace_map.as_ref() {
+                if let Some(Value::Array(calls)) = response.message.extra.get_mut("tool_calls") {
+                    for call in calls.iter_mut() {
+                        restore_tool_call_namespace(call, map);
+                    }
+                }
+            }
+            let response = response;
             let usage = response.usage.clone();
             let stream = async_stream::try_stream! {
                 yield ChatChunk {
@@ -910,13 +1677,27 @@ mod tests {
                 "model": "grok-4.7",
                 "presence_penalty": 0.5,
                 "reasoning_effort": "low",
-                "tools": [{"type": "web_search", "external_web_access": true}]
+                "tools": [{"type": "web_search", "external_web_access": true, "search_context_size": "high"}]
             }),
             "grok-4.7",
         );
         assert!(body.get("presence_penalty").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body["tools"][0].get("external_web_access").is_none());
+        assert!(body["tools"][0].get("search_context_size").is_none());
+        assert_eq!(body["tools"][0]["type"], serde_json::json!("web_search"));
+    }
+
+    #[test]
+    fn tools_capped_at_two_hundred() {
+        let tools: Vec<Value> = (0..250)
+            .map(|i| serde_json::json!({"type": "function", "name": format!("f{i}")}))
+            .collect();
+        let body = sanitize_responses_body(
+            serde_json::json!({"model": "grok-4.7", "tools": tools}),
+            "grok-4.7",
+        );
+        assert_eq!(body["tools"].as_array().unwrap().len(), MAX_TOOLS);
     }
 
     #[test]
@@ -932,6 +1713,241 @@ mod tests {
         // Incomplete \u escape is dropped rather than forwarded.
         let repaired = sanitize_function_call_output(&serde_json::json!("ab\\u12"));
         assert!(!repaired.contains("\\u12"));
+    }
+
+    #[test]
+    fn tool_schema_root_union_with_refs_is_reshaped() {
+        // Codex-desktop shape: root `oneOf` of `$defs` refs plus a
+        // `{type: "null"}` branch Grok rejects as "root cannot be
+        // nullable"; shared root keywords move into every branch.
+        let params = serde_json::json!({
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "oneOf": [
+                {"$ref": "#/$defs/ModeA"},
+                {"$ref": "#/$defs/ModeB"},
+                {"type": "null"}
+            ],
+            "$defs": {
+                "ModeA": {"type": "object", "properties": {"mode": {"const": "a"}}, "required": ["mode"]},
+                "ModeB": {"type": "object", "properties": {"mode": {"const": "b"}}}
+            }
+        });
+        let next = normalize_root_unions(&params);
+        let branches = next["oneOf"].as_array().unwrap();
+        assert_eq!(branches.len(), 2, "null branch dropped: {next}");
+        for branch in branches {
+            assert_eq!(branch["type"], serde_json::json!("object"));
+            assert!(
+                branch["properties"].get("id").is_some(),
+                "shared props moved: {branch}"
+            );
+            assert!(branch["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "id"));
+        }
+        // Root object keywords are gone while a union remains; `$defs`
+        // stays so nested refs keep resolving.
+        assert!(next.get("properties").is_none());
+        assert!(next.get("required").is_none());
+        assert!(next.get("$defs").is_some());
+    }
+
+    #[test]
+    fn tool_schema_without_union_passes_through() {
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": {"q": {"type": "string"}}
+        });
+        assert_eq!(normalize_root_unions(&params), params);
+        // Non-function tools and tools without object parameters are
+        // never touched. Driven through the send-path sanitizer, which is
+        // where the tool repair actually runs: its `changed` flag stays
+        // false, so `tools` comes back byte-identical.
+        let body = serde_json::json!({
+            "tools": [
+                {"type": "web_search"},
+                {"type": "function", "name": "f", "parameters": params},
+                {"type": "function", "name": "g"},
+            ]
+        });
+        let out = sanitize_responses_body(body.clone(), "grok-4.7");
+        assert_eq!(out["tools"], body["tools"], "tools untouched: {out}");
+    }
+
+    #[test]
+    fn tool_schema_with_foreign_ref_passes_through() {
+        let params = serde_json::json!({
+            "oneOf": [{"$ref": "#/elsewhere/Mode"}],
+            "$defs": {"Mode": {"type": "object", "properties": {}}}
+        });
+        assert_eq!(normalize_root_unions(&params), params);
+    }
+
+    #[test]
+    fn namespace_tools_flatten_with_identity_map() {
+        let mut body = serde_json::json!({
+            "model": "grok-4.7",
+            "tools": [
+                {"type": "function", "name": "plain"},
+                {"type": "namespace", "name": "mcp__srv", "tools": [
+                    {"type": "function", "name": "search", "description": "s",
+                     "parameters": {"type": "object", "properties": {}}},
+                    {"type": "custom", "name": "freeform"},
+                    {"type": "function", "name": ""}
+                ]},
+                {"type": "namespace", "name": "", "tools": [
+                    {"name": "bare", "parameters": {"type": "object", "properties": {}}}
+                ]}
+            ],
+            "input": [
+                {"type": "function_call", "namespace": "mcp__srv", "name": "search",
+                 "call_id": "c1", "arguments": "{}"}
+            ]
+        });
+        let map = flatten_grok_build_namespace_tools(&mut body).expect("group flattened");
+        assert_eq!(
+            map.get("mcp__srv__search"),
+            Some(&("mcp__srv".to_string(), "search".to_string()))
+        );
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .collect();
+        // Plain + one flattened function; the `custom` child and the
+        // unnamed child are dropped, never forwarded.
+        assert_eq!(names, vec!["plain", "mcp__srv__search", "bare"]);
+        // History renamed to the wire name so it matches the tools.
+        assert_eq!(
+            body["input"][0]["name"],
+            serde_json::json!("mcp__srv__search")
+        );
+        assert!(body["input"][0].get("namespace").is_none());
+    }
+
+    #[test]
+    fn no_namespace_tools_yields_no_map() {
+        let mut body = serde_json::json!({
+            "tools": [{"type": "function", "name": "f"}],
+        });
+        assert!(flatten_grok_build_namespace_tools(&mut body).is_none());
+    }
+
+    #[test]
+    fn restore_rewrites_wire_names_to_namespace_identity() {
+        let map: HashMap<String, (String, String)> = [
+            (
+                "mcp__srv__search".to_string(),
+                ("mcp__srv".to_string(), "search".to_string()),
+            ),
+            (
+                "collaboration__spawn_agent".to_string(),
+                ("collaboration".to_string(), "spawn_agent".to_string()),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut direct = serde_json::json!({
+            "id": "c1", "type": "function",
+            "function": {"name": "mcp__srv__search", "arguments": "{}"}
+        });
+        assert!(restore_tool_call_namespace(&mut direct, &map));
+        assert_eq!(direct["function"]["name"], serde_json::json!("search"));
+        assert_eq!(direct["namespace"], serde_json::json!("mcp__srv"));
+        // Dotted spelling resolves against the map; the mcp__ split
+        // fallback covers turns that never re-declared the tools.
+        let mut dotted = serde_json::json!({
+            "id": "c2", "type": "function",
+            "function": {"name": "mcp__srv.search", "arguments": "{}"}
+        });
+        assert!(restore_tool_call_namespace(&mut dotted, &map));
+        assert_eq!(dotted["namespace"], serde_json::json!("mcp__srv"));
+        let mut split = serde_json::json!({
+            "id": "c3", "type": "function",
+            "function": {"name": "mcp__other__tool", "arguments": "{}"}
+        });
+        assert!(restore_tool_call_namespace(&mut split, &HashMap::new()));
+        assert_eq!(split["function"]["name"], serde_json::json!("tool"));
+        assert_eq!(split["namespace"], serde_json::json!("mcp__other"));
+        // Collaboration calls gain the plaintext marker.
+        let mut spawn = serde_json::json!({
+            "id": "c4", "type": "function",
+            "function": {"name": "collaboration__spawn_agent", "arguments": "{}"}
+        });
+        assert!(restore_tool_call_namespace(&mut spawn, &map));
+        assert_eq!(spawn["encrypted_function_args"], serde_json::json!([]));
+        // Unknown names and already-namespaced calls pass through.
+        let mut unknown = serde_json::json!({
+            "id": "c5", "type": "function",
+            "function": {"name": "plain", "arguments": "{}"}
+        });
+        assert!(!restore_tool_call_namespace(&mut unknown, &map));
+        let mut stamped = serde_json::json!({
+            "id": "c6", "type": "function", "namespace": "mcp__srv",
+            "function": {"name": "search", "arguments": "{}"}
+        });
+        assert!(!restore_tool_call_namespace(&mut stamped, &map));
+    }
+
+    #[test]
+    fn foreign_reasoning_blob_stripped_grok_blob_kept() {
+        // OpenAI `rs_` hex blob (a codex combo turn): dropped, summary added.
+        let mut foreign = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_0123456789abcdef0123456789abcdef",
+            "encrypted_content": "opaque-openai-blob",
+        });
+        assert!(strip_foreign_reasoning_item(&mut foreign));
+        assert!(foreign.get("encrypted_content").is_none());
+        assert_eq!(foreign["summary"], serde_json::json!([]));
+        // Grok's own uuid item and tco_ tool reasoning survive.
+        let grok_id = "rs_12345678-1234-1234-1234-1234567890ab";
+        assert!(is_grok_build_reasoning_id(grok_id));
+        assert!(!is_grok_build_reasoning_id("rs_0123456789abcdef"));
+        let mut own = serde_json::json!({
+            "type": "reasoning", "id": grok_id, "encrypted_content": "grok-blob",
+        });
+        assert!(!strip_foreign_reasoning_item(&mut own));
+        let mut tool_reasoning = serde_json::json!({
+            "type": "reasoning", "id": "tco_abc", "encrypted_content": "tco_blob",
+        });
+        assert!(!strip_foreign_reasoning_item(&mut tool_reasoning));
+        // Items without a blob are never touched.
+        let mut plain = serde_json::json!({"type": "reasoning", "summary": []});
+        assert!(!strip_foreign_reasoning_item(&mut plain));
+    }
+
+    #[test]
+    fn sanitize_drops_foreign_encrypted_content_from_input() {
+        let body = sanitize_responses_body(
+            serde_json::json!({
+                "model": "grok-4.7",
+                "input": [
+                    {"type": "reasoning", "id": "rs_0123456789abcdef0123456789abcdef",
+                     "encrypted_content": "foreign"}
+                ]
+            }),
+            "grok-4.7",
+        );
+        assert!(body["input"][0].get("encrypted_content").is_none());
+        assert_eq!(body["input"][0]["summary"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn flattened_wire_name_rules() {
+        assert_eq!(flatten_namespace_tool_name("", "leaf"), "leaf");
+        assert_eq!(flatten_namespace_tool_name("ns", "a__b"), "a__b");
+        assert_eq!(flatten_namespace_tool_name("ns__", "leaf"), "ns__leaf");
+        assert_eq!(flatten_namespace_tool_name("ns", "leaf"), "ns__leaf");
+        // Over-long names truncate deterministically to the 64-char cap.
+        let (ns, leaf) = ("n".repeat(30), "l".repeat(40));
+        let first = flatten_namespace_tool_name(&ns, &leaf);
+        assert_eq!(first.len(), 64, "wire={first}");
+        assert_eq!(first, flatten_namespace_tool_name(&ns, &leaf));
     }
 
     /// Refresh posts the `{grant_type, client_id, refresh_token}` form

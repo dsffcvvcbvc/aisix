@@ -464,6 +464,110 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Provider Keys"
         ],
         "description": "List all configured provider key resources."
+      },
+      "post": {
+        "summary": "Create a Provider Key",
+        "description": "Create a provider key. The resource id is derived from the entry name, as it is for a file-loaded provider key. The new key is applied to the running configuration immediately and persisted to the active resources file.",
+        "requestBody": {
+          "description": "One provider key document. `display_name` and the credential (`api_key`, or the accepted `secret` spelling) are required; every other field is optional and defaults as the Provider Key schema documents.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The document is not a valid provider key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A provider key with this display name already exists, or the active resources file holds resources a per-key write cannot re-emit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The resources file could not be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ]
+      }
+    },
+    "/admin/v1/preset_providers": {
+      "get": {
+        "summary": "List Preset Providers",
+        "description": "List the upstream vendors a provider key can be pointed at with no code of its own. Each entry carries the vendor id, a label, the canonical base URL to set as the provider key's `api_base`, where the credential goes on the wire, and any static headers the vendor requires. No credential material is included. The catalog is compiled into the gateway binary and is read-only.",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ]
       }
     },
     "/admin/v1/provider_keys/{id}": {
@@ -527,6 +631,159 @@ const OPENAPI_JSON_BASE: &str = r##"{
           "Provider Keys"
         ],
         "description": "Get a provider key resource by ID."
+      },
+      "patch": {
+        "summary": "Update a Provider Key by ID",
+        "description": "Update a provider key by ID. The resource id is unchanged by the update, and the change is applied to the running configuration immediately.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider key resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+            "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
+          }
+        ],
+        "requestBody": {
+          "description": "The fields to change. Merged onto the stored document; a field the provider key has no place for is rejected rather than ignored, and `null` clears an optional field.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProviderKey"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProviderKeyEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The merged document is not a valid provider key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The resources file could not be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ]
+      },
+      "delete": {
+        "summary": "Delete a Provider Key by ID",
+        "description": "Delete a provider key by ID. Refused while a model or passthrough route still references it.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "Provider key resource ID, as assigned by the active resource source (a UUIDv5 derived from the entry name in file mode; the etcd key's ID segment otherwise).",
+            "example": "4f8f70e7-0c6e-4f74-92c5-cd70d94f3a21"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid admin key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Resource not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A model or passthrough route still references this provider key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The resources file could not be written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Provider Keys"
+        ]
       }
     },
     "/admin/v1/mcp_servers": {
@@ -2700,6 +2957,7 @@ mod tests {
             "/admin/v1/apikeys/{id}",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
+            "/admin/v1/preset_providers",
             "/admin/v1/mcp_servers",
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
@@ -2788,6 +3046,7 @@ mod tests {
             "/admin/v1/apikeys/{id}",
             "/admin/v1/provider_keys",
             "/admin/v1/provider_keys/{id}",
+            "/admin/v1/preset_providers",
             "/admin/v1/mcp_servers",
             "/admin/v1/mcp_servers/{id}",
             "/admin/v1/a2a_agents",
@@ -2834,10 +3093,19 @@ mod tests {
                             method, "post",
                             "{method} {path}: the resources write route is POST-only"
                         );
+                    } else if path == "/admin/v1/provider_keys"
+                        || path == "/admin/v1/provider_keys/{id}"
+                    {
+                        // provider_keys regained native CRUD; the rest of
+                        // the resource surface stays GET-only.
+                        assert!(
+                            matches!(method.as_str(), "get" | "post" | "patch" | "delete"),
+                            "{method} {path}: unexpected method on a provider-key write route"
+                        );
                     } else {
                         assert_eq!(
                             method, "get",
-                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources"
+                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources and provider-key CRUD"
                         );
                     }
                 }

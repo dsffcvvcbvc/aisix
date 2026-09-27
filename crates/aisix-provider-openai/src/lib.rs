@@ -17,6 +17,8 @@ pub mod codex;
 pub mod cohere;
 pub mod grok_cli;
 pub mod overrides;
+mod presets;
+mod presets_tests;
 pub mod qoder;
 pub mod reasoning;
 pub mod responses_wire;
@@ -26,4 +28,8 @@ pub use bridge::{close_strict_response_format_schema, OpenAiBridge, OPENAI_DEFAU
 pub use clinepass::{ClineBridge, ClinepassBridge, CLINE_DEFAULT_BASE};
 pub use codex::{CodexBridge, CODEX_CLIENT_VERSION, CODEX_DEFAULT_BASE};
 pub use grok_cli::{GrokCliBridge, GROK_CLIENT_VERSION, GROK_DEFAULT_BASE};
+pub use presets::{
+    find_preset, PresetAuth, PresetProvider, PRESET_ALIASES, PRESET_PROVIDERS,
+    PRESET_PROVIDER_COUNT,
+};
 pub use qoder::{QoderBridge, QODER_DEFAULT_BASE};

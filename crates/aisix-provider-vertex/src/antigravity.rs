@@ -50,12 +50,33 @@ const ANTIGRAVITY_IDE_VERSION: &str = "2.1.1";
 /// never on content requests.
 const ANTIGRAVITY_IDE_NODE_API_CLIENT: &str = "google-api-nodejs-client/10.3.0";
 /// Default Cloud Code project sent in the envelope. Per-key
-/// `ProviderKey.project` wins when set; this stays as the fallback so
-/// existing keys keep working unchanged, and a missing project fails
-/// closed upstream anyway. (The TS executor resolves the project
-/// per-account via `loadCodeAssist`; the gateway has no account store,
-/// so per-account discovery is out of scope here.)
+/// `ProviderKey.project` wins when set; when it is missing a best-effort
+/// `loadCodeAssist` discovery runs first (memoized per access token, see
+/// `discover_project`), and this stays as the fail-open fallback so
+/// existing keys keep working unchanged on any discovery error.
 const ANTIGRAVITY_DEFAULT_PROJECT: &str = "aicode-consumers";
+/// Google OAuth2 authorize endpoint for the Antigravity PKCE flow
+/// (`ANTIGRAVITY_CONFIG.authorizeUrl` in the TS registry).
+const ANTIGRAVITY_OAUTH_AUTHORIZE_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+/// OAuth scopes for the Antigravity PKCE flow — the Cloud Code / userinfo
+/// scopes exactly as the TS registry (`ANTIGRAVITY_CONFIG.scopes`).
+/// Deliberately no `openid`: with PKCE Google routes that into the
+/// hanging `firstparty/nativeapp` consent (see the registry comment).
+const ANTIGRAVITY_OAUTH_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/cloud-platform",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
+    "https://www.googleapis.com/auth/cclog",
+    "https://www.googleapis.com/auth/experimentsandconfigs",
+];
+/// `loadCodeAssist` bootstrap endpoint used for Cloud Code project
+/// discovery (`ANTIGRAVITY_BOOTSTRAP_BASE_URLS[0]` +
+/// `/v1internal:loadCodeAssist` in the TS registry).
+const ANTIGRAVITY_LOAD_CODE_ASSIST_URL: &str =
+    "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist";
+/// Bound for the in-memory per-access-token project cache (mirrors the
+/// etalon's 256-entry cap; the map is cleared once full).
+const ANTIGRAVITY_PROJECT_CACHE_MAX: usize = 256;
 
 /// Embedded public OAuth client id, XOR-masked per the mandatory
 /// `PUBLIC_CREDS.md` pattern (installed-app PKCE credential, public by
@@ -95,6 +116,21 @@ fn resolve_oauth_client_secret() -> String {
             "ANTIGRAVITY_CLIENT_SECRET",
         ],
     )
+}
+
+/// IDE version for the spoofed Antigravity `User-Agent`, mirroring
+/// `antigravityVersion.ts`: operator override via `ANTIGRAVITY_IDE_VERSION`
+/// env, pinned-const fallback otherwise. The value on the wire is
+/// unchanged by default (`2.1.1`); only an explicit env var moves it.
+fn ide_version_from_env(raw: Option<String>) -> String {
+    match raw.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        Some(v) => v,
+        None => ANTIGRAVITY_IDE_VERSION.to_string(),
+    }
+}
+
+fn resolve_ide_version() -> String {
+    ide_version_from_env(std::env::var("ANTIGRAVITY_IDE_VERSION").ok())
 }
 
 // ─── Token Mint ─────────────────────────────────────────────────────────────
@@ -190,8 +226,8 @@ impl AntigravityTokenMint {
             .header(
                 header::USER_AGENT,
                 format!(
-                    "antigravity/{ANTIGRAVITY_IDE_VERSION} darwin/arm64 \
-                     {ANTIGRAVITY_IDE_NODE_API_CLIENT}"
+                    "antigravity/{} darwin/arm64 {ANTIGRAVITY_IDE_NODE_API_CLIENT}",
+                    resolve_ide_version(),
                 ),
             )
             .form(&params)
@@ -239,6 +275,74 @@ impl AntigravityTokenMint {
 
         Ok(token)
     }
+}
+
+// ─── PKCE Authorize ─────────────────────────────────────────────────────────
+
+/// Percent-encode a query component (`URLSearchParams` shape: space as
+/// `+`, everything outside the unreserved set as `%XX`). No new deps —
+/// only the values this helper emits ever pass through here.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit((byte >> 4) as u32, 16)
+                        .unwrap_or('0')
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit((byte & 0xF) as u32, 16)
+                        .unwrap_or('0')
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Build the Google OAuth2 PKCE authorize URL (`buildAntigravityAuthUrl`
+/// in `src/lib/oauth/providers/antigravity.ts:82-96`): `response_type=code`
+/// with `access_type=offline`, `prompt=consent` and the S256
+/// `code_challenge`. Stateless — the caller supplies `state` and the
+/// challenge and keeps them; nothing is stored here. A blank `client_id`
+/// falls back to the resolved public credential, mirroring
+/// `resolve_project`'s blank-falls-back convention.
+pub fn build_authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> String {
+    let client_id = if client_id.trim().is_empty() {
+        resolve_oauth_client_id()
+    } else {
+        client_id.trim().to_string()
+    };
+    let params = [
+        ("client_id", client_id),
+        ("response_type", "code".to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("scope", ANTIGRAVITY_OAUTH_SCOPES.join(" ")),
+        ("state", state.to_string()),
+        ("access_type", "offline".to_string()),
+        ("prompt", "consent".to_string()),
+        ("code_challenge", code_challenge.to_string()),
+        ("code_challenge_method", "S256".to_string()),
+    ];
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", percent_encode_query(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{ANTIGRAVITY_OAUTH_AUTHORIZE_URL}?{query}")
 }
 
 // ─── Request Envelope & Sanitization ────────────────────────────────────────
@@ -373,13 +477,46 @@ struct AntigravityThinkingConfig {
 }
 
 /// Conservative ceiling for `maxOutputTokens`. The etalon resolves a
-/// per-model cap from its catalogue (fallback 16384); the gateway has no
-/// model catalogue, so the shared declared ceiling most Antigravity
-/// models publish (65535) is the clamp. Oversized Copilot-style values
-/// above it would 400 upstream (`antigravityOutputCap.ts`).
+/// per-model cap from its catalogue; the gateway has no model catalogue,
+/// so the pinned table below carries the confirmed values and this const
+/// (65535, the ceiling most Antigravity models publish) is both the clamp
+/// for unlisted models and the unknown-model fallback. Oversized
+/// Copilot-style values above the resolved cap would 400 upstream
+/// (`antigravityOutputCap.ts`).
 const ANTIGRAVITY_MAX_OUTPUT_TOKENS: u32 = 65535;
 
-fn build_generation_config(req: &ChatFormat) -> AntigravityGenConfig {
+/// Per-model `maxOutputTokens` ceilings on the Cloud Code face — the
+/// static port of `resolveAntigravityOutputCap`. Values quoted from the
+/// etalon's own comments plus Google's documented output limits
+/// (<https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro> and
+/// `.../gemini-2.5-flash`: 65,536 output tokens; the Cloud Code face
+/// publishes 65535, same as the fallback, so the pin is belt-and-braces).
+const ANTIGRAVITY_MODEL_OUTPUT_CAPS: &[(&str, u32)] = &[
+    ("claude-sonnet-4-6", 65536),
+    ("gemini-pro-agent", 65535),
+    ("gemini-2.5-flash", 65535),
+    ("gemini-2.5-pro", 65535),
+    ("gemini-2.5-flash-lite", 65535),
+    ("gpt-oss-120b-medium", 32768),
+];
+
+/// The output ceiling this model accepts, or 65535 when the id is not in
+/// the table. Lookup is case-insensitive on the trimmed id with a leading
+/// `models/` prefix tolerated (Gemini-style ids).
+pub fn resolve_output_cap(model: &str) -> u32 {
+    let mut id = model.trim().to_lowercase();
+    if let Some(stripped) = id.strip_prefix("models/") {
+        id = stripped.to_string();
+    }
+    for (known, cap) in ANTIGRAVITY_MODEL_OUTPUT_CAPS {
+        if id == *known {
+            return *cap;
+        }
+    }
+    ANTIGRAVITY_MAX_OUTPUT_TOKENS
+}
+
+fn build_generation_config(req: &ChatFormat, model: &str) -> AntigravityGenConfig {
     // Thinking budget the caller attached via `extra` (the unified
     // thinking adapter's body-root `thinking_budget` shape). `None`
     // means non-thinking: no `thinkingConfig` is emitted at all.
@@ -389,7 +526,8 @@ fn build_generation_config(req: &ChatFormat) -> AntigravityGenConfig {
         .and_then(serde_json::Value::as_u64)
         .and_then(|b| u32::try_from(b).ok())
         .filter(|b| *b > 0);
-    let mut max_output_tokens = req.max_tokens.unwrap_or(ANTIGRAVITY_MAX_OUTPUT_TOKENS);
+    let cap = resolve_output_cap(model);
+    let mut max_output_tokens = req.max_tokens.unwrap_or(cap);
     // `applyAntigravityGenerationDefaults`: the thinking budget must fit
     // inside the output window, so a max at or under the budget is
     // bumped past it.
@@ -398,7 +536,7 @@ fn build_generation_config(req: &ChatFormat) -> AntigravityGenConfig {
             max_output_tokens = budget.saturating_add(1);
         }
     }
-    max_output_tokens = max_output_tokens.min(ANTIGRAVITY_MAX_OUTPUT_TOKENS);
+    max_output_tokens = max_output_tokens.min(cap);
     AntigravityGenConfig {
         top_k: 40,
         top_p: 1.0,
@@ -676,7 +814,7 @@ fn convert_chat_format<'a>(
         request: AntigravityRequest {
             contents,
             system_instruction,
-            generation_config: build_generation_config(req),
+            generation_config: build_generation_config(req, model_name),
             tools,
             tool_config,
             session_id: Some(resolve_session_id(credential)),
@@ -846,6 +984,143 @@ fn resolve_project(key: &aisix_core::ProviderKey) -> &str {
     }
 }
 
+// ─── Project discovery (`loadCodeAssist` analogue) ──────────────────────────
+
+/// In-memory per-access-token project cache, keyed by the same refresh-
+/// token hash partition as the token mint so raw bearer tokens never sit
+/// in the map. Successful discoveries only — failures stay uncached so
+/// the next request retries instead of pinning a miss.
+static ANTIGRAVITY_PROJECT_CACHE: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+
+fn project_cache() -> &'static RwLock<HashMap<String, String>> {
+    ANTIGRAVITY_PROJECT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Extract the Cloud Code project id from a `loadCodeAssist` body: the
+/// `cloudaicompanionProject` field is either a plain string or an object
+/// carrying `id` (`antigravityProjectBootstrap.ts:152-161`). Empty and
+/// missing values yield `None` so the caller falls back.
+fn extract_discovered_project(body: &serde_json::Value) -> Option<String> {
+    match body.get("cloudaicompanionProject") {
+        Some(serde_json::Value::String(s)) => {
+            let id = s.trim();
+            if id.is_empty() {
+                None
+            } else {
+                Some(id.to_string())
+            }
+        }
+        Some(serde_json::Value::Object(obj)) => obj
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// Native `loadCodeAssist` body metadata (`antigravityHeaders.ts:116-122`):
+/// protobuf-JSON-shaped int enums, `ideType` 9 with the Gemini plugin
+/// type 2. The platform enum mirrors the etalon's host mapping.
+fn load_code_assist_platform() -> i32 {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => 2,
+        ("macos", _) => 1,
+        ("linux", "aarch64") => 4,
+        ("linux", _) => 3,
+        ("windows", _) => 5,
+        _ => 0,
+    }
+}
+
+fn load_code_assist_metadata() -> serde_json::Value {
+    serde_json::json!({
+        "ideType": 9,
+        "platform": load_code_assist_platform(),
+        "pluginType": 2,
+    })
+}
+
+/// `loadCodeAssist` analogue (`antigravity.ts:639-656`): discover the
+/// Cloud Code project bound to this access token. Results are memoized
+/// per token for the process lifetime; any transport, status or parse
+/// failure is an `Err` and the caller fails open to the shared default.
+pub async fn discover_project(access_token: &str) -> Result<String, BridgeError> {
+    let key = token_cache_key(access_token);
+    if let Some(cached) = project_cache().read().await.get(&key).cloned() {
+        return Ok(cached);
+    }
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+    let resp = client
+        .post(ANTIGRAVITY_LOAD_CODE_ASSIST_URL)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::USER_AGENT,
+            format!("antigravity/ide/{} darwin/arm64", resolve_ide_version()),
+        )
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({ "metadata": load_code_assist_metadata() }))
+        .send()
+        .await
+        .map_err(|e| {
+            BridgeError::Transport(format!("antigravity loadCodeAssist request failed: {e}"))
+        })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body: String = resp.text().await.unwrap_or_default();
+        return Err(BridgeError::upstream_status(
+            status.as_u16(),
+            format!(
+                "antigravity loadCodeAssist rejected ({status}): {}",
+                truncate_lossy(&body, MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+            ),
+        ));
+    }
+
+    let body: serde_json::Value = resp.json().await.map_err(|e| {
+        BridgeError::UpstreamDecode(format!(
+            "failed to parse antigravity loadCodeAssist response: {e}"
+        ))
+    })?;
+    let Some(project) = extract_discovered_project(&body) else {
+        return Err(BridgeError::UpstreamDecode(
+            "antigravity loadCodeAssist returned no cloudaicompanionProject".into(),
+        ));
+    };
+
+    let mut guard = project_cache().write().await;
+    if guard.len() >= ANTIGRAVITY_PROJECT_CACHE_MAX {
+        guard.clear();
+    }
+    guard.insert(key, project.clone());
+    Ok(project)
+}
+
+/// Project for the envelope as an owned value: per-key
+/// `ProviderKey.project` wins when set; when it is missing a best-effort
+/// discovery runs first, and any discovery error falls back to the shared
+/// default so existing keys keep working unchanged (fail-open to the old
+/// behavior, never fail-closed).
+async fn resolve_project_owned(key: &aisix_core::ProviderKey, access_token: &str) -> String {
+    let explicit = key
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+    match explicit {
+        Some(p) => p.to_string(),
+        None => discover_project(access_token)
+            .await
+            .unwrap_or_else(|_| ANTIGRAVITY_DEFAULT_PROJECT.to_string()),
+    }
+}
+
 // ─── Upstream SSE Response Types ───────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -988,7 +1263,8 @@ impl AntigravityBridge {
         headers.insert(
             header::USER_AGENT,
             HeaderValue::from_str(&format!(
-                "antigravity/ide/{ANTIGRAVITY_IDE_VERSION} darwin/arm64"
+                "antigravity/ide/{} darwin/arm64",
+                resolve_ide_version()
             ))
             .map_err(|_| BridgeError::Config("invalid antigravity user-agent".into()))?,
         );
@@ -1163,12 +1439,8 @@ impl Bridge for AntigravityBridge {
             .model_name
             .as_deref()
             .unwrap_or(&ctx.model.display_name);
-        let envelope = convert_chat_format(
-            req,
-            upstream_model,
-            credential,
-            resolve_project(&ctx.provider_key),
-        );
+        let project = resolve_project_owned(&ctx.provider_key, &access_token).await;
+        let envelope = convert_chat_format(req, upstream_model, credential, &project);
         let mut body_value = serde_json::to_value(&envelope).map_err(|e| {
             BridgeError::Config(format!(
                 "failed to serialize antigravity request envelope: {e}"
@@ -1817,6 +2089,154 @@ mod tests {
             keys.last().map(String::as_str),
             Some("authorization"),
             "authorization must land last, got {keys:?}"
+        );
+    }
+
+    /// Decode one `URLSearchParams`-style component (`+` → space, `%XX`).
+    fn decode_query_component(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        let mut bytes = raw.as_bytes().iter();
+        while let Some(&b) = bytes.next() {
+            match b {
+                b'+' => out.push(' '),
+                b'%' => {
+                    let hi = bytes.next().copied().unwrap_or(b'0');
+                    let lo = bytes.next().copied().unwrap_or(b'0');
+                    let hex = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+                    out.push((hex(hi) << 4 | hex(lo)) as char);
+                }
+                _ => out.push(b as char),
+            }
+        }
+        out
+    }
+
+    fn authorize_params(url: &str) -> HashMap<String, String> {
+        let query = url.split_once('?').expect("authorize url has a query").1;
+        query
+            .split('&')
+            .map(|pair| {
+                let (k, v) = pair.split_once('=').expect("key=value pair");
+                (k.to_string(), decode_query_component(v))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn authorize_url_carries_pkce_offline_consent_form() {
+        let url = build_authorize_url(
+            "test-client-id",
+            "http://localhost:8080/callback",
+            "state-123",
+            "challenge-abc",
+        );
+        assert!(
+            url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
+            "unexpected base: {url}"
+        );
+        let params = authorize_params(&url);
+        assert_eq!(params["client_id"], "test-client-id");
+        assert_eq!(params["response_type"], "code");
+        assert_eq!(params["redirect_uri"], "http://localhost:8080/callback");
+        assert_eq!(params["state"], "state-123");
+        assert_eq!(params["access_type"], "offline");
+        assert_eq!(params["prompt"], "consent");
+        assert_eq!(params["code_challenge"], "challenge-abc");
+        assert_eq!(params["code_challenge_method"], "S256");
+        assert_eq!(
+            params["scope"],
+            "https://www.googleapis.com/auth/cloud-platform \
+             https://www.googleapis.com/auth/userinfo.email \
+             https://www.googleapis.com/auth/userinfo.profile \
+             https://www.googleapis.com/auth/cclog \
+             https://www.googleapis.com/auth/experimentsandconfigs"
+        );
+    }
+
+    #[test]
+    fn resolve_output_cap_known_models_and_fallback() {
+        assert_eq!(resolve_output_cap("gemini-2.5-flash"), 65535);
+        assert_eq!(resolve_output_cap("gemini-2.5-pro"), 65535);
+        assert_eq!(resolve_output_cap("gemini-2.5-flash-lite"), 65535);
+        assert_eq!(resolve_output_cap("claude-sonnet-4-6"), 65536);
+        assert_eq!(resolve_output_cap("gpt-oss-120b-medium"), 32768);
+        // Normalization: case, whitespace and a `models/` prefix.
+        assert_eq!(resolve_output_cap("  GPT-OSS-120B-MEDIUM "), 32768);
+        assert_eq!(resolve_output_cap("models/gemini-2.5-pro"), 65535);
+        // Unknown and empty ids fall back to 65535.
+        assert_eq!(resolve_output_cap("some-future-model"), 65535);
+        assert_eq!(resolve_output_cap(""), 65535);
+        assert_eq!(resolve_output_cap("   "), 65535);
+    }
+
+    #[test]
+    fn generation_config_uses_per_model_cap() {
+        let mut req = ChatFormat::new("m", vec![ChatMessage::user("go")]);
+        req.max_tokens = Some(u32::MAX);
+        let env = convert_chat_format(&req, "gpt-oss-120b-medium", "cred", "proj");
+        let config = serde_json::to_value(&env.request.generation_config).unwrap();
+        assert_eq!(config["maxOutputTokens"], serde_json::json!(32768));
+        // Unlisted models keep the shared 65535 clamp.
+        let env = convert_chat_format(&req, "unknown-model", "cred", "proj");
+        let config = serde_json::to_value(&env.request.generation_config).unwrap();
+        assert_eq!(config["maxOutputTokens"], serde_json::json!(65535));
+    }
+
+    #[test]
+    fn ide_version_env_override_and_fallback() {
+        assert_eq!(ide_version_from_env(None), ANTIGRAVITY_IDE_VERSION);
+        assert_eq!(ide_version_from_env(Some(String::new())), "2.1.1");
+        assert_eq!(ide_version_from_env(Some("   ".to_string())), "2.1.1");
+        assert_eq!(ide_version_from_env(Some("  3.0.0 ".to_string())), "3.0.0");
+        // The default on the wire is unchanged without the env var.
+        assert_eq!(ANTIGRAVITY_IDE_VERSION, "2.1.1");
+    }
+
+    #[test]
+    fn discovery_parses_string_and_object_project() {
+        let body = serde_json::json!({"cloudaicompanionProject": "my-proj"});
+        assert_eq!(
+            extract_discovered_project(&body).as_deref(),
+            Some("my-proj")
+        );
+        let body = serde_json::json!({"cloudaicompanionProject": {"id": "  obj-proj "}});
+        assert_eq!(
+            extract_discovered_project(&body).as_deref(),
+            Some("obj-proj")
+        );
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"cloudaicompanionProject": ""}),
+            serde_json::json!({"cloudaicompanionProject": "   "}),
+            serde_json::json!({"cloudaicompanionProject": {"id": ""}}),
+            serde_json::json!({"cloudaicompanionProject": 42}),
+        ] {
+            assert_eq!(extract_discovered_project(&body), None, "body={body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn project_cache_short_circuits_discovery() {
+        // A cached entry must be served without any network round-trip.
+        let token = "test-cache-token-project-discovery";
+        let key = token_cache_key(token);
+        project_cache()
+            .write()
+            .await
+            .insert(key.clone(), "cached-proj".to_string());
+        let discovered = discover_project(token).await.expect("cached project");
+        assert_eq!(discovered, "cached-proj");
+        project_cache().write().await.remove(&key);
+    }
+
+    #[tokio::test]
+    async fn explicit_project_skips_discovery() {
+        let key: aisix_core::ProviderKey =
+            serde_json::from_str(r#"{"display_name":"k","secret":"s","project":"custom-proj"}"#)
+                .unwrap();
+        assert_eq!(
+            resolve_project_owned(&key, "ya29.unused").await,
+            "custom-proj"
         );
     }
 }

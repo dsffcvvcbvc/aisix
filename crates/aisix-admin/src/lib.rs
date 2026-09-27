@@ -15,6 +15,9 @@
 //! - `GET /admin/v1/models` and `GET /admin/v1/models/:id`
 //! - `GET /admin/v1/api_keys` and `GET /admin/v1/api_keys/:id`
 //! - `GET /admin/v1/provider_keys` and `GET /admin/v1/provider_keys/:id`
+//! - `POST /admin/v1/provider_keys`, `PATCH|DELETE /admin/v1/provider_keys/:id`
+//!   (validate + hot-reload + persist)
+//! - `GET /admin/v1/preset_providers`
 //! - `GET /admin/v1/guardrails` and `GET /admin/v1/guardrails/:id`
 //! - `GET /admin/v1/cache_policies` and `GET /admin/v1/cache_policies/:id`
 //! - `GET /admin/v1/observability_exporters` and
@@ -51,6 +54,9 @@ pub mod etcd_store;
 pub mod file_store;
 mod guardrails_handlers;
 mod health_handler;
+mod keys_handler;
+#[cfg(test)]
+mod keys_handler_tests;
 mod mcp_servers_handlers;
 mod models_handlers;
 mod models_status_handler;
@@ -161,11 +167,18 @@ pub fn build_router(state: AdminState) -> Router {
         )
         .route(
             "/admin/v1/provider_keys",
-            get(provider_keys_handlers::list_provider_keys),
+            get(provider_keys_handlers::list_provider_keys)
+                .post(keys_handler::create_provider_key),
         )
         .route(
             "/admin/v1/provider_keys/:id",
-            get(provider_keys_handlers::get_provider_key),
+            get(provider_keys_handlers::get_provider_key)
+                .patch(keys_handler::update_provider_key)
+                .delete(keys_handler::delete_provider_key),
+        )
+        .route(
+            "/admin/v1/preset_providers",
+            get(keys_handler::list_preset_providers),
         )
         .route(
             "/admin/v1/mcp_servers",
@@ -1552,17 +1565,19 @@ mod tests {
     /// Per-resource writes were removed: every collection and `:id`
     /// route serves GET only, so POST/PUT/DELETE answer 405 with an
     /// `Allow: GET` header — regardless of store backend or auth.
-    /// `POST /admin/v1/resources` is the sole write exception.
+    /// Two exceptions carry native CRUD: `POST /admin/v1/resources`
+    /// (whole-document write) and the provider-key routes.
     #[tokio::test]
     async fn removed_resource_writes_answer_405_with_allow_get() {
         // The FULL matrix — every route spelling × every write method.
         // A partial revert (say, PUT re-added on one {id} route) must
         // fail here; a sampled subset would let it through.
-        const ROUTE_SPELLINGS: [&str; 9] = [
+        // `provider_keys` is absent: it regained native CRUD, so POST/PUT/
+        // DELETE there are real handlers, not the removed write path.
+        const ROUTE_SPELLINGS: [&str; 8] = [
             "models",
             "api_keys",
             "apikeys", // former spelling: same removed write path
-            "provider_keys",
             "guardrails",
             "cache_policies",
             "observability_exporters",

@@ -65,7 +65,16 @@ use crate::error::ProxyError;
 /// on every PK, so a miss means a genuine misconfiguration, not a
 /// migration gap.
 pub(crate) fn resolve_bridge(hub: &Hub, provider_key: &ProviderKey) -> Option<Arc<dyn Bridge>> {
-    hub.dispatch_two_tier(provider_key)
+    if let Some(bridge) = hub.dispatch_two_tier(provider_key) {
+        return Some(bridge);
+    }
+    // A vendor in the preset catalog is OpenAI-shaped by construction, so it
+    // needs no dedicated bridge: the catalog carries the base URL and the
+    // shape of the auth header, and the OpenAI family bridge speaks the rest.
+    // The family bridge must still be registered — a preset describes the
+    // wire shape, not the transport.
+    aisix_provider_openai::find_preset(&provider_key.provider)
+        .and_then(|_| hub.family_bridge_for(aisix_core::Adapter::Openai))
 }
 
 /// Look up the `ProviderKey` a given `Model` references. Returns a
