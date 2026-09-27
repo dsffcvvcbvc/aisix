@@ -15,6 +15,7 @@ import {
   type ReceivedRequest,
   type SpawnedApp,
 } from "../harness/index.js";
+import { harnessRequest } from "../harness/http.js";
 
 /**
  * The WHOLE preset catalog dispatches, driven through a local mock upstream.
@@ -227,11 +228,17 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
       ctx.skip();
       return;
     }
-    // Spelled with a raw request rather than AdminClient, which always
-    // sends the key — the whole point is the request WITHOUT one.
-    const res = await fetch(`${app.adminUrl}/admin/v1/preset_providers`);
-    expect(res.status).toBe(401);
-    await res.body?.cancel();
+    // `harnessRequest`, not a bare `fetch`: this is the one assertion whose
+    // subject is a status code an intermediary could rewrite, and the
+    // harness agent deliberately bypasses any ambient HTTP_PROXY a dev tool
+    // has set. No authorization header at all — the point is the request
+    // WITHOUT the key, which `AdminClient` can never express.
+    const res = await harnessRequest(
+      `${app.adminUrl}/admin/v1/preset_providers`,
+      { method: "GET" },
+    );
+    expect(res.statusCode).toBe(401);
+    await res.body.dump();
   });
 
   test("all 190 vendors dispatch: one request each, every one landing on its own base", async (ctx) => {
