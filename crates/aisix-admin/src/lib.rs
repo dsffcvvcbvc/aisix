@@ -2,9 +2,11 @@
 //! `AdminConfig` for the code default).
 //!
 //! Public admin-listener endpoints:
-//! - `GET  /livez`
-//! - `GET  /admin/openapi.json`
-//! - `GET  /admin/openapi-scalar`
+//! - `GET /livez`
+//! - `GET /admin/openapi.json`
+//! - `GET /admin/openapi-scalar`
+//! - `GET /dashboard`, `GET /dashboard/*path` — the exported SPA
+//! - `GET /_next/*path` plus the document's origin-root icons/manifest
 //!
 //! Prometheus metrics are NOT served here — the scrape endpoint always
 //! lives on the dedicated metrics listener (see [`metrics_router`]),
@@ -134,7 +136,31 @@ pub fn build_router(state: AdminState) -> Router {
         )
         .route(
             "/dashboard/*path",
-            get(resources_handler::serve_dashboard_asset),
+            get(resources_handler::serve_dashboard_path),
+        )
+        // The exported documents request their chunks and icons at the
+        // ORIGIN ROOT, not under `/dashboard`: `basePath` and `assetPrefix`
+        // are both empty in the export (`OMNIROUTE_BASE_PATH` unset), so every
+        // `<script src>` is `/_next/static/...`. Without these the 79.3 MiB of
+        // chunks 404 and the SPA never boots. Same chokepoint, same layout
+        // rules — only the mount differs.
+        .route(
+            "/_next/*path",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/manifest.webmanifest",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route("/favicon.ico", get(resources_handler::serve_dashboard_path))
+        .route("/favicon.svg", get(resources_handler::serve_dashboard_path))
+        .route(
+            "/apple-touch-icon.png",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/icon-512.png",
+            get(resources_handler::serve_dashboard_path),
         )
         .route(
             "/admin/v1/models",
