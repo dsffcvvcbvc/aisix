@@ -3,6 +3,7 @@
 //! Holds:
 //! - the bootstrap-config-provided `admin_keys` (auth)
 //! - the `ConfigStore` trait object (CRUD backend)
+//! - the session table behind the admin-key → cookie exchange
 //! - a `SnapshotHandle` for authenticated operator-health handlers
 //!
 //! The store is held behind an `Arc<dyn ConfigStore>` so production can
@@ -17,12 +18,31 @@ use axum::Router;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::session::SessionStore;
 use crate::store::ConfigStore;
 
 #[derive(Clone)]
 pub struct AdminState {
     pub snapshot: SnapshotHandle<AisixSnapshot>,
     pub admin_keys: Arc<[String]>,
+    /// Cookie sessions minted by `POST /admin/v1/auth/session`. The
+    /// admin-key exchange is how a browser authenticates at all, so this
+    /// is on the same footing as `admin_keys` — see [`crate::session`]
+    /// for the token, storage, and lifetime contract, including the
+    /// in-memory consequence.
+    pub sessions: Arc<SessionStore>,
+    /// Whether a session cookie is issued with the `Secure` attribute.
+    ///
+    /// Resolved once, at construction, from whether the admin listener
+    /// terminates TLS (`admin.tls`). It cannot be decided per request:
+    /// the handshake completes in the gateway's own accept loop, so an
+    /// axum request carries no signal about its scheme, and reading a
+    /// forwarded header to find one would be reading a value the client
+    /// chose. The rule is therefore "the cookie is `Secure` exactly when
+    /// the listener is HTTPS" — always safe on a TLS listener, and what
+    /// makes cookie auth work over the plain-HTTP `127.0.0.1:3001` the
+    /// shipped `config.example.yaml` describes.
+    pub session_cookie_secure: bool,
     pub store: Arc<dyn ConfigStore>,
     /// Standalone file source path (`config.resources_file`) used by
     /// `POST /admin/v1/resources` for durable persistence. `None` in
@@ -59,6 +79,8 @@ impl AdminState {
         Self {
             snapshot,
             admin_keys: Arc::from(cfg.admin_keys.clone()),
+            sessions: Arc::new(SessionStore::default()),
+            session_cookie_secure: cfg.tls.is_some(),
             store,
             resources_file: None,
             health_tracker: None,

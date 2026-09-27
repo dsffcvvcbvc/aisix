@@ -38,7 +38,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
   "info": {
     "title": "AISIX Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, drive the playground, and apply declarative resources via `POST /admin/v1/resources`.\n\n`POST /admin/v1/resources` validates a `resources.yaml` payload, hot-reloads it in memory, and persists it to the configured `resources_file` (`AISIX_RESOURCES_PATH` / `resources.yaml` fallback). Other resource writes stay declarative: edit the `resources_file` (`resources.yaml`, reloaded on SIGHUP) or write to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
+    "description": "The AISIX Admin API is the operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, drive the playground, and apply declarative resources via `POST /admin/v1/resources`.\n\n`POST /admin/v1/resources` validates a `resources.yaml` payload, hot-reloads it in memory, and persists it to the configured `resources_file` (`AISIX_RESOURCES_PATH` / `resources.yaml` fallback). Other resource writes stay declarative: edit the `resources_file` (`resources.yaml`, reloaded on SIGHUP) or write to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\n## Authenticating a browser\n\nRequests authenticate with an admin key from `config.admin.admin_keys`, as `Authorization: Bearer <key>` or `x-api-key: <key>`. A browser cannot send either, so `POST /admin/v1/auth/session` exchanges the key for an `HttpOnly` session cookie that carries the same authority and is scoped to `/admin/v1`.\n\nWhere a request presents more than one credential, the first of `Authorization`, then `x-api-key`, then the session cookie is the one that decides, and an invalid one is refused rather than falling through to the next.\n\n## Cross-origin requests\n\nBecause the session cookie is attached by the browser on its own, every unsafe method on this API (`POST`, `PUT`, `PATCH`, `DELETE`) additionally checks that the request came from this server's own host: a request that carries an `Origin` or `Referer` naming a different host is refused with `403`. Requests that carry neither header are not browsers and are allowed through.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
   },
   "paths": {
     "/livez": {
@@ -1805,6 +1805,128 @@ const OPENAPI_JSON_BASE: &str = r##"{
         ]
       }
     },
+    "/admin/v1/auth/session": {
+      "post": {
+        "summary": "Create Admin Session",
+        "description": "Exchange an admin key from `config.admin.admin_keys` for a session cookie, so that a browser can read the admin API without ever handling the key itself.\n\nThe key is sent in the request body, never as a query parameter, so it does not reach server access logs, `Referer` headers, or browser history. The key is never returned to the client, and is not readable by page scripts after the exchange: the response sets an `HttpOnly` cookie, which JavaScript cannot read.\n\nThe cookie is a session cookie — it carries no `Max-Age` or `Expires`, so the browser discards it when the browser session ends — is scoped to `Path=/admin/v1`, and carries `SameSite=Strict`. The `Secure` attribute is set exactly when the admin listener terminates TLS (`admin.tls` is configured), which is what keeps the session token off any cleartext connection. A deployment that terminates TLS in front of the gateway rather than on it must configure `admin.tls` for the cookie to be marked `Secure`.\n\nThe server-side session lasts 8 hours and is absolute. Sessions are held in the gateway process, so they end when the gateway restarts.\n\nThis is the only `/admin/v1/` route that does not require an existing credential: the credential it verifies is in the body. Every other admin route accepts the resulting cookie with the same authority as an admin key.",
+        "requestBody": {
+          "description": "The admin key to exchange.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "admin_key"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "admin_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "One of the keys in `config.admin.admin_keys`."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Session created. The admin session cookie is set on the response; there is no body.",
+            "headers": {
+              "Set-Cookie": {
+                "description": "The admin session cookie, named `aisix_admin_session`, with `HttpOnly`, `SameSite=Strict`, and `Path=/admin/v1`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request body is not a JSON object, or does not carry exactly a non-empty string `admin_key`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The key is not one of `config.admin.admin_keys`. The response never echoes the key.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The request declared an `Origin` or `Referer` that is not this server's own host. Every unsafe method on the admin API is checked this way; see the API description.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Admin Sessions"
+        ]
+      },
+      "delete": {
+        "summary": "Revoke Admin Session",
+        "description": "Revoke the calling session server-side and clear its cookie. Idempotent, and available to a caller that authenticated with an admin key as well as one that authenticated with the session cookie.\n\nRequires a credential like every other admin route. A `401` means the presented session was already expired or revoked, so there was nothing left to revoke; read it as already signed out. The cookie is cleared by the response either way.",
+        "security": [
+          {
+            "AdminBearer": []
+          },
+          {
+            "AdminSessionCookie": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session revoked and the cookie cleared. There is no body.",
+            "headers": {
+              "Set-Cookie": {
+                "description": "The admin session cookie, expired with `Max-Age=0` at the same `Path` it was set at.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid admin credential, or the presented session had already expired or been revoked.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The request declared an `Origin` or `Referer` that is not this server's own host.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AdminError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Admin Sessions"
+        ]
+      }
+    },
     "/admin/v1/resources": {
       "post": {
         "summary": "Apply Declarative Resources",
@@ -2035,6 +2157,12 @@ const OPENAPI_JSON_BASE: &str = r##"{
         "type": "http",
         "scheme": "bearer",
         "description": "Admin key from `config.admin.admin_keys`."
+      },
+      "AdminSessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "aisix_admin_session",
+        "description": "Session cookie minted by `POST /admin/v1/auth/session`. Carries the same authority as an admin key. Sent as an `HttpOnly` cookie, so it is never readable by page scripts; scoped to `Path=/admin/v1`, and to a browser session (no `Max-Age`). Where more than one credential is presented, `Authorization` decides and the cookie is not consulted."
       },
       "ProxyBearer": {
         "type": "http",
@@ -2751,6 +2879,10 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "description": "Machine-readable Admin API specification and browser UI."
     },
     {
+      "name": "Admin Sessions",
+      "description": "Exchange an admin key for a session cookie, and revoke it. Because the cookie is a credential the browser attaches on its own, every unsafe method on this API additionally requires the request to come from this server's own host."
+    },
+    {
       "name": "Models",
       "description": "Model aliases used by proxy requests, including direct, routing, and ensemble models."
     },
@@ -3424,6 +3556,7 @@ mod tests {
             "/livez",
             "/admin/openapi.json",
             "/admin/openapi-scalar",
+            "/admin/v1/auth/session",
             "/admin/v1/models",
             "/admin/v1/models/{id}",
             "/admin/v1/models/status",
@@ -3519,6 +3652,7 @@ mod tests {
             "/readyz",
             "/admin/openapi.json",
             "/admin/openapi-scalar",
+            "/admin/v1/auth/session",
             "/admin/v1/models",
             "/admin/v1/models/{id}",
             "/admin/v1/models/status",
@@ -3556,9 +3690,10 @@ mod tests {
 
     #[tokio::test]
     async fn openapi_documents_no_admin_write_operations() {
-        // Only `POST /admin/v1/resources` writes; every other `/admin/v1/`
-        // resource route stays GET-only (the playground POST is not under
-        // `/admin/v1/`).
+        // `POST /admin/v1/resources` writes resources; the session
+        // exchange writes a credential, not a resource. Every other
+        // `/admin/v1/` resource route stays GET-only (the playground POST
+        // is not under `/admin/v1/`).
         let parsed: serde_json::Value =
             serde_json::from_str(merged_openapi()).expect("merged_openapi must parse");
         let paths = parsed["paths"]
@@ -3577,6 +3712,13 @@ mod tests {
                             method, "post",
                             "{method} {path}: the resources write route is POST-only"
                         );
+                    } else if path == "/admin/v1/auth/session" {
+                        // The credential lifecycle: mint, revoke. Not a
+                        // resource write.
+                        assert!(
+                            matches!(method.as_str(), "post" | "delete"),
+                            "{method} {path}: unexpected method on the session route"
+                        );
                     } else if path == "/admin/v1/provider_keys"
                         || path == "/admin/v1/provider_keys/{id}"
                         || path == "/admin/v1/combos"
@@ -3591,7 +3733,7 @@ mod tests {
                     } else {
                         assert_eq!(
                             method, "get",
-                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources, provider-key CRUD and combo CRUD"
+                            "{method} {path}: resource routes are read-only except POST /admin/v1/resources, provider-key CRUD, combo CRUD and the session exchange"
                         );
                     }
                 }
@@ -3642,6 +3784,19 @@ mod tests {
                     .as_object()
                     .unwrap_or_else(|| panic!("{method} {path} must define responses"));
                 for (status, response) in responses {
+                    // Statuses that by definition carry no body exempt
+                    // from the content-schema rule — and are held to the
+                    // OPPOSITE requirement instead, so the exemption
+                    // cannot become a place to hide an undocumented body.
+                    if matches!(status.as_str(), "204" | "304") {
+                        assert!(
+                            response.get("content").is_none(),
+                            "{method} {path} response {status} must not declare content: a \
+                             {status} carries no body, so documenting one describes a response \
+                             the server never sends"
+                        );
+                        continue;
+                    }
                     let Some(content) = response["content"].as_object() else {
                         panic!("{method} {path} response {status} missing content schema");
                     };

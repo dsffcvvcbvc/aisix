@@ -33,6 +33,7 @@
 //!   `GET /admin/v1/passthrough_routes/:id`
 //! - `GET /admin/v1/models/status`, `GET /admin/v1/health`
 //! - `POST /admin/v1/resources` (validate + hot-reload + persist)
+//! - `POST|DELETE /admin/v1/auth/session` (admin-key ↔ cookie exchange)
 //!
 //! `POST /admin/v1/resources` validates a declarative payload via
 //! `aisix_core::filesource::load_from_str`, commits it with an RCU
@@ -43,6 +44,33 @@
 //! storage layer stays pluggable via the [`ConfigStore`] trait;
 //! production wires etcd or the file-snapshot store, tests use
 //! [`InMemoryStore`].
+//!
+//! ## Authenticating a browser
+//!
+//! Every route above except `/livez`, `/readyz`, the OpenAPI pair, the
+//! dashboard assets, and the exchange endpoint itself is behind the
+//! admin gate, which accepts three credentials in a fixed order —
+//! `Authorization: Bearer <key>`, `x-api-key: <key>`, or the session
+//! cookie. See [`auth`] for the precedence rule and [`session`] for the
+//! exchange:
+//!
+//! - `POST   /admin/v1/auth/session` — body `{"admin_key": "..."}` →
+//!   `204` + a `HttpOnly; SameSite=Strict` cookie scoped to `/admin/v1`.
+//!   `401` for a key not in `config.admin.admin_keys`.
+//! - `DELETE /admin/v1/auth/session` — `204`, revokes the session and
+//!   clears the cookie.
+//!
+//! The key is exchanged rather than handed to the page because it must
+//! never be readable by JavaScript or sit in `localStorage`; the cookie
+//! is `HttpOnly`, and it is a *session* cookie (no `Max-Age`), so the
+//! browser discards it when the browser session ends.
+//!
+//! ## CSRF
+//!
+//! A cookie the browser attaches by itself is ambient authority, so the
+//! router enforces an `Origin`/`Referer` same-origin check on every
+//! unsafe method, on top of the cookie's `SameSite=Strict`. See
+//! [`auth::require_same_origin`].
 //!
 //! Errors follow the simple admin envelope: `{"error_msg": "..."}`,
 //! distinct from the proxy's OpenAI-style envelope.
@@ -70,6 +98,7 @@ mod passthrough_routes_handlers;
 mod playground_handler;
 mod provider_keys_handlers;
 mod resources_handler;
+mod session;
 mod state;
 pub mod store;
 
@@ -126,6 +155,16 @@ pub fn build_router(state: AdminState) -> Router {
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
         .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
+        // The admin-key → session exchange. Deliberately NOT behind
+        // `AdminAuth`: the credential it verifies is in the body, not in
+        // a header, which is the whole reason the endpoint exists — see
+        // `session`. Every other admin route is behind the gate, and the
+        // session cookie it mints is an equally-valid credential for
+        // them (`auth::is_admin_authorized`).
+        .route(
+            "/admin/v1/auth/session",
+            post(session::create_session).delete(session::delete_session),
+        )
         .route(
             "/admin/v1/resources",
             post(resources_handler::update_resources),
@@ -285,7 +324,17 @@ pub fn build_router(state: AdminState) -> Router {
             post(playground_handler::playground_chat_completions),
         );
 
-    router.with_state(state)
+    router
+        // One chokepoint for CSRF, hoisted over the whole router rather
+        // than into the mutating handlers: a cookie credential is ambient
+        // authority, so EVERY unsafe method on this router is
+        // cross-origin-reachable, and a route added later must be covered
+        // by construction rather than by remembering to opt in. Reads
+        // (`GET`/`HEAD`/`OPTIONS`) are not gated. See `auth`'s module doc
+        // for why this is an `Origin`/`Referer` check rather than a CSRF
+        // token, and what it does and does not refuse.
+        .layer(axum::middleware::from_fn(auth::require_same_origin))
+        .with_state(state)
 }
 
 /// Build the router for the **dedicated** metrics/status listener — the

@@ -160,12 +160,37 @@ proxy:
 # Admin listener — read-only resource surface, OpenAPI reference, and
 # playground. Resources are managed declaratively (resources_file or
 # direct etcd writes), not through this listener.
+#
+# The dashboard SPA is served from this listener too, which is what makes
+# browser login possible: `POST /admin/v1/auth/session` exchanges an admin
+# key for an HttpOnly session cookie scoped to /admin/v1, and every other
+# /admin/v1 route then accepts that cookie with the same authority as the
+# key. The key itself is never handed to the page.
 admin:
   addr: "127.0.0.1:3001"
   admin_keys:
     # Provide via env to avoid committing secrets.
     # - "${AISIX_ADMIN_KEY}"
     - "admin-local-only-change-me"
+  # TLS on the admin listener. This decides the `Secure` attribute on the
+  # session cookie:
+  #
+  #   admin.tls set     -> the cookie is issued with `Secure`, so the
+  #                        session token never crosses a cleartext hop.
+  #   admin.tls unset   -> the cookie is issued WITHOUT `Secure`.
+  #
+  # There is no override, and the reason matters: the TLS handshake
+  # completes in the gateway's own accept loop, so a request does not
+  # record the scheme it arrived on, and inferring one from a
+  # X-Forwarded-Proto header would mean trusting a value the client chose.
+  # The listener's own configuration is the only trustworthy signal.
+  #
+  # CONSEQUENCE: if you terminate TLS in a reverse proxy or load balancer
+  # in front of the gateway, configure admin.tls as well. Without it the
+  # gateway has no way to know the browser is on HTTPS, and the session
+  # token will travel in cleartext on the hop from that proxy to the
+  # gateway. A plain-HTTP admin listener (the default above) is fine for
+  # local development and end-to-end tests over 127.0.0.1.
   # tls:
   #   cert_file: "/etc/aisix/tls/admin.crt"
   #   key_file:  "/etc/aisix/tls/admin.key"

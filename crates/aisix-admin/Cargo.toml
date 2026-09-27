@@ -26,6 +26,14 @@ chrono.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
 etcd-client.workspace = true
+# Admin session cookies (`session.rs`): CSPRNG token generation, the
+# SHA-256 token hash, and its lowercase-hex encoding. All three are
+# already in the build graph through `aisix-core` / `aisix-proxy`
+# (`ApiKey::hash_bearer` is the same SHA-256-over-bytes-then-hex
+# construction), so these are direct edges, not new crates.
+rand.workspace = true
+sha2.workspace = true
+hex.workspace = true
 aisix-obs = { path = "../aisix-obs" }
 # The embedded OpenAI-compatible provider catalog behind
 # `GET /admin/v1/preset_providers`. Already in the build graph through
