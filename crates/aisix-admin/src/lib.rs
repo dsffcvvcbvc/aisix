@@ -7,6 +7,9 @@
 //! - `GET /admin/openapi-scalar`
 //! - `GET /dashboard`, `GET /dashboard/*path` — the exported SPA
 //! - `GET /_next/*path` plus the document's origin-root icons/manifest
+//! - `GET /` and the export's origin-root app routes (`/login`,
+//!   `/auth/callback`, …) — the same chokepoint, the same containment, and
+//!   the same honest-failure contract as the two above
 //!
 //! Prometheus metrics are NOT served here — the scrape endpoint always
 //! lives on the dedicated metrics listener (see [`metrics_router`]),
@@ -196,6 +199,30 @@ pub fn build_router(state: AdminState) -> Router {
             "/_next/*path",
             get(resources_handler::serve_dashboard_path),
         )
+        // The export's ORIGIN-ROOT surface, on the same chokepoint: the
+        // `EntryRedirector` shell at `/`, the RSC payload and the route tree
+        // of the root route (which the export writes at the root, not under
+        // `dashboard/`), and the payload of the `/dashboard` route itself.
+        .route(
+            "/",
+            get(resources_handler::serve_dashboard_index),
+        )
+        .route(
+            "/index.txt",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/__next._tree.txt",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/__next.__PAGE__.txt",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/dashboard.txt",
+            get(resources_handler::serve_dashboard_path),
+        )
         .route(
             "/manifest.webmanifest",
             get(resources_handler::serve_dashboard_path),
@@ -208,6 +235,42 @@ pub fn build_router(state: AdminState) -> Router {
         )
         .route(
             "/icon-512.png",
+            get(resources_handler::serve_dashboard_path),
+        )
+        // The provider logos the origin-root documents link to (`landing` and
+        // `home` render them as `<img src>`). Named rather than wildcarded, so
+        // the surface is exactly the set a document asks for — the same
+        // choice as the icons above.
+        .route(
+            "/providers/claude.svg",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/providers/cline.svg",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/providers/codex.svg",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/providers/cursor.svg",
+            get(resources_handler::serve_dashboard_path),
+        )
+        .route(
+            "/providers/kimi-logomark-light.svg",
+            get(resources_handler::serve_dashboard_path),
+        )
+        // Route families a static export can never carry, mounted so they get
+        // the honest 404 instead of the router's bare one: `/docs/*` is
+        // force-dynamic by design, and `/connect/codex/[token]` is a
+        // single-use token row. Both are linked from the origin-root
+        // documents, so both are reachable.
+        .route("/docs", get(resources_handler::serve_dashboard_path))
+        .route("/docs/", get(resources_handler::serve_dashboard_path))
+        .route("/docs/*path", get(resources_handler::serve_dashboard_path))
+        .route(
+            "/connect/codex/:token",
             get(resources_handler::serve_dashboard_path),
         )
         .route(
@@ -323,6 +386,37 @@ pub fn build_router(state: AdminState) -> Router {
             "/playground/chat/completions",
             post(playground_handler::playground_chat_completions),
         );
+
+    // The export's origin-root app routes, four mounts each, because that is
+    // how many ways a client asks for one: the document, its RSC payload on a
+    // client-side navigation, the same route with a trailing slash
+    // (`matchit` 0.7.3 leaves `/login/` unmatched against a catch-all — see
+    // the `/dashboard/` mount above), and the per-segment files of a cold
+    // segment cache. All four are the same chokepoint; the table carries the
+    // measured route list, and `resources_handler`'s tests own the layout
+    // rules every mount here resolves through.
+    //
+    // Deliberately NOT a catch-all fallback: a fallback would make this the
+    // answer for every unmatched path on the admin listener, including a
+    // mistyped `/admin/v1/...`, and answer it in a body that names the
+    // dashboard. What is left unmatched stays the router's own answer.
+    let mut router = router;
+    for route in resources_handler::ORIGIN_ROOT_ROUTES {
+        router = router
+            .route(route, get(resources_handler::serve_dashboard_path))
+            .route(
+                &format!("{route}.txt"),
+                get(resources_handler::serve_dashboard_path),
+            )
+            .route(
+                &format!("{route}/"),
+                get(resources_handler::serve_dashboard_path),
+            )
+            .route(
+                &format!("{route}/*path"),
+                get(resources_handler::serve_dashboard_path),
+            );
+    }
 
     router
         // One chokepoint for CSRF, hoisted over the whole router rather
@@ -698,6 +792,305 @@ mod tests {
             .unwrap();
         let resp = run(app, req).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The admin listener is ONE flat router, so an origin-root route and an
+    /// admin route are the same path if they spell alike — and `matchit`
+    /// would then serve whichever registered first, silently. This is the
+    /// census that keeps the two lists apart; the router's own duplicate-path
+    /// panic at build time is the backstop, not the check.
+    #[test]
+    fn origin_root_routes_cannot_take_an_admin_path() {
+        // First segments the admin listener already owns, and what each one
+        // carries. Measured against `build_router`'s own mount list.
+        let reserved: [(&str, &str); 7] = [
+            ("admin", "/admin/* — the Admin API and the OpenAPI pair"),
+            ("livez", "/livez"),
+            ("readyz", "/readyz"),
+            ("playground", "/playground/chat/completions"),
+            ("metrics", "the scrape path, owned by the metrics listener"),
+            ("_next", "/_next/*path — the content-hashed asset tree"),
+            ("dashboard", "/dashboard, /dashboard/, /dashboard/*path"),
+        ];
+        // Every path `build_router` mounts by hand, so a table entry that
+        // duplicates one of them is caught here rather than as a boot panic.
+        let handwritten = [
+            "/",
+            "/index.txt",
+            "/__next._tree.txt",
+            "/__next.__PAGE__.txt",
+            "/dashboard.txt",
+            "/dashboard",
+            "/dashboard/",
+            "/dashboard/*path",
+            "/_next/*path",
+            "/manifest.webmanifest",
+            "/favicon.ico",
+            "/favicon.svg",
+            "/apple-touch-icon.png",
+            "/icon-512.png",
+            "/providers/claude.svg",
+            "/providers/cline.svg",
+            "/providers/codex.svg",
+            "/providers/cursor.svg",
+            "/providers/kimi-logomark-light.svg",
+            "/docs",
+            "/docs/",
+            "/docs/*path",
+            "/connect/codex/:token",
+            "/livez",
+            "/readyz",
+            "/playground/chat/completions",
+        ];
+        let mut mounted: Vec<String> = Vec::new();
+        for route in resources_handler::ORIGIN_ROOT_ROUTES {
+            let first = route.trim_start_matches('/').split('/').next().unwrap();
+            for (segment, owns) in reserved {
+                assert_ne!(first, segment, "{route} would take {owns}");
+            }
+            // The four mounts the loop derives, so a route whose own name is
+            // another route's mount is caught too.
+            for derived in [
+                route.to_string(),
+                format!("{route}.txt"),
+                format!("{route}/"),
+                format!("{route}/*path"),
+            ] {
+                assert!(
+                    !handwritten.contains(&derived.as_str()),
+                    "{derived} is mounted by hand as well as from the route table"
+                );
+                assert!(!mounted.contains(&derived), "{derived} is mounted twice");
+                mounted.push(derived);
+            }
+        }
+        // And the table is the measured one: a route that silently dropped out
+        // would leave a page unreachable with nothing failing anywhere. From
+        // export artifact `omniroute-dashboard-out` #10932864997.
+        assert_eq!(resources_handler::ORIGIN_ROOT_ROUTES.len(), 23);
+        for route in [
+            "/login",
+            "/auth/callback",
+            "/_not-found",
+            "/status",
+            "/terms",
+            "/404",
+        ] {
+            assert!(
+                resources_handler::ORIGIN_ROOT_ROUTES.contains(&route),
+                "{route} is not mounted"
+            );
+        }
+    }
+
+    /// Every admin route still answers what it answered before the origin-root
+    /// mounts existed — the gate, the operational reads, the POST-only
+    /// endpoints, and the CSRF refusal. A mount that shadowed or bypassed any
+    /// of them would change one of these.
+    #[tokio::test]
+    async fn the_admin_surface_answers_exactly_as_it_did_before_the_origin_root_mounts() {
+        let app = build_router(build_state());
+        // Behind the gate: 401 with no credential, whatever else is mounted.
+        for uri in [
+            "/admin/v1/models",
+            "/admin/v1/combos",
+            "/admin/v1/health",
+            "/admin/v1/api_keys",
+        ] {
+            let resp = run(
+                app.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        // The unauthenticated operational reads.
+        for uri in ["/livez", "/admin/openapi.json", "/admin/openapi-scalar"] {
+            let resp = run(
+                app.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/readyz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(
+                resp.status(),
+                StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "/readyz answered {}",
+            resp.status()
+        );
+        // A method the endpoint does not have is still 405, not a document.
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/playground/chat/completions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+        // The CSRF gate is hoisted over the whole router and must still refuse
+        // a cross-origin unsafe method — serving more GET routes does not
+        // change what a POST may do.
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/admin/v1/auth/session")
+                .header("origin", "https://evil.example")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"admin_key":"admin-secret"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        // And with no `Origin` the exchange still authenticates the key.
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .method("POST")
+                .uri("/admin/v1/auth/session")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"admin_key":"wrong"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        // A path this surface never had is still the ROUTER's own 404 — the
+        // empty one, not the dashboard's explanation. That is the proof that
+        // no fallback was added over this listener.
+        let resp = run(
+            app.clone(),
+            Request::builder()
+                .uri("/admin/v1/typo")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            !body.contains("deployed dashboard build"),
+            "an unmatched admin path was intercepted: {body:?}"
+        );
+    }
+
+    /// `/status` is an origin-root ROUTE in the export, and its per-segment
+    /// files need a `/status/*path` mount — which is the one new mount that
+    /// also matches the metrics listener's paths. Those are a different router
+    /// on a different address, so nothing is shadowed; this drives that router
+    /// to prove it, and pins what the admin listener answers for them.
+    #[tokio::test]
+    async fn the_metrics_listener_keeps_every_status_route() {
+        use aisix_obs::Metrics;
+        let metrics = metrics_router(
+            Arc::new(Metrics::new(false)),
+            aisix_core::ConfigStatus::new(aisix_core::SourceKind::Etcd),
+            &PrometheusConfig {
+                enabled: true,
+                path: "metrics".into(),
+                addr: "0.0.0.0:9090".into(),
+            },
+            empty_models_status(),
+        );
+        // Exact answers, so "the route is missing" (404) cannot pass as "the
+        // handler ran": `/status/ready` is 503 until a configuration has been
+        // applied, and `/status/config` reports the (empty) view right away.
+        for (uri, expected) in [
+            ("/status/config", StatusCode::OK),
+            ("/status/ready", StatusCode::SERVICE_UNAVAILABLE),
+            ("/status/models", StatusCode::OK),
+        ] {
+            let resp = run(
+                metrics.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), expected, "{uri} on the metrics listener");
+        }
+        // The admin listener has never served these, and still does not: the
+        // origin-root `/status` route is a different path from `/status/*`.
+        let app = build_router(build_state());
+        for uri in ["/status/config", "/status/ready", "/status/models"] {
+            let resp = run(
+                app.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    /// The `:3000` proxy is a separate router, built by
+    /// `aisix_proxy::build_router` and bound to `proxy.addr`; the dashboard
+    /// mounts exist only in this one, bound to `admin.addr`. Driving the proxy
+    /// router proves the dashboard surface did not leak into it.
+    #[tokio::test]
+    async fn the_proxy_router_never_serves_the_dashboard() {
+        let snapshot = SnapshotHandle::new(AisixSnapshot::new());
+        let proxy = aisix_proxy::build_router(
+            aisix_proxy::ProxyState::new(
+                snapshot,
+                Arc::new(aisix_gateway::Hub::new()),
+                &proxy_cfg(),
+            )
+            .without_cache(),
+        );
+        // The proxy's own API answers, and is not the dashboard's 404.
+        let resp = run(
+            proxy.clone(),
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND, "/v1/models");
+        // `/` is the proxy's ordinary miss path (a `passthrough_route` would
+        // have to be configured to claim it), not the export's shell.
+        for uri in ["/", "/login", "/dashboard"] {
+            let resp = run(
+                proxy.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+        // …and the admin router has never served the proxy's API.
+        let app = build_router(build_state());
+        for uri in ["/v1/models", "/v1/chat/completions", "/mcp"] {
+            let resp = run(
+                app.clone(),
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+
+    fn proxy_cfg() -> aisix_core::ProxyConfig {
+        aisix_core::ProxyConfig {
+            addr: "127.0.0.1:0".into(),
+            request_body_limit_bytes: 1_048_576,
+            real_ip: Default::default(),
+            request_id: Default::default(),
+            url_rewrites: Vec::new(),
+            tls: None,
+            listeners: Vec::new(),
+            thread_per_core: None,
+            workers: None,
+        }
     }
 
     #[tokio::test]

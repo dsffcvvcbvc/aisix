@@ -6,6 +6,8 @@
 //! - `GET /dashboard/*path`: route documents, RSC payloads and segment files
 //! - `GET /_next/*path` and the origin-root document assets: the files the
 //!   exported documents request without the `dashboard` prefix
+//! - `GET /` and the origin-root app routes: the export's own non-dashboard
+//!   surface, resolved by the same chokepoint as the two above
 
 use std::path::{Path, PathBuf};
 
@@ -209,6 +211,10 @@ fn mime_for_path(path: &Path) -> &'static str {
         "woff" => "font/woff",
         "woff2" => "font/woff2",
         "ttf" => "font/ttf",
+        // The export ships `openapi.yaml` at its root. `application/yaml` is
+        // the registered media type (RFC 9512), and it is what stops the file
+        // falling through to the octet-stream default below.
+        "yaml" => "application/yaml",
         _ => "application/octet-stream",
     }
 }
@@ -216,20 +222,25 @@ fn mime_for_path(path: &Path) -> &'static str {
 /// `GET /dashboard` — the SPA entry document. Named for the mount; the
 /// resolution is identical to every other dashboard URL, and the built-in
 /// landing page is reachable from here alone because only the entry point
-/// resolves to [`DashboardResolution::NoBuildAtEntry`].
+/// resolves to [`DashboardResolution::NoBuildAtEntry`]. `/` is the same
+/// handler: which of the two a URL is comes from the path, not the mount.
 pub async fn serve_dashboard_index(uri: Uri) -> Response {
     dashboard_response(&uri)
 }
 
 /// Every other dashboard URL: route documents, RSC payloads, per-segment
-/// files, and the origin-root assets an exported document references
-/// without the `dashboard` prefix (`basePath` and `assetPrefix` are both
-/// empty in the export, so every `<script src>` is `/_next/static/...`).
+/// files, the export's origin-root app routes (`/login`, `/auth/callback`, …)
+/// and their payloads, the origin-root assets an exported document references
+/// without a prefix (`basePath` and `assetPrefix` are both empty in the
+/// export, so every `<script src>` is `/_next/static/...`), and the origin-root
+/// families a static export can never carry (`/docs/*`, a single-use
+/// `/connect/codex/:token`).
 ///
-/// Mounted on `/dashboard/*path`, on `/_next/*path`, and on the handful of
-/// named root-level files a document links to. All of them resolve
-/// identically, so they are all one handler: a mount that had its own copy
-/// of this logic is exactly how the layout rules would drift.
+/// Mounted on `/dashboard/*path`, on `/_next/*path`, on `/`, on each entry of
+/// [`ORIGIN_ROOT_ROUTES`], and on the handful of named root-level files a
+/// document links to. All of them resolve identically, so they are all one
+/// handler: a mount that had its own copy of this logic is exactly how the
+/// layout rules would drift.
 pub async fn serve_dashboard_path(uri: Uri) -> Response {
     dashboard_response(&uri)
 }
@@ -274,13 +285,14 @@ fn file_response(bytes: Vec<u8>, path: &Path, immutable: bool) -> Response {
 }
 
 fn route_absent_response(url_path: &str) -> Response {
-    // Honest 404: the export carries no such route. Four route families are
-    // legitimately absent by construction — a DB row (`/dashboard/combos/[id]`),
-    // an installed plugin (`/dashboard/plugins/[name]/config`), a single-use
-    // token, and a force-dynamic docs tree — and a static export cannot
-    // produce any of them. This is deliberately NOT the entry document: a
-    // 200 carrying `dashboard.html` would drop the operator on `/dashboard`
-    // and report a page that was never asked for as a success.
+    // Honest 404: the export carries no such route. Route families that are
+    // legitimately absent by construction — a DB row
+    // (`/dashboard/combos/[id]`), an installed plugin
+    // (`/dashboard/plugins/[name]/config`), a single-use token
+    // (`/connect/codex/[token]`), a force-dynamic docs tree (`/docs/*`) — and
+    // no static export can produce any of them. This is deliberately NOT the
+    // entry document: a 200 carrying `dashboard.html` would drop the operator
+    // on `/dashboard` and report a page that was never asked for as a success.
     tracing::debug!(url_path, "dashboard route is not in this build");
     plain_response(
         StatusCode::NOT_FOUND,
@@ -368,6 +380,91 @@ fn landing_page_response() -> Response {
 /// directory of every route document.
 const DASHBOARD_ENTRY: &str = "dashboard";
 
+/// The export's ORIGIN-ROOT app routes — the ones that are not under
+/// `dashboard/`, and that therefore 404 for an operator who opens the
+/// gateway's own address. Measured from export artifact
+/// `omniroute-dashboard-out` #10932864997: the 22 documents the export lays
+/// down as `<route>.html` beside `index.html`, plus `auth/callback`, the one
+/// nested document at the origin root.
+///
+/// Mounted four ways each, because that is how many ways a client asks for
+/// one: the document (`/login`), its RSC payload on a client-side navigation
+/// (`/login.txt`), the same route with a trailing slash (`/login/`), and the
+/// per-segment files of a cold segment cache (`/login/__next._tree.txt`).
+/// Every mount is the same chokepoint — see [`resolve_dashboard`] — so this
+/// table is a routing statement, not a second implementation.
+///
+/// Nothing here may start with a segment the admin surface owns (`admin`,
+/// `livez`, `readyz`, `playground`, `_next`, `dashboard`): the admin listener
+/// is one flat router, so a mount here and a route there would be the same
+/// path, and `tests::origin_root_routes_cannot_take_an_admin_path` is what
+/// keeps the two lists from overlapping.
+pub(crate) const ORIGIN_ROOT_ROUTES: &[&str] = &[
+    "/400",
+    "/401",
+    "/403",
+    "/404",
+    "/408",
+    "/429",
+    "/500",
+    "/502",
+    "/503",
+    "/_not-found",
+    "/auth/callback",
+    "/callback",
+    "/forbidden",
+    "/forgot-password",
+    "/home",
+    "/landing",
+    "/login",
+    "/maintenance",
+    "/miniapp",
+    "/offline",
+    "/privacy",
+    "/status",
+    "/terms",
+];
+
+/// The content-hashed asset tree inside the export. Two decisions key on it —
+/// the immutable caching contract and [`names_build_artifact`] — so it is one
+/// constant rather than two spellings that can drift.
+const NEXT_STATIC_DIR: &str = "_next/static";
+
+/// The export root's own document: a null-rendering `EntryRedirector` whose
+/// whole job is to `router.replace('/dashboard')`. Addressable by exactly one
+/// URL shape — a request that reduces to an empty remainder — so that no
+/// route document is ever answered with it (see
+/// `tests::the_root_shell_is_never_what_a_route_request_answers_with`).
+const ROOT_SHELL: &str = "index.html";
+
+/// The file extensions the export's own protocol names, and the only ones
+/// whose absence indicts the build. Measured from artifact #10932864997:
+/// `.txt .html .js .css .svg .png .json .webmanifest .ico .woff2 .yaml`
+/// actually ship. The remainder are what the mime table already answers for
+/// and what an export with images, source maps or a WASM bridge can add.
+const BUILD_ARTIFACT_EXTENSIONS: &[&str] = &[
+    "css",
+    "html",
+    "ico",
+    "jpeg",
+    "jpg",
+    "js",
+    "json",
+    "map",
+    "mjs",
+    "png",
+    "svg",
+    "txt",
+    "ttf",
+    "wasm",
+    "webmanifest",
+    "webp",
+    "woff",
+    "woff2",
+    "xml",
+    "yaml",
+];
+
 /// What a dashboard request resolved to.
 #[derive(Debug, PartialEq, Eq)]
 enum DashboardResolution {
@@ -411,6 +508,12 @@ enum DashboardResolution {
 /// | `/_next/static/chunks/x.js` | `_next/static/chunks/x.js` | the form the document actually requests |
 /// | `/dashboard/_next/static/chunks/x.js` | `_next/static/chunks/x.js` | the re-rooted form under the mount |
 /// | `/favicon.ico`, `/manifest.webmanifest` | the same name at the export root | `public/` assets, referenced without a prefix |
+/// | `/` | `index.html` | the export's `EntryRedirector` shell, which `router.replace`s to `/dashboard` |
+/// | `/index.txt`, `/__next._tree.txt`, `/__next.__PAGE__.txt` | the same names at the export root | the RSC payload, the route tree and the page segment of the root route itself |
+/// | `/dashboard.txt` | `dashboard.txt` | the payload of the `/dashboard` route, which the export puts at the ROOT |
+/// | `/login`, `/auth/callback` | `login.html`, `auth/callback.html` | an origin-root app route document |
+/// | `/login.txt` | `login.txt` | its RSC payload on a client-side navigation |
+/// | `/login/__next._tree.txt` | same path, exact | its route tree on a cold segment cache |
 ///
 /// The candidates are tried in that order and the first existing file wins;
 /// nothing else is consulted, so no request shape can reach a file that is
@@ -450,7 +553,7 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
                 // it is immutable; every other dashboard file keeps a stable
                 // name whose bytes change on the next export and must be
                 // revalidated.
-                immutable: real.starts_with(real_root.join("_next").join("static")),
+                immutable: real.starts_with(real_root.join(NEXT_STATIC_DIR)),
                 path: real,
             },
             _ => DashboardResolution::Refused,
@@ -458,15 +561,39 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
     }
 
     // A build IS deployed; it just does not carry this path. Which of the
-    // two honest answers applies is decided by the request's own shape, which
-    // is the export's own split: a request whose last segment carries a file
-    // extension is asking for a named build artifact, and one that does not
-    // is asking for a route document.
+    // two honest answers applies is decided by [`names_build_artifact`],
+    // beside the layout that decides it: an artifact the export's protocol
+    // names is a broken deployment (5xx, logged), and a route the build does
+    // not carry is a plain absence (404, explained).
     if rel.named_artifact {
         DashboardResolution::AssetMissing
     } else {
         DashboardResolution::RouteAbsent
     }
+}
+
+/// Whether a request names a build artifact — a file the export's own
+/// protocol asks for by name — rather than a route. Two conditions, and both
+/// are load-bearing:
+///
+/// * the last segment carries a **known artifact extension**
+///   ([`BUILD_ARTIFACT_EXTENSIONS`]). "Carries a dot" is not the test: a
+///   provider id, a plugin name, or a token routinely carries one, and
+///   calling `/dashboard/providers/acme.corp` an artifact made an absent
+///   document answer 500 — "the build is incomplete", a different and false
+///   claim about a page that simply is not in this export.
+/// * the request addresses a tree that can hold one: the app-route tree
+///   (`/dashboard/**`, which carries the `<route>.txt` payloads and the
+///   per-segment files) or the content-hashed [`NEXT_STATIC_DIR`] tree. At
+///   the export root a dotted last segment is a route name, because no Next
+///   build protocol ever asks for `/dashboard.txt` or `/favicon.png` — their
+///   absence says nothing about the build, so the honest answer is 404.
+fn names_build_artifact(rest: &Path, in_app_route_tree: bool) -> bool {
+    let Some(extension) = rest.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    BUILD_ARTIFACT_EXTENSIONS.contains(&extension)
+        && (in_app_route_tree || rest.starts_with(NEXT_STATIC_DIR))
 }
 
 /// One dashboard request split into the export namespaces it can address.
@@ -479,12 +606,18 @@ struct DashboardPaths {
     /// it arrived under the `dashboard` mount, the only place the export
     /// puts them.
     wants_document: bool,
-    /// Whether the request's last segment carries a file extension, i.e.
-    /// whether it names a build artifact rather than a route.
+    /// Whether the request names a build artifact rather than a route, i.e.
+    /// which of the two absent-answers it draws. Decided in one place —
+    /// [`names_build_artifact`] — because a request shape that counts as an
+    /// artifact here must not read as a route there.
     named_artifact: bool,
     /// Whether the request addresses the SPA entry point itself, with or
     /// without a trailing slash.
     at_entry: bool,
+    /// Whether the request addresses the export ROOT rather than a path in
+    /// it: it reduced to an empty remainder, the one shape that can name
+    /// [`ROOT_SHELL`].
+    at_export_root: bool,
     /// The same remainder relative to the export root, for a request that
     /// DID arrive under the `dashboard` mount, so an origin-root asset is
     /// addressable from either mount.
@@ -492,32 +625,30 @@ struct DashboardPaths {
 }
 
 /// Take the `dashboard` mount prefix off, if it is there. A request that
-/// does not carry it — `/_next/static/…`, `/favicon.ico` — is already
-/// relative to the export root and can only name an asset.
+/// does not carry it — `/_next/static/…`, `/favicon.ico`, `/login` — is
+/// already relative to the export root and resolves against it.
 fn split_dashboard_entry(rel: PathBuf) -> DashboardPaths {
     let mut segments = rel.components();
     match segments.next() {
         Some(std::path::Component::Normal(first)) if first == DASHBOARD_ENTRY => {
             let rest = segments.as_path().to_path_buf();
-            let named_artifact = rest.extension().is_some();
             DashboardPaths {
                 at_entry: rest.as_os_str().is_empty(),
-                named_artifact,
+                at_export_root: false,
+                named_artifact: names_build_artifact(&rest, true),
                 origin_asset: Some(rest.clone()),
                 rest,
                 wants_document: true,
             }
         }
-        _ => {
-            let named_artifact = rel.extension().is_some();
-            DashboardPaths {
-                at_entry: false,
-                named_artifact,
-                rest: rel,
-                wants_document: false,
-                origin_asset: None,
-            }
-        }
+        _ => DashboardPaths {
+            at_entry: false,
+            at_export_root: rel.as_os_str().is_empty(),
+            named_artifact: names_build_artifact(&rel, false),
+            rest: rel,
+            wants_document: false,
+            origin_asset: None,
+        },
     }
 }
 
@@ -533,35 +664,60 @@ fn no_build(at_entry: bool) -> DashboardResolution {
 
 /// Every file a dashboard request is allowed to resolve to, in priority
 /// order. Each is `real_root`-relative by construction, so no request shape
-/// can reach a file outside the four forms below.
+/// can reach a file outside the five forms below.
 fn dashboard_candidates(real_root: &Path, rel: &DashboardPaths) -> Vec<PathBuf> {
     let mut candidates = Vec::with_capacity(4);
-    if rel.wants_document {
-        let route_root = real_root.join(DASHBOARD_ENTRY);
-        // Exact name inside the app-route tree: the RSC payload of a
-        // client-side navigation (`<page>.txt`) and the per-segment files
-        // (`__next._tree.txt`, `__next._index.txt`, `__next._full.txt`).
+    if rel.at_export_root {
+        // The export root is one file, and one URL shape reaches it. Handled
+        // apart from the forms below so that no route request can be answered
+        // with the null-rendering shell.
+        candidates.push(real_root.join(ROOT_SHELL));
+    } else {
+        // The two bases the export lays its files out in: the app-route tree
+        // under the `dashboard` mount, and the export root for everything
+        // else. An origin-root route document is as real a document as one
+        // under `dashboard/` — it is the export that puts it at the root.
+        let base = if rel.wants_document {
+            real_root.join(DASHBOARD_ENTRY)
+        } else {
+            real_root.to_path_buf()
+        };
+        // Exact name first: the RSC payload of a client-side navigation
+        // (`<page>.txt`) and the per-segment files (`__next._tree.txt`,
+        // `__next._index.txt`, `__next._full.txt`).
         // MUST precede the document form — an extension-appending candidate
         // tried first would answer a payload request with the HTML document.
-        candidates.push(route_root.join(&rel.rest));
+        candidates.push(base.join(&rel.rest));
         if !rel.named_artifact {
             // Document: `trailingSlash` is unset, so the export emits a flat
-            // `<route>.html`, not a directory index. Restricted to a path
-            // with no extension, which is exactly what makes it a route
-            // request rather than an asset request.
-            candidates.push(route_root.join(&rel.rest).with_extension("html"));
+            // `<route>.html`, not a directory index. Restricted to a request
+            // that is not naming an artifact, which is exactly what makes it a
+            // route request.
+            candidates.push(appended_extension(&base.join(&rel.rest), "html"));
             // Directory index, for a trailing-slash request and for a build
             // that does emit `index.html`.
-            candidates.push(route_root.join(&rel.rest).join("index.html"));
+            candidates.push(base.join(&rel.rest).join("index.html"));
         }
-    } else {
-        candidates.push(real_root.join(&rel.rest));
     }
     // Origin-root asset, reachable from the `dashboard` mount too.
     if let Some(asset) = &rel.origin_asset {
         candidates.push(real_root.join(asset));
     }
     candidates
+}
+
+/// `<name>.html`, APPENDING the extension rather than replacing it.
+/// `Path::with_extension` turns a dotted route name (`providers/acme.corp`)
+/// into `acme.html` — a *different* route — so the one request form that can
+/// reach a document for a dotted route would 404 a document the build ships.
+fn appended_extension(path: &Path, extension: &str) -> PathBuf {
+    let Some(name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let mut appended = name.to_os_string();
+    appended.push(".");
+    appended.push(extension);
+    path.with_file_name(appended)
 }
 
 /// The export-root-relative path a dashboard request resolves to, or `None`
@@ -582,6 +738,12 @@ fn dashboard_candidates(real_root: &Path, rel: &DashboardPaths) -> Vec<PathBuf> 
 /// rather than report it as an absent file. It is decoded ONCE and only
 /// once: a double-encoded `%252e%252e%252f` therefore stays the ordinary
 /// (absent) directory name `%2e%2e%2f` and can never become a traversal.
+///
+/// An empty remainder is NOT a rejection: it is the export root, which names
+/// exactly one file ([`ROOT_SHELL`]) and no path at all — see
+/// [`DashboardPaths::at_export_root`]. A request that reduced to nothing can
+/// therefore read `/` , `//` and `/.` and nothing more, and none of those
+/// spellings can carry a traversal.
 fn dashboard_relative_path(path: &str) -> Option<PathBuf> {
     let decoded = percent_decode(path.trim_start_matches('/'));
     if decoded.contains('\\') || decoded.contains('\0') {
@@ -595,7 +757,7 @@ fn dashboard_relative_path(path: &str) -> Option<PathBuf> {
             other => rel.push(other),
         }
     }
-    (!rel.as_os_str().is_empty()).then_some(rel)
+    Some(rel)
 }
 
 /// Percent-decode a URL path. `+` is left alone: this is a path, not a form
@@ -630,21 +792,46 @@ mod tests {
     use tempfile::TempDir;
     use tower::ServiceExt;
 
-    /// A dashboard root shaped like the real export (artifact `10928452044`):
-    /// a flat `<route>.html` per route, `<route>.txt` beside it, the segment
-    /// files in a directory of the same name, and the origin-root `_next/`
+    /// A dashboard root shaped like the real export (artifact
+    /// `omniroute-dashboard-out` #10932864997): a flat `<route>.html` per
+    /// route, `<route>.txt` beside it, the segment files in a directory of the
+    /// same name, the origin-root app routes beside them, and the `_next/`
     /// and `public/` assets the documents reference without a prefix.
     fn export_root() -> TempDir {
         let dir = TempDir::new().unwrap();
-        let root = dir.path();
+        populate_export(dir.path());
+        dir
+    }
+
+    /// The same build with a canary file BESIDE the root rather than inside
+    /// it: a traversal that actually left the root would answer 200 with
+    /// those bytes, so the assertion has to be able to see them.
+    fn export_root_with_a_canary_beside_it() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("out");
+        populate_export(&root);
+        let canary = dir.path().join("canary.txt");
+        fs::write(&canary, b"aisix-traversal-canary").unwrap();
+        (dir, canary)
+    }
+
+    fn populate_export(root: &Path) {
+        fs::create_dir_all(root).unwrap();
         // The `/` shell is a null-rendering redirector: it must never be
-        // what a dashboard request answers with.
+        // what a route request answers with.
         fs::write(
             root.join("index.html"),
             b"ROOT SHELL: router.replace('/dashboard')",
         )
         .unwrap();
         fs::write(root.join("dashboard.html"), b"<html>dashboard entry</html>").unwrap();
+        // The RSC payload, route tree and page segment of the root route, and
+        // the payload of the `/dashboard` route: the export writes all four
+        // at the ROOT, not under `dashboard/`.
+        fs::write(root.join("index.txt"), b"ROOT RSC PAYLOAD").unwrap();
+        fs::write(root.join("__next._tree.txt"), b"ROOT TREE").unwrap();
+        fs::write(root.join("__next.__PAGE__.txt"), b"ROOT PAGE SEGMENT").unwrap();
+        fs::write(root.join("dashboard.txt"), b"DASHBOARD RSC PAYLOAD").unwrap();
         let route = root.join("dashboard/providers/openai");
         fs::create_dir_all(&route).unwrap();
         fs::write(
@@ -670,7 +857,47 @@ mod tests {
         fs::create_dir_all(root.join(".well-known")).unwrap();
         fs::write(root.join(".well-known/agent.json"), b"{}").unwrap();
         fs::write(root.join("manifest.webmanifest"), b"{}").unwrap();
-        dir
+        fs::write(root.join("favicon.ico"), b"ICO").unwrap();
+        // The origin-root app routes: a document beside its payload and its
+        // per-segment directory, one nested document, and a provider logo a
+        // document links to.
+        fs::write(root.join("login.html"), b"<html>login</html>").unwrap();
+        fs::write(root.join("login.txt"), b"LOGIN RSC PAYLOAD").unwrap();
+        fs::create_dir_all(root.join("login")).unwrap();
+        fs::write(root.join("login/__next._tree.txt"), b"LOGIN TREE").unwrap();
+        fs::write(
+            root.join("login/__next.login.__PAGE__.txt"),
+            b"LOGIN PAGE SEGMENT",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("auth")).unwrap();
+        fs::write(
+            root.join("auth/callback.html"),
+            b"<html>auth callback</html>",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("providers")).unwrap();
+        // The five provider logos the origin-root documents link to. The
+        // export ships 141 files in this directory; the five are the ones a
+        // document asks for, and they are mounted by name.
+        for (name, body) in [
+            ("claude.svg", &b"<svg id='claude'/>"[..]),
+            ("cline.svg", &b"<svg id='cline'/>"[..]),
+            ("codex.svg", &b"<svg id='codex'/>"[..]),
+            ("cursor.svg", &b"<svg id='cursor'/>"[..]),
+            (
+                "kimi-logomark-light.svg",
+                &b"<svg id='kimi-logomark-light'/>"[..],
+            ),
+        ] {
+            fs::write(root.join("providers").join(name), body).unwrap();
+        }
+        // A route name that carries a dot: a provider id, not a file type.
+        fs::write(
+            root.join("dashboard/providers/acme.corp.html"),
+            b"<html>acme corp</html>",
+        )
+        .unwrap();
     }
 
     /// A root that exists but holds no dashboard at all.
@@ -797,23 +1024,217 @@ mod tests {
     }
 
     #[test]
-    fn the_root_shell_is_never_what_a_dashboard_request_answers_with() {
+    fn every_known_artifact_extension_has_a_content_type_of_its_own() {
+        // The catch-all over the classification rule: an extension the
+        // artifact rule trusts must never reach the octet-stream default,
+        // because a browser that is told "application/octet-stream"
+        // DOWNLOADS a chunk or a stylesheet instead of running it.
+        for extension in BUILD_ARTIFACT_EXTENSIONS {
+            let mime = mime_for_path(Path::new(&format!("fixture.{extension}")));
+            assert_ne!(
+                mime, "application/octet-stream",
+                ".{extension} has no content type of its own"
+            );
+            assert!(
+                !mime.is_empty(),
+                ".{extension} produced an empty content type"
+            );
+        }
+        // And the default is pinned on an extension no build ships, so the
+        // loop above cannot pass by making the table total.
+        assert_eq!(
+            mime_for_path(Path::new("fixture.xyzzy")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn the_export_root_answers_its_own_shell() {
+        let root = export_root();
+        // `/` is the export's `EntryRedirector`: a null-rendering document
+        // whose whole job is `router.replace('/dashboard')`.
+        let (shell, immutable) = resolved_file(&root, "/");
+        assert!(shell.ends_with(ROOT_SHELL), "/ resolved to {shell:?}");
+        assert_eq!(
+            std::fs::read(&shell).unwrap(),
+            b"ROOT SHELL: router.replace('/dashboard')"
+        );
+        assert!(
+            !immutable,
+            "the shell keeps a stable name and must be revalidated"
+        );
+        // Every spelling that reduces to the same empty remainder names that
+        // one file — and nothing else, so none of them can carry a traversal.
+        for spelling in ["//", "/./", "/."] {
+            assert_eq!(resolved_file(&root, spelling).0, shell, "{spelling}");
+        }
+        assert_eq!(resolved(&root, "/../"), DashboardResolution::Refused);
+        // The shell is also addressable by its own name, which is the same
+        // document rather than a route answered with the wrong one.
+        assert_eq!(resolved_file(&root, "index").0, shell);
+        assert_eq!(resolved_file(&root, "index.html").0, shell);
+    }
+
+    #[test]
+    fn the_root_shell_is_never_what_a_route_request_answers_with() {
         // `out/index.html` is a null-rendering redirector whose only job is to
-        // `router.replace('/dashboard')`. Serving it for any dashboard URL
-        // silently dumps the operator on `/dashboard` and reports success.
+        // `router.replace('/dashboard')`. Serving it for any route silently
+        // dumps the operator on `/dashboard` and reports a page that was never
+        // asked for as a success.
         let root = export_root();
         for url_path in [
             "dashboard",
             "dashboard/providers",
             "dashboard/providers/openai",
             "dashboard/_next/static/chunks/app.js",
+            "login",
+            "login/",
+            "login.txt",
+            "login/__next._tree.txt",
+            "auth/callback",
+            "favicon.ico",
+            "manifest.webmanifest",
+            "providers/claude.svg",
+            "_next/static/chunks/app.js",
         ] {
             let (path, _) = resolved_file(&root, url_path);
             assert!(
-                !path.ends_with("index.html"),
+                !path.ends_with(ROOT_SHELL),
                 "{url_path} resolved to the root shell {path:?}",
             );
         }
+    }
+
+    #[test]
+    fn an_origin_root_route_resolves_in_every_client_request_form() {
+        let root = export_root();
+        // The document, the RSC payload of a client-side navigation, the
+        // trailing-slash spelling, and the route tree of a cold segment cache.
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "login").0).unwrap(),
+            b"<html>login</html>"
+        );
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "login.txt").0).unwrap(),
+            b"LOGIN RSC PAYLOAD"
+        );
+        assert_eq!(
+            resolved_file(&root, "login/").0,
+            resolved_file(&root, "login").0
+        );
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "login/__next._tree.txt").0).unwrap(),
+            b"LOGIN TREE"
+        );
+        // The one nested document at the origin root.
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "auth/callback").0).unwrap(),
+            b"<html>auth callback</html>"
+        );
+        // The root route's own payload and segment files, and the payload of
+        // the `/dashboard` route: the export writes all of them at the ROOT,
+        // which is why they are mounted there and not under `/dashboard`.
+        for (url_path, body) in [
+            ("index.txt", &b"ROOT RSC PAYLOAD"[..]),
+            ("__next._tree.txt", b"ROOT TREE"),
+            ("__next.__PAGE__.txt", b"ROOT PAGE SEGMENT"),
+            ("dashboard.txt", b"DASHBOARD RSC PAYLOAD"),
+        ] {
+            assert_eq!(
+                std::fs::read(resolved_file(&root, url_path).0).unwrap(),
+                body,
+                "{url_path}"
+            );
+        }
+        // A `public/` asset an origin-root document links to.
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "providers/claude.svg").0).unwrap(),
+            b"<svg id='claude'/>"
+        );
+    }
+
+    #[test]
+    fn a_dotted_route_name_is_a_route_and_not_a_missing_artifact() {
+        // The defect: "the last segment carries a dot" read `acme.corp` as a
+        // file type, so a document that is simply not in this export answered
+        // 500 — "the build is incomplete", a claim about the deployment
+        // rather than about the page.
+        let root = export_root();
+        // Present: the document is `<id>.html` with the dot KEPT. A
+        // `with_extension("html")` candidate would ask for `acme.html` — a
+        // different route — and 404 a document the build ships.
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "dashboard/providers/acme.corp").0).unwrap(),
+            b"<html>acme corp</html>"
+        );
+        // Absent: a route, so the honest 404.
+        assert_eq!(
+            resolved(&root, "dashboard/providers/absent.corp"),
+            DashboardResolution::RouteAbsent
+        );
+        // The same dotted id, asked for as a payload, is still an artifact:
+        // the export's protocol names `<route>.txt`, and its absence indicts
+        // the build.
+        assert_eq!(
+            resolved(&root, "dashboard/providers/acme.corp.txt"),
+            DashboardResolution::AssetMissing
+        );
+        assert_eq!(
+            resolved(&root, "dashboard/providers/acme.corp/__next._tree.txt"),
+            DashboardResolution::AssetMissing
+        );
+        // And a genuinely missing chunk is still loud.
+        assert_eq!(
+            resolved(&root, "_next/static/chunks/gone.js"),
+            DashboardResolution::AssetMissing
+        );
+    }
+
+    #[test]
+    fn a_dotted_path_at_the_export_root_is_a_route_too() {
+        let root = export_root();
+        // The export DOES ship `dashboard.txt` — the payload of the
+        // `/dashboard` route, which it writes at the root — and a file that
+        // exists is a file.
+        assert_eq!(
+            std::fs::read(resolved_file(&root, "dashboard.txt").0).unwrap(),
+            b"DASHBOARD RSC PAYLOAD"
+        );
+        fs::remove_file(root.path().join("dashboard.txt")).unwrap();
+        // Absent, a dotted path at the root is a ROUTE name, not a missing
+        // artifact: no Next build protocol ever asks for `/favicon.png`, so
+        // its absence says nothing about the build and 500 would be a lie.
+        for url_path in [
+            "dashboard.txt",
+            "favicon.png",
+            "openapi.yaml",
+            "sitemap.xml",
+            "status.json",
+        ] {
+            assert_eq!(
+                resolved(&root, url_path),
+                DashboardResolution::RouteAbsent,
+                "{url_path}"
+            );
+        }
+        // The content-hashed tree, which the protocol DOES name by path, keeps
+        // the loud answer — so the rule above is a tree, not a blanket.
+        for url_path in [
+            "_next/static/media/gone.woff2",
+            "_next/static/chunks/gone.js",
+            "_next/static/css/gone.css",
+        ] {
+            assert_eq!(
+                resolved(&root, url_path),
+                DashboardResolution::AssetMissing,
+                "{url_path}"
+            );
+        }
+        // And `_next/` outside `static/` is not that tree.
+        assert_eq!(
+            resolved(&root, "_next/gone.js"),
+            DashboardResolution::RouteAbsent
+        );
     }
 
     #[test]
@@ -864,7 +1285,9 @@ mod tests {
             DashboardResolution::NoBuildAtEntry
         );
         // And the entry is the ONLY url that may fall back to the landing
-        // page, so it must be distinguished from every other path.
+        // page, so it must be distinguished from every other path — the
+        // origin-root routes included, or a deep link to `/login` on a host
+        // with no build would land the operator on `/dashboard`.
         assert_ne!(
             resolved(&empty, "dashboard/providers"),
             resolved(&empty, "dashboard")
@@ -873,6 +1296,13 @@ mod tests {
             resolved(&empty, "dashboard/providers"),
             DashboardResolution::NoBuild
         );
+        for url_path in ["/", "/login", "/login.txt", "/docs/intro", "/status"] {
+            assert_eq!(
+                resolved(&empty, url_path),
+                DashboardResolution::NoBuild,
+                "{url_path}"
+            );
+        }
     }
 
     #[test]
@@ -906,9 +1336,42 @@ mod tests {
         assert!(dashboard_relative_path("assets/..").is_none());
         assert!(dashboard_relative_path("assets\\..\\..\\etc\\passwd").is_none());
         assert!(dashboard_relative_path("assets/app.js\0.png").is_none());
-        // Nothing to read.
-        assert!(dashboard_relative_path("").is_none());
-        assert!(dashboard_relative_path("/").is_none());
+        // An empty remainder is not a rejection but it is not a path either:
+        // it names the export root, and the only file there is the shell.
+        assert_eq!(dashboard_relative_path(""), Some(PathBuf::new()));
+        assert_eq!(dashboard_relative_path("/"), Some(PathBuf::new()));
+        assert!(!dashboard_relative_path("").unwrap().is_absolute());
+    }
+
+    #[test]
+    fn the_origin_root_mounts_are_covered_by_the_same_containment() {
+        // The wider surface invited new spellings of the same attack, and
+        // they must land on the same refusal as the two the dashboard mount
+        // already refused: a route mount, a nested mount, a `:param` mount
+        // and the export root itself.
+        let root = export_root();
+        for url_path in [
+            "login/../../etc/passwd",
+            "login/../dashboard.html",
+            "auth/callback/../../../etc/passwd",
+            "docs/../../etc/passwd",
+            "docs/a/b/../../../etc/passwd",
+            "connect/codex/../../etc/passwd",
+            "connect/codex/..%2f..%2fetc%2fpasswd",
+            "providers/../dashboard.html",
+            "status/../..%2fetc%2fpasswd",
+            "404/..%2f..%2fetc%2fpasswd",
+            "login%2f..%2f..%2fetc%2fpasswd",
+            "login\\..\\..\\etc\\passwd",
+            "login/__next._tree.txt\0.png",
+            "/../../etc/passwd",
+        ] {
+            assert_eq!(
+                resolve_dashboard(root.path(), &format!("/{url_path}")),
+                DashboardResolution::Refused,
+                "/{url_path} was not refused",
+            );
+        }
     }
 
     #[test]
@@ -939,29 +1402,36 @@ mod tests {
         // Decoded exactly once, so `%252e%252e%252f` is the ordinary name
         // `%2e%2e%2fetc%2fpasswd` — a single segment that is neither a `..`
         // segment nor a file. Which of the two absent-answers it draws
-        // depends only on whether the decoded NAME happens to contain a `.`
-        // (that is what makes it a named artifact rather than a route), so
-        // only the security property is asserted for all of them…
+        // depends only on the decoded NAME and the tree it addresses, so only
+        // the security property is asserted for all of them…
         let root = export_root();
-        for encoded in [
-            "..%252f..%252fetc%252fpasswd",
-            "%252e%252e%252fetc%252fpasswd",
-            "..%255c..%255cetc%255cpasswd",
-        ] {
-            let resolution = resolve_dashboard(root.path(), &format!("/dashboard/{encoded}"));
-            assert!(
-                !matches!(
-                    resolution,
-                    DashboardResolution::File { .. } | DashboardResolution::Refused
-                ),
-                "{encoded} was not treated as an ordinary absent name: {resolution:?}",
-            );
+        for mount in ["/dashboard", "/login", "/auth/callback", "/docs", ""] {
+            for encoded in [
+                "..%252f..%252fetc%252fpasswd",
+                "%252e%252e%252fetc%252fpasswd",
+                "..%255c..%255cetc%255cpasswd",
+            ] {
+                let url_path = format!("{mount}/{encoded}");
+                let resolution = resolve_dashboard(root.path(), &url_path);
+                assert!(
+                    !matches!(
+                        resolution,
+                        DashboardResolution::File { .. } | DashboardResolution::Refused
+                    ),
+                    "{url_path} was not treated as an ordinary absent name: {resolution:?}",
+                );
+            }
         }
         // …and the no-literal-dot form is pinned exactly, so a SECOND decode
         // pass — which would turn it into `../etc/passwd` and flip the answer
-        // to `Refused` — cannot pass unnoticed.
+        // to `Refused` — cannot pass unnoticed. Pinned on both trees, since
+        // they classify it differently and both answers must stay honest.
         assert_eq!(
             resolve_dashboard(root.path(), "/dashboard/%252e%252e%252fetc%252fpasswd"),
+            DashboardResolution::RouteAbsent,
+        );
+        assert_eq!(
+            resolve_dashboard(root.path(), "/login/%252e%252e%252fetc%252fpasswd"),
             DashboardResolution::RouteAbsent,
         );
     }
@@ -995,6 +1465,44 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_out_of_the_root_is_refused_on_the_origin_root_surface_too() {
+        // The wider surface is the same chokepoint, so the same three places a
+        // document candidate looks: the export root's own shell, an
+        // origin-root route document, and a segment inside a route's
+        // directory.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("out");
+        populate_export(&root);
+        let outside = dir.path().join("outside-secret.txt");
+        fs::write(&outside, b"TOP SECRET").unwrap();
+        // The shell, which is the one file the export root names.
+        fs::remove_file(root.join("index.html")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("index.html")).unwrap();
+        // An origin-root route document.
+        fs::remove_file(root.join("login.html")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("login.html")).unwrap();
+        // A symlinked segment under a route, so the escape is not only a leaf.
+        fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+        fs::write(dir.path().join("elsewhere/leaf.html"), b"TOP SECRET").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("login/hop")).unwrap();
+
+        for url_path in ["/", "/login", "/login/hop/leaf"] {
+            assert_eq!(
+                resolve_dashboard(&root, url_path),
+                DashboardResolution::Refused,
+                "{url_path} was not refused",
+            );
+        }
+        // The payload beside the refused document is a real file, so the
+        // three refusals above are about the symlinks and not about a root
+        // that answers nothing.
+        assert!(matches!(
+            resolve_dashboard(&root, "/login.txt"),
+            DashboardResolution::File { .. }
+        ));
+    }
+
+    #[test]
     fn a_segment_named_like_a_dotdot_is_not_a_traversal() {
         // The shape the old textual strip broke on, and the reason it
         // broke: `....//` collapsed to `//`, and `root.join("//etc/passwd")`
@@ -1014,19 +1522,27 @@ mod tests {
     // ── End-to-end through the real router ────────────────────────────────
     //
     // Resolution is only half the contract; what the operator's browser
-    // receives is the other half. `AISIX_DASHBOARD_DIR` is process-global, so
-    // these run in one test to keep them from racing each other.
+    // receives is the other half. The dashboard root is process-global (the
+    // override above), so every test that sets it holds this lock for its
+    // duration — otherwise two concurrent `#[tokio::test]`s would each assert
+    // against the other's fixture.
 
-    async fn get(
-        app: axum::Router,
-        uri: &str,
-    ) -> (
-        StatusCode,
-        String,
-        std::collections::HashMap<String, String>,
-    ) {
+    static TEST_ROOT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    type Headers = std::collections::HashMap<String, String>;
+
+    /// One request against the real router, with the raw bytes: a served
+    /// `.png` is binary, so a `String` body would assert against a lossy
+    /// rendering of it rather than the file.
+    async fn request(app: axum::Router, method: &str, uri: &str) -> (StatusCode, Vec<u8>, Headers) {
         let resp = app
-            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let status = resp.status();
@@ -1043,11 +1559,54 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
             .await
             .unwrap();
+        (status, bytes.to_vec(), headers)
+    }
+
+    async fn get(app: axum::Router, uri: &str) -> (StatusCode, String, Headers) {
+        let (status, bytes, headers) = request(app, "GET", uri).await;
         (
             status,
             String::from_utf8_lossy(&bytes).into_owned(),
             headers,
         )
+    }
+
+    /// `HEAD` — the probe `next/dist/client/components/segment-cache/cache.js:1241`
+    /// issues before it fetches a route document, and the only method the
+    /// browser sends for it.
+    async fn head(app: axum::Router, uri: &str) -> (StatusCode, Vec<u8>, Headers) {
+        request(app, "HEAD", uri).await
+    }
+
+    fn content_type(headers: &Headers) -> Option<&str> {
+        headers.get("content-type").map(String::as_str)
+    }
+
+    /// A build that carries a document, a payload and a segment directory for
+    /// EVERY entry of the route table, so the census below drives the whole
+    /// table rather than a sample of it.
+    fn export_root_with_every_origin_root_route() -> TempDir {
+        let dir = export_root();
+        for route in ORIGIN_ROOT_ROUTES {
+            let name = route.trim_start_matches('/');
+            fs::write(
+                dir.path().join(format!("{name}.html")),
+                format!("<html>{name}</html>"),
+            )
+            .unwrap();
+            fs::write(
+                dir.path().join(format!("{name}.txt")),
+                format!("{name} RSC PAYLOAD"),
+            )
+            .unwrap();
+            fs::create_dir_all(dir.path().join(name)).unwrap();
+            fs::write(
+                dir.path().join(name).join("__next._tree.txt"),
+                format!("{name} TREE"),
+            )
+            .unwrap();
+        }
+        dir
     }
 
     fn dashboard_app() -> axum::Router {
@@ -1069,6 +1628,7 @@ mod tests {
     /// `#[tokio::test]` bodies run concurrently.
     #[tokio::test]
     async fn the_router_serves_a_deployed_build_and_still_works_without_one() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
         let root = export_root();
         // A canary beside the root: a traversal that escaped would answer 200
         // with these bytes, so the assertion is on the BODY, not the status.
@@ -1169,14 +1729,24 @@ mod tests {
             "/_next/../canary.txt",
             "/_next/%2e%2e%2fcanary.txt",
         ] {
-            let (status, body, _) = get(dashboard_app(), uri).await;
-            assert!(
-                status.is_client_error(),
-                "{uri} answered {status} with {body:?}",
-            );
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            // 400, not 404: the request is malformed or hostile, and a 404
+            // would report it as a merely absent page.
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} answered {body:?}");
             assert!(
                 !body.contains("aisix-traversal-canary"),
-                "{uri} leaked file content: {body:?}",
+                "{uri} leaked file content: {body:?}"
+            );
+            // A refused request is a plain explanation, never a document and
+            // never the shell.
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri}"
+            );
+            assert!(
+                !body.contains("<html>"),
+                "{uri} answered a document: {body:?}"
             );
         }
 
@@ -1211,6 +1781,434 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _, _) = get(dashboard_app(), "/admin/openapi.json").await;
         assert_eq!(status, StatusCode::OK);
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The whole origin-root route table, in every form a client asks for a
+    /// route in. A census rather than a sample: a mount that resolves nothing
+    /// is indistinguishable from a route that does not exist until someone
+    /// opens that page.
+    #[tokio::test]
+    async fn every_origin_root_route_answers_in_every_request_form() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root_with_every_origin_root_route();
+        let previous = with_test_dashboard_root(root.path());
+
+        for route in ORIGIN_ROOT_ROUTES {
+            let name = route.trim_start_matches('/');
+            // The document.
+            let (status, body, headers) = get(dashboard_app(), route).await;
+            assert_eq!(status, StatusCode::OK, "{route} answered {body:?}");
+            assert_eq!(body, format!("<html>{name}</html>"), "{route} body");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/html; charset=utf-8"),
+                "{route} content-type"
+            );
+            // The trailing-slash spelling an operator types by hand.
+            let (status, body, _) = get(dashboard_app(), &format!("{route}/")).await;
+            assert_eq!(status, StatusCode::OK, "{route}/ answered {body:?}");
+            assert_eq!(body, format!("<html>{name}</html>"), "{route}/ body");
+            // The RSC payload of a client-side navigation, which the router
+            // only accepts as Flight when it arrives as `text/plain`.
+            let (status, body, headers) = get(dashboard_app(), &format!("{route}.txt")).await;
+            assert_eq!(status, StatusCode::OK, "{route}.txt answered {body:?}");
+            assert_eq!(body, format!("{name} RSC PAYLOAD"), "{route}.txt body");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{route}.txt content-type"
+            );
+            // The route tree of a cold segment cache.
+            let uri = format!("{route}/__next._tree.txt");
+            let (status, body, _) = get(dashboard_app(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {body:?}");
+            assert_eq!(body, format!("{name} TREE"), "{uri} body");
+            // And the `HEAD` probe the client router issues before it fetches
+            // a document (`cache.js:1241`): the same status and the same
+            // content type, with no body.
+            let (status, body, headers) = head(dashboard_app(), route).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {route} answered {status}");
+            assert!(body.is_empty(), "HEAD {route} carried a body");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/html; charset=utf-8"),
+                "HEAD {route} content-type"
+            );
+            let (status, body, headers) = head(dashboard_app(), &format!("{route}.txt")).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {route}.txt answered {status}");
+            assert!(body.is_empty(), "HEAD {route}.txt carried a body");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "HEAD {route}.txt content-type"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    #[tokio::test]
+    async fn the_export_root_and_its_own_client_request_forms_are_served() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        // `/` is the export's `EntryRedirector`, and it must stay that: the
+        // null-rendering shell, revalidated rather than cached immutably.
+        for method in ["GET", "HEAD"] {
+            let (status, body, headers) = request(dashboard_app(), method, "/").await;
+            assert_eq!(status, StatusCode::OK, "{method} / answered {status}");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/html; charset=utf-8"),
+                "{method} / content-type"
+            );
+            assert_eq!(
+                headers.get("cache-control").map(String::as_str),
+                Some("no-cache")
+            );
+            if method == "GET" {
+                assert!(
+                    body.windows(b"router.replace('/dashboard')".len())
+                        .any(|window| window == b"router.replace('/dashboard')"),
+                    "/ body was {body:?}"
+                );
+            } else {
+                assert!(body.is_empty(), "HEAD / carried a body");
+            }
+        }
+
+        // The root route's own payload and segment files, and the payload of
+        // the `/dashboard` route — all four are written at the export ROOT, so
+        // a client-side navigation to `/` or to `/dashboard` needs them there.
+        for (uri, expected, content_type_expected) in [
+            (
+                "/index.txt",
+                "ROOT RSC PAYLOAD",
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/__next._tree.txt",
+                "ROOT TREE",
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/__next.__PAGE__.txt",
+                "ROOT PAGE SEGMENT",
+                "text/plain; charset=utf-8",
+            ),
+            (
+                "/dashboard.txt",
+                "DASHBOARD RSC PAYLOAD",
+                "text/plain; charset=utf-8",
+            ),
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {body:?}");
+            assert_eq!(body, expected, "{uri} body");
+            assert_eq!(content_type(&headers), Some(content_type_expected), "{uri}");
+        }
+
+        // The provider logos the origin-root documents link to: `/landing`
+        // renders four of them as `<img src>` and `/home` one, so without
+        // these the served routes render broken images.
+        for name in [
+            "claude.svg",
+            "cline.svg",
+            "codex.svg",
+            "cursor.svg",
+            "kimi-logomark-light.svg",
+        ] {
+            let uri = format!("/providers/{name}");
+            let (status, body, headers) = get(dashboard_app(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {body:?}");
+            assert_eq!(
+                content_type(&headers),
+                Some("image/svg+xml"),
+                "{uri} content-type"
+            );
+            assert!(!body.is_empty(), "{uri} was empty");
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The origin-root families a static export can never carry, and the
+    /// classification defect, through the real router — where the previous
+    /// answers were axum's bare 404 (empty body, no content type) and a 500
+    /// for a route that is simply not in the build.
+    #[tokio::test]
+    async fn the_routes_a_static_export_cannot_carry_explain_themselves() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root_with_every_origin_root_route();
+        let previous = with_test_dashboard_root(root.path());
+
+        for uri in [
+            // `/docs/*` is force-dynamic by design, and the origin-root
+            // documents link to it; `/connect/codex/[token]` is a single-use
+            // token row. A token that carries a dot is still a token.
+            "/docs",
+            "/docs/",
+            "/docs/intro",
+            "/docs/api/reference",
+            "/docs/openapi.json",
+            "/connect/codex/single-use-token",
+            "/connect/codex/tok-en.vec",
+            "/connect/codex/tok%2Fen",
+            // A provider id that is not in this export, dotted or not.
+            "/dashboard/providers/absent.corp",
+            "/dashboard/providers/acme.corp.txt",
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            if uri.ends_with(".txt") {
+                // The one shape that is an artifact: the export's protocol
+                // names `<route>.txt`, so its absence indicts the build and
+                // must stay loud.
+                assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
+                assert!(body.contains("incomplete"), "{uri} body was {body:?}");
+                continue;
+            }
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri} answered {body:?}");
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri} answered the router's bare 404, not the honest one"
+            );
+            assert!(
+                body.contains("not part of the deployed dashboard build"),
+                "{uri} body was {body:?}"
+            );
+            assert!(
+                !body.contains("<html>"),
+                "{uri} answered with a document: {body:?}"
+            );
+            // The same honest answer for the `HEAD` probe.
+            let (status, body, headers) = head(dashboard_app(), uri).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "HEAD {uri} answered {status}"
+            );
+            assert!(body.is_empty(), "HEAD {uri} carried a body");
+            assert_eq!(content_type(&headers), Some("text/plain; charset=utf-8"));
+        }
+
+        // And a dotted provider id the build DOES carry answers 200 — the
+        // document is `<id>.html` with the dot kept.
+        fs::write(
+            root.path().join("dashboard/providers/acme.corp.html"),
+            b"<html>acme corp</html>",
+        )
+        .unwrap();
+        let (status, body, headers) = get(dashboard_app(), "/dashboard/providers/acme.corp").await;
+        assert_eq!(status, StatusCode::OK, "body was {body:?}");
+        assert_eq!(body, "<html>acme corp</html>");
+        assert_eq!(content_type(&headers), Some("text/html; charset=utf-8"));
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The attack surface grew with the origin-root surface, so containment is
+    /// re-proven here rather than assumed: every case is asserted on the BODY,
+    /// because a 200 that leaks file content is the failure that matters.
+    #[tokio::test]
+    async fn the_wider_surface_still_refuses_to_leave_the_dashboard_root() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let (dir, _canary) = export_root_with_a_canary_beside_it();
+        let previous = with_test_dashboard_root(&dir.path().join("out"));
+
+        for uri in [
+            // The mounts that existed before this change.
+            "/dashboard/../canary.txt",
+            "/dashboard/%2e%2e%2fcanary.txt",
+            "/dashboard/providers/..%2f..%2fcanary.txt",
+            "/_next/../canary.txt",
+            "/_next/%2e%2e%2fcanary.txt",
+            "/_next/static/..%2f..%2fcanary.txt",
+            // The origin-root route mount, its nested form, the docs family
+            // and the token family.
+            "/login/../../canary.txt",
+            "/login/%2e%2e/%2e%2e/canary.txt",
+            "/login/__next._tree.txt/../../../canary.txt",
+            "/auth/callback/../../canary.txt",
+            "/status/../canary.txt",
+            "/docs/../../canary.txt",
+            "/docs/a/../../../canary.txt",
+            "/connect/codex/..%2f..%2fcanary.txt",
+            // A backslash and a NUL, which the `/` split would not see and
+            // which truncates the path at the syscall.
+            "/login/..%5c..%5ccanary.txt",
+            "/login/canary.txt%00.png",
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            // 400, not 404: the request is malformed or hostile, and a 404
+            // would report it as a merely absent page.
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} answered {body:?}");
+            assert!(
+                !body.contains("aisix-traversal-canary"),
+                "{uri} leaked file content: {body:?}"
+            );
+            // A refused request is a plain explanation, never a document and
+            // never the shell.
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri}"
+            );
+            assert!(
+                !body.contains("<html>"),
+                "{uri} answered a document: {body:?}"
+            );
+        }
+
+        // Three shapes the ROUTER refuses before a handler ever sees them,
+        // because their first segment is not a mounted one: `..` where a
+        // mount expects a name, and an encoded backslash where a mount
+        // expects a `/`. They answer the router's own 404, and the property
+        // that matters still holds — no file content, no document. The
+        // chokepoint's own refusal of these shapes is pinned at the
+        // resolution level in
+        // `the_origin_root_mounts_are_covered_by_the_same_containment`.
+        for uri in [
+            "/../canary.txt",
+            "/./../../canary.txt",
+            "/login%5c..%5ccanary.txt",
+        ] {
+            let (status, body, _) = get(dashboard_app(), uri).await;
+            assert!(status.is_client_error(), "{uri} answered {status}");
+            assert!(
+                !body.contains("aisix-traversal-canary"),
+                "{uri} leaked file content: {body:?}"
+            );
+            assert!(
+                !body.contains("<html>"),
+                "{uri} answered a document: {body:?}"
+            );
+        }
+
+        // A symlink that leaves the root is refused on the new mounts too,
+        // and the canary's bytes are still not in the body.
+        let root = dir.path().join("out");
+        fs::remove_file(root.join("login.html")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("canary.txt"), root.join("login.html")).unwrap();
+        fs::remove_file(root.join("index.html")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("canary.txt"), root.join("index.html")).unwrap();
+        fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+        fs::write(
+            dir.path().join("elsewhere/leaf.html"),
+            b"aisix-traversal-canary",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("login/hop")).unwrap();
+        for uri in ["/login", "/", "/login/hop/leaf"] {
+            let (status, body, _) = get(dashboard_app(), uri).await;
+            assert!(
+                status.is_client_error(),
+                "{uri} answered {status} with {body:?}"
+            );
+            assert!(
+                !body.contains("aisix-traversal-canary"),
+                "{uri} leaked file content through a symlink: {body:?}"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// Real bytes for an extension, so the content-type table is asserted
+    /// about files and not about names: a real 1×1 PNG (the 8-byte signature
+    /// plus an `IHDR` chunk), a real `<svg>` document, and text otherwise.
+    fn artifact_bytes(extension: &str) -> Vec<u8> {
+        match extension {
+            "png" => vec![
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+                0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            ],
+            "svg" => {
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"></svg>"#.to_vec()
+            }
+            other => format!("fixture {other}").into_bytes(),
+        }
+    }
+
+    /// Fixture-backed, not a table lookup: every extension the classification
+    /// rule trusts is a real file in a real build, planted under the
+    /// content-hashed tree, requested through the router, and the RESPONSE's
+    /// content type is what is asserted. Before this, the `.png`/`.svg`/font
+    /// arms of `mime_for_path` had never been exercised by a served file —
+    /// this export happens to ship no images under `_next/static`.
+    #[tokio::test]
+    async fn every_known_artifact_extension_is_served_with_its_own_content_type() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        for extension in BUILD_ARTIFACT_EXTENSIONS {
+            let name = format!("fixture.{extension}");
+            let planted = artifact_bytes(extension);
+            let path = root.path().join(NEXT_STATIC_DIR).join("media").join(&name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, &planted).unwrap();
+            let uri = format!("/{NEXT_STATIC_DIR}/media/{name}");
+            let (status, body, headers) = request(dashboard_app(), "GET", &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {status}");
+            assert_eq!(body, planted, "{uri} served other bytes");
+            let served = content_type(&headers);
+            let expected = mime_for_path(Path::new(&name));
+            assert_eq!(served, Some(expected), "{uri} content type");
+            assert_ne!(
+                served,
+                Some("application/octet-stream"),
+                ".{extension} is served as a download"
+            );
+            // The content-hashed tree keeps the immutable contract, so a
+            // browser never re-fetches a file whose name cannot change.
+            assert_eq!(
+                headers.get("cache-control").map(String::as_str),
+                Some("public, max-age=31536000, immutable"),
+                "{uri} cache-control"
+            );
+        }
+
+        // An extension no build ships falls through to the download type,
+        // pinned so the loop above cannot pass by making the table total.
+        let path = root
+            .path()
+            .join(NEXT_STATIC_DIR)
+            .join("media")
+            .join("fixture.xyzzy");
+        fs::write(&path, b"\x00\x01\x02").unwrap();
+        let (status, _, headers) = get(
+            dashboard_app(),
+            &format!("/{NEXT_STATIC_DIR}/media/fixture.xyzzy"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            content_type(&headers),
+            Some("application/octet-stream"),
+            "the default arm moved"
+        );
 
         let mut guard = TEST_DASHBOARD_ROOT
             .lock()
