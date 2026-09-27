@@ -134,6 +134,15 @@ pub fn build_router(state: AdminState) -> Router {
             "/dashboard",
             get(resources_handler::serve_dashboard_index),
         )
+        // `matchit` 0.7.3 (`tree.rs:519`) deliberately leaves a trailing-slash
+        // path unmatched when a catch-all is registered, so `/dashboard/`
+        // reaches NO handler without this and answers with a bare 404. It is
+        // the URL an operator types by hand, so it must resolve to the same
+        // entry document.
+        .route(
+            "/dashboard/",
+            get(resources_handler::serve_dashboard_index),
+        )
         .route(
             "/dashboard/*path",
             get(resources_handler::serve_dashboard_path),

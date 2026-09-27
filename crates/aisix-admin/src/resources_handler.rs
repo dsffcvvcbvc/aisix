@@ -1086,6 +1086,14 @@ mod tests {
             Some("text/html; charset=utf-8")
         );
 
+        // The trailing-slash entry. `matchit` 0.7.3 leaves `/dashboard/`
+        // unmatched against `/dashboard/*path` (`tree.rs:519`), so this is a
+        // ROUTER fact, not a resolution one, and it is pinned here: without
+        // the explicit route it answers a bare 404.
+        let (status, body, _) = get(dashboard_app(), "/dashboard/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("dashboard entry"), "body was {body:?}");
+
         // The document, the RSC payload and the segment file a client-side
         // navigation to a deep route needs, each with its own answer.
         for (uri, expected) in [
