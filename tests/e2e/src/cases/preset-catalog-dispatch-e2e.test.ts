@@ -111,15 +111,31 @@ function bearerRows(rows: PresetRow[]): PresetRow[] {
   return rows.filter((r) => r.auth.type === "bearer");
 }
 
+/**
+ * The type predicate is SPELLED OUT rather than left to inference. TypeScript
+ * 5.5+ infers one from an arrow of exactly this shape, and 6.0 does, so a
+ * newer compiler checks this file clean while CI's does not and reports
+ * `Type 'PresetRow[]' is not assignable to type 'ApiKeyHeaderRow[]'` on the
+ * return. That is a toolchain-dependent pass, which is not a pass: the gate
+ * runs on a pinned compiler and the test must be correct on THAT one. Naming
+ * the predicate makes the narrowing independent of the version.
+ */
+function isApiKeyHeaderRow(r: PresetRow): r is ApiKeyHeaderRow {
+  return r.auth.type === "api_key_header";
+}
+
 /** The four rows whose credential replaces a header other than `Authorization`. */
 function apiKeyHeaderRows(rows: PresetRow[]): ApiKeyHeaderRow[] {
-  return rows.filter((r) => r.auth.type === "api_key_header");
+  return rows.filter(isApiKeyHeaderRow);
+}
+
+function isAuthorizationSchemeRow(r: PresetRow): r is AuthorizationSchemeRow {
+  return r.auth.type === "authorization_scheme";
 }
 
 /** The one row whose credential is an `Authorization` value under a non-Bearer scheme. */
 function authorizationSchemeRows(rows: PresetRow[]): AuthorizationSchemeRow[] {
-  return rows.filter((r) => r.auth.type === "authorization_scheme");
-}
+  return rows.filter(isAuthorizationSchemeRow);
 
 /**
  * The upstream path a vendor's `api_base` produces. The family bridge
