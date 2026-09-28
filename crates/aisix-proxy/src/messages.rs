@@ -7016,6 +7016,107 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 
+    // -- TEMPORARY CI PROBE - delete before landing anything --
+    struct ProbeBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for ProbeBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for ProbeBuf {
+        type Writer = ProbeBuf;
+        fn make_writer(&self) -> Self::Writer {
+            ProbeBuf(self.0.clone())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_fail_open_duplicate_upstream_request() {
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_target(true)
+            .with_writer(ProbeBuf(buf.clone()))
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let iterations: usize = std::env::var("PROBE_ITERATIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let mut dupes = 0usize;
+        for i in 0..iterations {
+            buf.lock().unwrap().clear();
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                })))
+                .mount(&upstream)
+                .await;
+
+            let snap = new_snap_anthropic(&upstream.uri());
+            snap.models.insert(anthropic_model("my-claude"));
+            snap.apikeys.insert(apikey_entry(&["*"]));
+            let row: aisix_core::models::Guardrail = serde_json::from_str(
+                r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+            )
+            .unwrap();
+            crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
+
+            let hub = Arc::new(Hub::new());
+            hub.register_specialized("anthropic", Arc::new(AnthropicBridge::new()));
+            let state =
+                crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache();
+
+            let resp = crate::build_router(state)
+                .oneshot(make_req(serde_json::json!({
+                    "model": "my-claude",
+                    "max_tokens": 100,
+                })))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let received = upstream.received_requests().await.unwrap();
+            if received.len() != 1 || status != StatusCode::OK {
+                dupes += 1;
+                let dump: Vec<String> = received
+                    .iter()
+                    .map(|r| {
+                        format!(
+                            "  {} {} body={:?}",
+                            r.method,
+                            r.url,
+                            String::from_utf8_lossy(&r.body)
+                        )
+                    })
+                    .collect();
+                let logs = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+                panic!(
+                    "PROBE iteration {i}: status={status} requests={}\n{}\n--- logs ---\n{}",
+                    received.len(),
+                    dump.join("\n"),
+                    logs
+                );
+            }
+        }
+        println!("PROBE: {iterations} iterations, {dupes} duplicates");
+    }
+
     /// The forwarding above is a fail-open BYPASS, and it has to be
     /// findable: the prompt reached the provider with nothing screening
     /// it, and the usage row otherwise reads exactly like a screened one.
