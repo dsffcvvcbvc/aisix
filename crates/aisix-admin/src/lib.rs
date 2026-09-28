@@ -151,8 +151,9 @@ pub fn admin_openapi_json() -> &'static str {
 /// collision census and `tests::every_handwritten_mount_is_actually_mounted`
 /// — and a closure column would be readable by neither. Every variant is a
 /// different entry point into the same origin-root chokepoint, which is the
-/// point: five of the six are one handler under five names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// point: each variant is one distinct handler function, and the enum
+/// exists at all so the table stays readable as data.
+#[derive(Debug, Clone, Copy)]
 enum HandwrittenMount {
     /// `serve_dashboard_index` — the SPA entry document. `/`, `/dashboard`
     /// and `/dashboard/` resolve through it, and only it turns a host with
@@ -186,9 +187,31 @@ enum HandwrittenMount {
 /// mount added to `build_router` and forgotten in the array left both lists
 /// internally consistent and every assertion green, so the census went on
 /// reporting "the derived mounts collide with nothing" about a mount list it
-/// no longer described. A mount now exists if and only if it is a row here,
-/// so the question the copy was keeping honest is not one this file can be
-/// put into.
+/// no longer described. There is no second copy left to drift.
+///
+/// **What this does and does not buy, stated against a measurement rather
+/// than a hope.** `build_router` mounts every row through the one loop below,
+/// and `tests::every_handwritten_mount_is_actually_mounted` proves each row is
+/// reached, so a row that is not a mount fails. It is NOT true that a mount
+/// cannot exist without a row: adding a `.route(...)` to `build_router`
+/// itself, outside this table, is still accepted silently. That was measured,
+/// not assumed — the mutant is a mount added straight to `build_router`, and
+/// all 239 tests in the crate stay green.
+///
+/// It cannot be closed from here, and the reason is worth recording so the
+/// next reader does not re-derive it: `axum` 0.7.9 does not expose route
+/// enumeration. `Router`'s 17 public methods (`routing/mod.rs`) are
+/// `new`/`route`/`nest`/`merge`/`layer`/`with_state`/`fallback`/… and none
+/// returns the mounted path set, and the type that holds it, `PathRouter`, is
+/// `pub(super)` with a private `routes` field (`routing/path_router.rs:17`).
+/// So no test can walk what `build_router` actually mounted and diff it
+/// against this table. Option 2 of the original finding — "add a test walking
+/// `build_router`'s real routes" — is not available on this version.
+///
+/// What the derive does buy is the half that was actually broken: a mount in
+/// this table and a mount in the census can no longer disagree, because they
+/// are the same rows. A mount added to the table is seen by the collision
+/// census, which is what the hand-copy could not do.
 ///
 /// The two derived mount families are deliberately NOT rows: the export's
 /// app routes (`resources_handler::ORIGIN_ROOT_ROUTES`) and its asset trees
@@ -935,6 +958,10 @@ mod tests {
         // `/.well-known` are not rows of it either — they are derived from
         // ORIGIN_ROOT_ASSET_TREES below, and spelling them out here as well
         // would be the same second list one level down.
+        //
+        // The one thing this still cannot see is a `.route(...)` added to
+        // `build_router` outside the table; see `HANDWRITTEN_MOUNTS` for the
+        // measurement and for why `axum` 0.7.9 rules out closing it.
         let handwritten: Vec<&str> = HANDWRITTEN_MOUNTS.iter().map(|(path, _)| *path).collect();
         let mut mounted: Vec<String> = Vec::new();
         for tree in resources_handler::ORIGIN_ROOT_ASSET_TREES {
