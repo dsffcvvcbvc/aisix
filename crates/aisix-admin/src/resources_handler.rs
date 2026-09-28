@@ -498,7 +498,10 @@ fn file_response(
     // `from_static` is a `const fn` returning the value, not a `Result` —
     // unlike `from_str`, whose `if let Ok` arms are the convention elsewhere
     // in this file. A static string cannot fail to be a header value.
-    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     if tree.is_some() {
         headers.insert(
             "content-security-policy",
@@ -838,8 +841,7 @@ impl OriginRootAssetTree {
 /// The response policy every origin-root asset tree is served under. See
 /// [`file_response`], which is where it is set and why it does not apply to
 /// the rest of the export.
-const ORIGIN_ROOT_ASSET_TREE_CSP: &str =
-    "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+const ORIGIN_ROOT_ASSET_TREE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 /// Every origin-root asset tree the host mounts. Measured from the deployed
 /// export artifact `omniroute-dashboard-out` #10932864997: `providers/` (141
@@ -1826,12 +1828,7 @@ mod tests {
         // assertion in this test proves that for `dashboard.txt` — so the
         // four names below are the absent case, which is what the rule is
         // actually about, and `openapi.yaml` is now the present case.
-        for url_path in [
-            "dashboard.txt",
-            "favicon.png",
-            "sitemap.xml",
-            "status.json",
-        ] {
+        for url_path in ["dashboard.txt", "favicon.png", "sitemap.xml", "status.json"] {
             assert_eq!(
                 resolved(&root, url_path),
                 DashboardResolution::RouteAbsent,
@@ -2825,8 +2822,11 @@ mod tests {
         // And the third answer — a REQUIRED artifact missing — keeps its own
         // status and stays distinguishable from both: 500, not 404, because a
         // missing `_next/static` file indicts the deployment.
-        let (broken_status, broken_body, broken_headers) =
-            get(dashboard_app(), "/_next/static/chunks/a-chunk-that-vanished.js").await;
+        let (broken_status, broken_body, broken_headers) = get(
+            dashboard_app(),
+            "/_next/static/chunks/a-chunk-that-vanished.js",
+        )
+        .await;
         assert_eq!(
             broken_status,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3473,8 +3473,7 @@ mod tests {
         // bytes, so the answer does not depend on which mount was typed.
         for relative in ["images/tier-flow-dark.svg", ".well-known/agent.json"] {
             let origin = request(dashboard_app(), "GET", &format!("/{relative}")).await;
-            let rerooted =
-                request(dashboard_app(), "GET", &format!("/dashboard/{relative}")).await;
+            let rerooted = request(dashboard_app(), "GET", &format!("/dashboard/{relative}")).await;
             assert_eq!(rerooted.0, origin.0, "/dashboard/{relative}");
             assert_eq!(rerooted.1, origin.1, "/dashboard/{relative} bytes");
         }
@@ -3557,15 +3556,13 @@ mod tests {
         // from. A directory the export lays down and this host deliberately
         // does not serve, with the reason, is not a gap to be closed by
         // reflex — it is a decision that has to survive re-reading.
-        const DELIBERATELY_UNMOUNTED: &[(&str, &str)] = &[
-            (
-                "sponsors",
-                "1.0 MB of banner art the export ships and no document, chunk \
+        const DELIBERATELY_UNMOUNTED: &[(&str, &str)] = &[(
+            "sponsors",
+            "1.0 MB of banner art the export ships and no document, chunk \
                  or manifest references anywhere; serving it would add a \
                  megabyte-scale unauthenticated download to the admin origin \
                  for zero requests",
-            ),
-        ];
+        )];
 
         let mounted_trees: Vec<&str> = ORIGIN_ROOT_ASSET_TREES.iter().map(|t| t.dir).collect();
         // The first segment each route-table entry mounts, which is what
@@ -3609,7 +3606,10 @@ mod tests {
         // Every declared-unmounted entry is real, so the list cannot rot into
         // an excuse for a directory that has since been added and mounted.
         for (dir, reason) in DELIBERATELY_UNMOUNTED {
-            assert!(root.path().join(dir).is_dir(), "/{dir} is not in the export");
+            assert!(
+                root.path().join(dir).is_dir(),
+                "/{dir} is not in the export"
+            );
             assert!(reason.len() > 40, "/{dir} is declared dead with no reason");
             assert!(
                 !mounted_trees.contains(dir),
@@ -3713,7 +3713,10 @@ mod tests {
         // both: the list must not excuse a file that has since been mounted,
         // and must not declare dead something that is not there.
         for (file, reason) in DELIBERATELY_UNMOUNTED {
-            assert!(root.path().join(file).is_file(), "/{file} is not in the export");
+            assert!(
+                root.path().join(file).is_file(),
+                "/{file} is not in the export"
+            );
             assert!(reason.len() > 40, "/{file} is declared dead with no reason");
             assert!(
                 !MOUNTED_BY_HAND.contains(file),
@@ -3748,10 +3751,7 @@ mod tests {
                 status.is_client_error(),
                 "{uri} is in the build and was served: {status} {body:?}"
             );
-            assert!(
-                !body.contains(marker),
-                "{uri} leaked its content: {body:?}"
-            );
+            assert!(!body.contains(marker), "{uri} leaked its content: {body:?}");
             assert_eq!(
                 content_type(&headers),
                 Some("text/plain; charset=utf-8"),
@@ -4257,16 +4257,10 @@ mod tests {
             root.join("providers/to-chunk.svg"),
         )
         .unwrap();
-        std::os::unix::fs::symlink(
-            root.join("index.html"),
-            root.join("providers/to-shell.svg"),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink(
-            root.join("openapi.yaml"),
-            root.join("images/to-spec.svg"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(root.join("index.html"), root.join("providers/to-shell.svg"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.join("openapi.yaml"), root.join("images/to-spec.svg"))
+            .unwrap();
         // And one INSIDE both, which must be served — the check is
         // containment, not "is it a symlink".
         fs::write(root.join("providers/real.svg"), b"<svg id='real'/>").unwrap();

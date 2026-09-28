@@ -797,7 +797,10 @@ async fn preset_providers_serve_the_embedded_catalog_as_an_array() {
     );
     for row in scheme_rows {
         assert!(
-            !row["auth"]["scheme"].as_str().unwrap_or_default().is_empty(),
+            !row["auth"]["scheme"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty(),
             "an authorization_scheme preset must name the scheme: {row}"
         );
     }

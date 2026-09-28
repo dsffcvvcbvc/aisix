@@ -200,7 +200,7 @@ pub(crate) fn resolve_base_for(provider: &str, raw: &str) -> String {
         );
     }
     normalize_api_base(raw)
- }
+}
 
 impl Default for OpenAiBridge {
     fn default() -> Self {
@@ -467,9 +467,10 @@ fn credential_header(
         // `Authorization: Key <key>`, and its registry value `key` is the
         // scheme. Rendering it into a header literally called `key` would
         // put the secret where the vendor does not read it.
-        PresetAuth::AuthorizationScheme(scheme) => {
-            (header::AUTHORIZATION.as_str(), format!("{scheme} {api_key_str}"))
-        }
+        PresetAuth::AuthorizationScheme(scheme) => (
+            header::AUTHORIZATION.as_str(),
+            format!("{scheme} {api_key_str}"),
+        ),
         PresetAuth::None => return Ok(None),
     };
     let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
@@ -1882,11 +1883,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
                 .unwrap_or_else(|e| panic!("{provider} must authenticate via {declared}: {e:?}"));
 
             let sent = &server.received_requests().await.unwrap()[0];
-            let names: Vec<&str> = sent
-                .headers
-                .iter()
-                .map(|(name, _)| name.as_str())
-                .collect();
+            let names: Vec<&str> = sent.headers.iter().map(|(name, _)| name.as_str()).collect();
             assert!(
                 !names.contains(&"authorization"),
                 "{provider}: declared header {declared} is not a Bearer, so Authorization must \
@@ -1910,9 +1907,7 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
     /// — which is the outcome the catalog is written to prevent.
     #[tokio::test]
     async fn a_registry_auth_header_the_reference_ignores_on_chat_stays_bearer() {
-        for (provider, registry_header) in
-            [("haiper", "HAIPER_KEY"), ("ideogram", "Api-Key")]
-        {
+        for (provider, registry_header) in [("haiper", "HAIPER_KEY"), ("ideogram", "Api-Key")] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
@@ -1962,7 +1957,11 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
             .await;
 
         let bridge = OpenAiBridge::new();
-        let ctx = BridgeContext::new("req-1", sample_model(), pk_for_vendor(&server.uri(), "maritalk"));
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model(),
+            pk_for_vendor(&server.uri(), "maritalk"),
+        );
         bridge
             .chat(&req(), &ctx)
             .await

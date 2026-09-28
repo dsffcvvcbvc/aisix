@@ -36,67 +36,360 @@ type Expected = (
 );
 
 const SPOT_CHECK: &[Expected] = &[
-        ("agnes", "https://apihub.agnes-ai.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("aihorde", "https://oai.aihorde.net/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("alibaba", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("anyapi", "https://api.anyapi.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("baichuan", "https://api.baichuan-ai.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("baseten", "https://inference.baseten.co/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("chutes", "https://llm.chutes.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("cohere", "https://api.cohere.com/compatibility/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("cerebras", "https://api.cerebras.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("deepseek", "https://api.deepseek.com/chat/completions", PresetAuth::Bearer, &[]),
-        ("deepinfra", "https://api.deepinfra.com/v1/openai/chat/completions", PresetAuth::Bearer, &[]),
-        ("fireworks", "https://api.fireworks.ai/inference/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("groq", "https://api.groq.com/openai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("huggingface", "https://router.huggingface.co/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("hyperbolic", "https://api.hyperbolic.xyz/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("lambda-ai", "https://api.lambda.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("mistral", "https://api.mistral.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("modal", "https://api.modal.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("nebius", "https://api.tokenfactory.nebius.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("nvidia", "https://integrate.api.nvidia.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("novita", "https://api.novita.ai/openai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("openai", "https://api.openai.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("openrouter", "https://openrouter.ai/api/v1/chat/completions", PresetAuth::Bearer, &[("HTTP-Referer", "https://endpoint-proxy.local"), ("X-Title", "Endpoint Proxy")]),
-        ("perplexity", "https://api.perplexity.ai/chat/completions", PresetAuth::Bearer, &[]),
-        ("poolside", "https://inference.poolside.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("qwen-cloud", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("requesty", "https://router.requesty.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("sambanova", "https://api.sambanova.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("scaleway", "https://api.scaleway.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("together", "https://api.together.xyz/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("venice", "https://api.venice.ai/api/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("vercel-ai-gateway", "https://ai-gateway.vercel.sh/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("writer", "https://api.writer.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("xai", "https://api.x.ai/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("baidu", "https://qianfan.baidubce.com/v2/chat/completions", PresetAuth::Bearer, &[]),
-        ("qianfan", "https://qianfan.baidubce.com/v2/chat/completions", PresetAuth::Bearer, &[]),
-        ("tencent", "https://api.hunyuan.cloud.tencent.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("volcengine", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", PresetAuth::Bearer, &[]),
-        ("doubao", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", PresetAuth::Bearer, &[]),
-        ("siliconflow", "https://api.siliconflow.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("modelscope", "https://api-inference.modelscope.cn/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("ollama-cloud", "https://ollama.com/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("v0-vercel", "https://api.v0.dev/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("zenmux", "https://zenmux.ai/api/v1/chat/completions", PresetAuth::Bearer, &[]),
-        // `HAIPER_KEY` / `Api-Key` are the registry's `authHeader` values and
-        // the reference honours them — from its image/video handlers, never
-        // from a chat path, which Bearer-falls-back on both. See the
-        // `haiper` and `ideogram` rows in `presets.rs` and
-        // `bridge::tests::a_registry_auth_header_the_reference_ignores_on_chat_stays_bearer`.
-        ("haiper", "https://api.haiper.ai/v1", PresetAuth::Bearer, &[]),
-        ("ideogram", "https://api.ideogram.ai", PresetAuth::Bearer, &[]),
-        ("maritalk", "https://chat.maritaca.ai/api", PresetAuth::AuthorizationScheme("Key"), &[]),
-        ("pioneer", "https://api.pioneer.ai/v1/chat/completions", PresetAuth::ApiKeyHeader("x-api-key"), &[]),
-        ("uc-direct", "https://api.uncensored.com/api/v1", PresetAuth::ApiKeyHeader("x-api-key"), &[]),
-        ("api-airforce", "https://api.airforce/v1/chat/completions", PresetAuth::Bearer, &[("HTTP-Referer", "https://endpoint-proxy.local"), ("X-Title", "Endpoint Proxy")]),
-        ("orcarouter", "https://api.orcarouter.ai/v1/chat/completions", PresetAuth::Bearer, &[("HTTP-Referer", "https://endpoint-proxy.local"), ("X-Title", "Endpoint Proxy")]),
-        ("gitlawb", "https://opengateway.gitlawb.com/v1/xiaomi-mimo", PresetAuth::Bearer, &[("User-Agent", "OpenClaude/1.0 (linux; x86_64)"), ("X-Title", "OpenClaude CLI"), ("HTTP-Referer", "https://github.com/Gitlawb/openclaude")]),
-        ("navy", "https://api.navy/v1/chat/completions", PresetAuth::Bearer, &[("User-Agent", "OmniRoute/1.0")]),
-        ("routeway", "https://api.routeway.ai/v1/chat/completions", PresetAuth::Bearer, &[("User-Agent", "Mozilla/5.0 OmniRoute/1.0")]),
-        ("mlx-gemma", "http://localhost:11435/v1", PresetAuth::Bearer, &[]),
-        ("mlx-qwen", "http://localhost:11436/v1", PresetAuth::Bearer, &[]),
+    (
+        "agnes",
+        "https://apihub.agnes-ai.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "aihorde",
+        "https://oai.aihorde.net/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "alibaba",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "anyapi",
+        "https://api.anyapi.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "baichuan",
+        "https://api.baichuan-ai.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "baseten",
+        "https://inference.baseten.co/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "chutes",
+        "https://llm.chutes.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "cohere",
+        "https://api.cohere.com/compatibility/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "cerebras",
+        "https://api.cerebras.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "deepseek",
+        "https://api.deepseek.com/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "deepinfra",
+        "https://api.deepinfra.com/v1/openai/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "fireworks",
+        "https://api.fireworks.ai/inference/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "groq",
+        "https://api.groq.com/openai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "huggingface",
+        "https://router.huggingface.co/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "hyperbolic",
+        "https://api.hyperbolic.xyz/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "lambda-ai",
+        "https://api.lambda.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "mistral",
+        "https://api.mistral.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "modal",
+        "https://api.modal.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "nebius",
+        "https://api.tokenfactory.nebius.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "nvidia",
+        "https://integrate.api.nvidia.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "novita",
+        "https://api.novita.ai/openai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "openai",
+        "https://api.openai.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "openrouter",
+        "https://openrouter.ai/api/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[
+            ("HTTP-Referer", "https://endpoint-proxy.local"),
+            ("X-Title", "Endpoint Proxy"),
+        ],
+    ),
+    (
+        "perplexity",
+        "https://api.perplexity.ai/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "poolside",
+        "https://inference.poolside.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "qwen-cloud",
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "requesty",
+        "https://router.requesty.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "sambanova",
+        "https://api.sambanova.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "scaleway",
+        "https://api.scaleway.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "together",
+        "https://api.together.xyz/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "venice",
+        "https://api.venice.ai/api/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "vercel-ai-gateway",
+        "https://ai-gateway.vercel.sh/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "writer",
+        "https://api.writer.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "xai",
+        "https://api.x.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "baidu",
+        "https://qianfan.baidubce.com/v2/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "qianfan",
+        "https://qianfan.baidubce.com/v2/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "tencent",
+        "https://api.hunyuan.cloud.tencent.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "volcengine",
+        "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "doubao",
+        "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "siliconflow",
+        "https://api.siliconflow.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "modelscope",
+        "https://api-inference.modelscope.cn/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "ollama-cloud",
+        "https://ollama.com/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "v0-vercel",
+        "https://api.v0.dev/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "zenmux",
+        "https://zenmux.ai/api/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    // `HAIPER_KEY` / `Api-Key` are the registry's `authHeader` values and
+    // the reference honours them — from its image/video handlers, never
+    // from a chat path, which Bearer-falls-back on both. See the
+    // `haiper` and `ideogram` rows in `presets.rs` and
+    // `bridge::tests::a_registry_auth_header_the_reference_ignores_on_chat_stays_bearer`.
+    (
+        "haiper",
+        "https://api.haiper.ai/v1",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "ideogram",
+        "https://api.ideogram.ai",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "maritalk",
+        "https://chat.maritaca.ai/api",
+        PresetAuth::AuthorizationScheme("Key"),
+        &[],
+    ),
+    (
+        "pioneer",
+        "https://api.pioneer.ai/v1/chat/completions",
+        PresetAuth::ApiKeyHeader("x-api-key"),
+        &[],
+    ),
+    (
+        "uc-direct",
+        "https://api.uncensored.com/api/v1",
+        PresetAuth::ApiKeyHeader("x-api-key"),
+        &[],
+    ),
+    (
+        "api-airforce",
+        "https://api.airforce/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[
+            ("HTTP-Referer", "https://endpoint-proxy.local"),
+            ("X-Title", "Endpoint Proxy"),
+        ],
+    ),
+    (
+        "orcarouter",
+        "https://api.orcarouter.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[
+            ("HTTP-Referer", "https://endpoint-proxy.local"),
+            ("X-Title", "Endpoint Proxy"),
+        ],
+    ),
+    (
+        "gitlawb",
+        "https://opengateway.gitlawb.com/v1/xiaomi-mimo",
+        PresetAuth::Bearer,
+        &[
+            ("User-Agent", "OpenClaude/1.0 (linux; x86_64)"),
+            ("X-Title", "OpenClaude CLI"),
+            ("HTTP-Referer", "https://github.com/Gitlawb/openclaude"),
+        ],
+    ),
+    (
+        "navy",
+        "https://api.navy/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[("User-Agent", "OmniRoute/1.0")],
+    ),
+    (
+        "routeway",
+        "https://api.routeway.ai/v1/chat/completions",
+        PresetAuth::Bearer,
+        &[("User-Agent", "Mozilla/5.0 OmniRoute/1.0")],
+    ),
+    (
+        "mlx-gemma",
+        "http://localhost:11435/v1",
+        PresetAuth::Bearer,
+        &[],
+    ),
+    (
+        "mlx-qwen",
+        "http://localhost:11436/v1",
+        PresetAuth::Bearer,
+        &[],
+    ),
 ];
 
 /// `(alias, canonical_id)` from the same registry entries.
@@ -601,8 +894,7 @@ fn the_excluded_classes_are_still_excluded() {
     // claims, so the documented arithmetic cannot drift from them.
     let excluded: usize = EXCLUDED_IDS.iter().map(|(_, ids)| ids.len()).sum();
     assert_eq!(
-        excluded,
-        73,
+        excluded, 73,
         "the exclusion classes no longer sum to the 73 the module docs subtract"
     );
     assert_eq!(
@@ -721,8 +1013,7 @@ fn every_row_dispatches_to_its_own_base_url() {
         );
     }
     for id in BASE_URL_ROWS {
-        let p = find_preset(id)
-            .unwrap_or_else(|| panic!("BASE_URL_ROWS names unknown id {id:?}"));
+        let p = find_preset(id).unwrap_or_else(|| panic!("BASE_URL_ROWS names unknown id {id:?}"));
         assert_ne!(
             format!(
                 "{}/chat/completions",

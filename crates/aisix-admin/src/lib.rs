@@ -918,10 +918,7 @@ mod tests {
         for tree in resources_handler::ORIGIN_ROOT_ASSET_TREES {
             let first = tree.dir;
             for (segment, owns) in reserved {
-                assert_ne!(
-                    first, segment,
-                    "the asset tree {first} would take {owns}"
-                );
+                assert_ne!(first, segment, "the asset tree {first} would take {owns}");
             }
             for derived in [
                 format!("/{first}"),
