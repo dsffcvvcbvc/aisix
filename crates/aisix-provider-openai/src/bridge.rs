@@ -7,8 +7,9 @@
 //!
 //! Transport layer:
 //! - `reqwest::Client` is shared across requests (connection reuse).
-//! - `Authorization: Bearer <api_key>` sourced from the
-//!   [`aisix_core::Model`]'s `provider_config`.
+//! - the credential in the header the vendor's preset declares
+//!   (`Authorization: Bearer <api_key>` unless [`PresetAuth`] says
+//!   otherwise) sourced from the [`aisix_core::ProviderKey`]'s `api_key`.
 //! - Timeout comes from `BridgeContext::deadline` when present;
 //!   otherwise the request runs to completion.
 //!
@@ -42,6 +43,7 @@ use crate::overrides::{
     apply_param_renames, apply_stream_done_marker_policy, extract_reasoning_field,
     StreamDoneOutcome,
 };
+use crate::presets::{find_preset, PresetAuth};
 use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
@@ -177,16 +179,28 @@ impl OpenAiBridge {
                 return Ok(OPENAI_DEFAULT_BASE.to_string());
             }
         };
-        if crate::cohere::is_cohere(&ctx.provider_key.provider) {
-            return Ok(format!(
-                "{}{}",
-                crate::cohere::api_root(strip_known_endpoint(&raw)),
-                crate::cohere::COMPATIBILITY_PATH
-            ));
-        }
-        Ok(normalize_api_base(&raw))
+        Ok(resolve_base_for(&ctx.provider_key.provider, &raw))
     }
 }
+
+/// The base URL the family bridge extends with an operation path, for a
+/// Provider Key that HAS an `api_base` — i.e. [`OpenAiBridge::resolve_base`]
+/// without the ProviderKey context and without the empty-`api_base` guard.
+///
+/// Split out so `presets_tests` can hold the catalog's `base_url` promise
+/// against the code that has to honour it, rather than against a
+/// restatement of the rule in a test. `resolve_base` really does delegate
+/// here, so the two cannot drift.
+pub(crate) fn resolve_base_for(provider: &str, raw: &str) -> String {
+    if crate::cohere::is_cohere(provider) {
+        return format!(
+            "{}{}",
+            crate::cohere::api_root(strip_known_endpoint(raw)),
+            crate::cohere::COMPATIBILITY_PATH
+        );
+    }
+    normalize_api_base(raw)
+ }
 
 impl Default for OpenAiBridge {
     fn default() -> Self {
@@ -414,7 +428,64 @@ pub fn close_strict_response_format_schema(body: &mut Value) {
     }
 }
 
-/// Build the base outbound `HeaderMap` (Authorization, Content-Type,
+/// The credential shape to use for a Provider Key's `provider` vendor id.
+///
+/// A catalogued vendor declares the header its key belongs in; the family
+/// bridge applies it. A vendor with no catalog row keeps the OpenAI default,
+/// which is the shape every hand-written OpenAI-compatible upstream uses.
+///
+/// This is the same lookup `aisix_proxy::dispatch::resolve_bridge` makes
+/// when it decides a catalogued vendor needs no dedicated bridge — the
+/// membership test and the auth shape are two halves of one fact about the
+/// vendor, and reading the row is what stops the declared shape from being
+/// published and then dropped on the floor.
+fn preset_auth(provider: &str) -> PresetAuth {
+    find_preset(provider).map_or(PresetAuth::Bearer, |preset| preset.auth)
+}
+
+/// The credential header a preset vendor expects, ready to insert — or
+/// `None` when the vendor takes no credential.
+///
+/// `api_key_str` has already been validated as a header value by [`api_key`],
+/// so only the *shape* can still fail, and it fails on a constant compiled
+/// into the catalog rather than on operator input. It is reported as a
+/// config error rather than `unreachable!()` anyway: a panic in the request
+/// path is the wrong answer to any future edit of the table, and
+/// `presets_tests::a_non_bearer_auth_shape_is_a_valid_header_name` holds the
+/// table to shapes that can be built at all.
+fn credential_header(
+    auth: PresetAuth,
+    api_key_str: &str,
+) -> Result<Option<(HeaderName, HeaderValue)>, BridgeError> {
+    let (name, value) = match auth {
+        PresetAuth::Bearer => (
+            header::AUTHORIZATION.as_str(),
+            format!("Bearer {api_key_str}"),
+        ),
+        PresetAuth::ApiKeyHeader(name) => (name, api_key_str.to_string()),
+        // A scheme name, not a header name: `maritalk` authenticates with
+        // `Authorization: Key <key>`, and its registry value `key` is the
+        // scheme. Rendering it into a header literally called `key` would
+        // put the secret where the vendor does not read it.
+        PresetAuth::AuthorizationScheme(scheme) => {
+            (header::AUTHORIZATION.as_str(), format!("{scheme} {api_key_str}"))
+        }
+        PresetAuth::None => return Ok(None),
+    };
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+        BridgeError::InvalidUpstreamConfig(format!(
+            "catalog preset names {name:?}, which is not a valid header name: {e}"
+        ))
+    })?;
+    let value = HeaderValue::from_str(&value).map_err(|e| {
+        BridgeError::InvalidUpstreamCredentials(format!(
+            "api key contains invalid header chars: {e}"
+        ))
+    })?;
+    Ok(Some((name, value)))
+}
+
+/// Build the base outbound `HeaderMap` (the credential, Content-Type,
 /// x-aisix-request-id, and optionally Accept: text/event-stream
 /// for streaming calls), then merge any `default_headers` the PK carries.
 /// Bridge-owned headers are inserted before the merge, which is what makes
@@ -433,18 +504,16 @@ pub fn close_strict_response_format_schema(body: &mut Value) {
 /// read it, and the original #368 catch-Hub-typo motivation became
 /// untestable for the family-keyed providers.
 fn build_request_headers(
+    auth: PresetAuth,
     api_key_str: &str,
     request_id: &str,
     sse: bool,
     hdr: &UpstreamHeaderContext<'_>,
 ) -> Result<HeaderMap, BridgeError> {
     let mut headers = HeaderMap::new();
-    let auth = HeaderValue::from_str(&format!("Bearer {api_key_str}")).map_err(|e| {
-        BridgeError::InvalidUpstreamCredentials(format!(
-            "api key contains invalid header chars: {e}"
-        ))
-    })?;
-    headers.insert(header::AUTHORIZATION, auth);
+    if let Some((name, value)) = credential_header(auth, api_key_str)? {
+        headers.insert(name, value);
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
@@ -489,7 +558,13 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
+        let headers = build_request_headers(
+            preset_auth(&ctx.provider_key.provider),
+            key,
+            &ctx.request_id,
+            false,
+            &ctx.header_ctx(),
+        )?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/chat",
@@ -543,7 +618,13 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
+        let headers = build_request_headers(
+            preset_auth(&ctx.provider_key.provider),
+            key,
+            &ctx.request_id,
+            false,
+            &ctx.header_ctx(),
+        )?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/embeddings",
@@ -602,7 +683,13 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
+        let headers = build_request_headers(
+            preset_auth(&ctx.provider_key.provider),
+            key,
+            &ctx.request_id,
+            false,
+            &ctx.header_ctx(),
+        )?;
 
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -660,7 +747,13 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(key, &ctx.request_id, false, &ctx.header_ctx())?;
+        let headers = build_request_headers(
+            preset_auth(&ctx.provider_key.provider),
+            key,
+            &ctx.request_id,
+            false,
+            &ctx.header_ctx(),
+        )?;
 
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
@@ -710,7 +803,13 @@ impl Bridge for OpenAiBridge {
             ctx.provider_key.request.as_ref(),
             ctx.provider_key.response.as_ref(),
         )?;
-        let headers = build_request_headers(key, &ctx.request_id, true, &ctx.header_ctx())?;
+        let headers = build_request_headers(
+            preset_auth(&ctx.provider_key.provider),
+            key,
+            &ctx.request_id,
+            true,
+            &ctx.header_ctx(),
+        )?;
         let url = cached_endpoint_url(
             &ctx.provider_key_id,
             "openai/chat",
@@ -1746,6 +1845,183 @@ data: {\"error\":{\"message\":\"The server had an error processing your request\
             }],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
         })
+    }
+
+    fn pk_for_vendor(base: &str, provider: &str) -> Arc<ProviderKey> {
+        let cfg = format!(
+            r#"{{"display_name": "{provider}-prod", "secret": "sk-test", "api_base": "{base}", "provider": "{provider}"}}"#
+        );
+        Arc::new(serde_json::from_str(&cfg).unwrap())
+    }
+
+    /// The catalog's declared auth shape reaches the wire, and the
+    /// `Authorization: Bearer` that every uncatalogued vendor gets is
+    /// genuinely absent — the matcher only passes on the declared header, and
+    /// the recorded request is then read back so a header that arrived in
+    /// ADDITION to the declared one still fails here.
+    #[tokio::test]
+    async fn a_catalogued_vendor_sends_its_key_in_its_declared_header() {
+        for (provider, declared) in [("pioneer", "x-api-key"), ("uc-direct", "x-api-key")] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(header(declared, "sk-test"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+                .mount(&server)
+                .await;
+
+            let bridge = OpenAiBridge::new();
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model(),
+                pk_for_vendor(&server.uri(), provider),
+            );
+            bridge
+                .chat(&req(), &ctx)
+                .await
+                .unwrap_or_else(|e| panic!("{provider} must authenticate via {declared}: {e:?}"));
+
+            let sent = &server.received_requests().await.unwrap()[0];
+            let names: Vec<&str> = sent
+                .headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert!(
+                !names.contains(&"authorization"),
+                "{provider}: declared header {declared} is not a Bearer, so Authorization must \
+                 be absent; sent {names:?}"
+            );
+        }
+    }
+
+    /// A registry `authHeader` the reference does not honour on the chat
+    /// surface is `Bearer`, and this pins that for the two rows it covers.
+    ///
+    /// `haiper`'s `HAIPER_KEY` and `ideogram`'s `Api-Key` name those vendors'
+    /// IMAGE and VIDEO apis — the reference sends them from
+    /// `handlers/imageGeneration/providers/{haiper,ideogram}.ts` and
+    /// `handlers/videoGeneration.ts` — while BOTH of its chat-surface auth
+    /// builders (`executors/default.ts`, `services/provider.ts`) recognise
+    /// only `x-api-key`, `key` and `x-goog-api-key` by name and
+    /// Bearer-fall-back on everything else. The mock here matches on
+    /// `Authorization: Bearer` and nothing else, so a bridge that rendered
+    /// the registry string literally gets no matching request and fails here
+    /// — which is the outcome the catalog is written to prevent.
+    #[tokio::test]
+    async fn a_registry_auth_header_the_reference_ignores_on_chat_stays_bearer() {
+        for (provider, registry_header) in
+            [("haiper", "HAIPER_KEY"), ("ideogram", "Api-Key")]
+        {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .and(header("authorization", "Bearer sk-test"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+                .mount(&server)
+                .await;
+
+            let bridge = OpenAiBridge::new();
+            let ctx = BridgeContext::new(
+                "req-1",
+                sample_model(),
+                pk_for_vendor(&server.uri(), provider),
+            );
+            bridge.chat(&req(), &ctx).await.unwrap_or_else(|e| {
+                panic!("{provider} must authenticate as Bearer, not via {registry_header}: {e:?}")
+            });
+
+            let sent = &server.received_requests().await.unwrap()[0];
+            let leaked: Vec<&str> = sent
+                .headers
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .filter(|name| name.eq_ignore_ascii_case(registry_header))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "{provider}: the secret must not also go out in {registry_header}, which names \
+                 an image/video credential the chat path never sends"
+            );
+        }
+    }
+
+    /// `maritalk`'s registry `authHeader` is `key`, which is an Authorization
+    /// SCHEME, not a header name. Rendering it literally would put the secret
+    /// in a header called `key` that the vendor never reads — so the wire
+    /// contract is `Authorization: Key <key>`, matching
+    /// `open-sse/executors/default.ts`'s hard-coded `case "maritalk"`.
+    #[tokio::test]
+    async fn maritalk_renders_its_registry_value_as_an_authorization_scheme() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Key sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = BridgeContext::new("req-1", sample_model(), pk_for_vendor(&server.uri(), "maritalk"));
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("maritalk must authenticate with the Key scheme");
+
+        let sent = &server.received_requests().await.unwrap()[0];
+        assert!(
+            !sent.headers.contains_key("key"),
+            "maritalk's registry value is a scheme, not a header name; the secret must not go \
+             out in a header called `key`"
+        );
+    }
+
+    /// A vendor the catalog does not carry keeps the OpenAI default. This is
+    /// the other half of the previous two: without it, "the declared header
+    /// went out" would also be true of a bridge that sent every key in
+    /// `Authorization` and happened to be pointed at a mock that did not
+    /// check.
+    #[tokio::test]
+    async fn a_vendor_outside_the_catalog_keeps_the_bearer_default() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = BridgeContext::new(
+            "req-1",
+            sample_model(),
+            pk_for_vendor(&server.uri(), "some-hand-written-gateway"),
+        );
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("an uncatalogued vendor is Bearer");
+    }
+
+    /// The alias table is a second spelling of a catalogued vendor, so it has
+    /// to resolve to the same auth shape. `pn` is `pioneer`, an `x-api-key`
+    /// vendor; a key stored under the legacy id must not fall back to Bearer.
+    #[tokio::test]
+    async fn a_legacy_alias_resolves_to_its_canonical_auth_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(header("x-api-key", "sk-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_chat_response()))
+            .mount(&server)
+            .await;
+
+        let bridge = OpenAiBridge::new();
+        let ctx = BridgeContext::new("req-1", sample_model(), pk_for_vendor(&server.uri(), "pn"));
+        bridge
+            .chat(&req(), &ctx)
+            .await
+            .expect("the alias must resolve to pioneer's x-api-key shape");
     }
 
     /// `param_renames` must rewrite the outbound body key. Build a

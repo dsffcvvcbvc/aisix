@@ -5,7 +5,8 @@
 //! executor. This table carries the three facts a dashboard needs to onboard
 //! such a vendor, and nothing else:
 //!
-//! 1. the canonical `base_url`,
+//! 1. the canonical `base_url` (see `PresetProvider::base_url` for the two
+//!    forms it may take),
 //! 2. the *shape* of the auth header (never the credential itself),
 //! 3. any static non-secret headers the vendor requires on every request.
 //!
@@ -19,7 +20,7 @@
 //!
 //! `base_url`/`auth`/`headers` describe an endpoint that answers a normal
 //! OpenAI chat request over HTTP(S) with the caller's own API key. That
-//! excludes four classes, each for a concrete reason rather than by taste:
+//! excludes six classes, each for a concrete reason rather than by taste:
 //!
 //! * **Web scrapers** — `chatgpt-web`, `grok-web`, `tinycms-web`, the
 //!   cookie-auth entries (`udio`, `hyperagent`, `zenmux-free`), and the
@@ -52,6 +53,35 @@
 //!   Chromium driving a `cf_agent` WebSocket), `uc` (a Clerk-JWT socket
 //!   minted from a browser login) and `promptql` (a reverse-engineered
 //!   GraphQL playground endpoint).
+//! * **Endpoints the OpenAI family bridge cannot reach** — six rows, for
+//!   two provable reasons, and in both the family bridge would build a URL
+//!   the reference never builds for that vendor:
+//!
+//!   1. the row's `base_url` already ends in an operation the bridge does
+//!      not know, so extending it doubles the path — `muse-code`
+//!      (`…/v1/responses`, a Responses-API endpoint), `oneminai`
+//!      (`…/api/chat-with-ai`, which the registry itself documents as a
+//!      non-OpenAI wire format — a single `promptObject.prompt` string and
+//!      `event:`/`data:` SSE framing — behind a translating executor),
+//!      `inner-ai` (`…/chat`, plus a dedicated `inner-ai` executor in the
+//!      reference) and `free-ai` (`…/v1/chat/`). `strip_known_endpoint`
+//!      knows the seven OpenAI operations and no others, so these dispatch
+//!      to `…/responses/chat/completions`, `…/chat-with-ai/chat/completions`
+//!      or `…/chat/chat/completions`.
+//!   2. the reference reaches the vendor on a path the bridge cannot
+//!      produce at all — `command-code` (registry `chatPath:
+//!      "/provider/v1/chat/completions"`, and `executors/commandCode.ts`
+//!      appends it to the base) and `nlpcloud`
+//!      (`executors/nlpcloud.ts` builds `<base>/<model>/chatbot`, which is
+//!      model-scoped and not an OpenAI operation). For both, `<base_url>/
+//!      chat/completions` is a URL the reference does not request.
+//!
+//!   The class is a *bridge-capability* limit, not a judgement about the
+//!   vendor: `cohere` shows the shape that IS expressible (a base the bridge
+//!   rewrites before extending it, see `crate::cohere`), and a row like
+//!   these becomes onboardable again the day the bridge learns the vendor's
+//!   operation. `presets_tests::every_row_dispatches_to_its_own_base_url`
+//!   is what keeps the class from rotting in either direction.
 //!
 //! **Non-OpenAI wire formats** are excluded on the same grounds: the
 //! entries whose registry `format` is `claude` (`anthropic`, `agentrouter`,
@@ -66,11 +96,11 @@
 //! the table already carries under `kimi` and `moonshot`. It is a model
 //! tier, not a vendor.
 //!
-//! # Reconciling the count — 190, and why
+//! # Reconciling the count — 184, and why
 //!
 //! An architecture spec claimed **216** "standard REST providers" (78% of
-//! a claimed 274 total). The table here is **190**, and 190 is the correct
-//! number; the 216 is a stale snapshot, not 26 missing vendors. Reproduced
+//! a claimed 274 total). The table here is **184**, and 184 is the correct
+//! number; the 216 is a stale snapshot, not 32 missing vendors. Reproduced
 //! against the source registry (`open-sse/config/providers/registry/*/index.ts`)
 //! at the time of writing:
 //!
@@ -83,16 +113,36 @@
 //!   less non-OpenAI wire formats                      -11
 //!   less oauth-only upstreams                         -6
 //!   less non-REST or non-callable `base_url`          -7
+//!   less endpoints the family bridge cannot reach     -6
 //!   less a second id for an endpoint already listed   -1
 //!                                                    -----
-//! PRESET_PROVIDERS                                    190
+//! PRESET_PROVIDERS                                    184
 //! ```
+//!
+//! `184 = 257 − 73`, and `presets_tests::the_excluded_classes_are_still_
+//! excluded` asserts the classes sum to exactly 73, so this arithmetic and
+//! the guarded set cannot drift apart.
+//!
+//! The classes that moved, and why, are settled by the source registry's
+//! own text rather than by a re-run judgement:
+//!
+//! * **endpoints the family bridge cannot reach is new**, and holds six
+//!   rows: `muse-code`, `oneminai`, `inner-ai` and `free-ai` because their
+//!   `base_url` ends in a path segment outside the seven OpenAI operations
+//!   the bridge knows, plus `command-code` and `nlpcloud` because the
+//!   reference reaches them on a path the bridge cannot produce at all (see
+//!   the scope bullet above).
+//!   `presets_tests::every_row_dispatches_to_its_own_base_url` is what makes
+//!   the class mechanical rather than a comment: a row that would be
+//!   extended into a URL its vendor does not serve fails that test, and a
+//!   row that *is* expressible fails the `EXCLUDED_IDS` guard, so neither
+//!   side of the class can rot.
 //!
 //! Three facts make the 216 unreproducible rather than merely optimistic:
 //!
-//! * **The set is closed.** Every one of the 190 ids is a registry entry
+//! * **The set is closed.** Every one of the 184 ids is a registry entry
 //!   id, and the registry contributes nothing that is not accounted for
-//!   above — so there is no pool of 26 un-added vendors to draw from. A
+//!   above — so there is no pool of 32 un-added vendors to draw from. A
 //!   count larger than its source is not a count of a subset.
 //! * **The source has moved.** The registry the 216 was measured against
 //!   predates the current one; the same spec's total-provider figure is
@@ -118,7 +168,7 @@
 //! # Lookup
 //!
 //! [`find_preset`] is case-insensitive and also resolves the legacy short
-//! aliases vendors were registered under (67 of them, in
+//! aliases vendors were registered under (62 of them, in
 //! [`PRESET_ALIASES`]) so an old config or a copied `model` string keeps
 //! resolving. It is a linear scan: the table is a few hundred short strings,
 //! this is a dashboard/selection path rather than a per-token hot path, and a
@@ -131,32 +181,54 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresetAuth {
     /// `Authorization: Bearer <key>`. The default OpenAI-compatible shape,
-    /// and what 184 of the 190 `PRESET_PROVIDERS` entries use.
+    /// and what 181 of the 184 `PRESET_PROVIDERS` entries use.
+    ///
+    /// A registry `authHeader` this table does NOT spell literally falls
+    /// here, and that is the reference's own rule rather than a second
+    /// opinion about the vendor: `open-sse/executors/default.ts` and
+    /// `open-sse/services/provider.ts` — the two independent places the
+    /// reference builds chat-surface auth from a registry entry — honour
+    /// `x-api-key`, `key` and `x-goog-api-key` by name and
+    /// **Bearer-fall-back on everything else**. `haiper`'s `HAIPER_KEY` and
+    /// `ideogram`'s `Api-Key` are honoured only by the reference's image and
+    /// video generation handlers, never by a chat path, so a chat row that
+    /// declared them would promise a header nothing sends.
     Bearer,
-    /// The key does not go out as `Authorization: Bearer`. The payload is the
-    /// source registry's `authHeader` recorded verbatim, which is one of
-    /// two things:
+    /// The key goes out in a header that is **not** `Authorization: Bearer`:
+    /// `<name>: <key>`. The payload is a header NAME, which is why it
+    /// cannot share a variant with [`PresetAuth::AuthorizationScheme`].
     ///
-    /// * a **header name** — `x-api-key`, `Api-Key`, `api-key`, or a
-    ///   vendor-unique one like `HAIPER_KEY`; the key replaces the
-    ///   credential in that header.
-    /// * an **`Authorization` scheme name** for a vendor that authenticates
-    ///   with something other than Bearer. There is exactly one such entry,
-    ///   `maritalk`, whose registry value is `key` — the upstream expects
-    ///   `Authorization: Key <key>`, so render the payload into
-    ///   `Authorization` rather than into a header of that name.
-    ///
-    /// Six of the 190 entries need this; the other 184 are `Bearer`.
+    /// Exactly two of the 184 entries need this — `pioneer` and
+    /// `uc-direct`, both `x-api-key` — and both are cases where the
+    /// reference's generic arm agrees, because the registry value *is* one
+    /// of the two names that arm honours. Each vendor's own registry
+    /// comment says the same in prose (`pioneer`: "Bearer also accepted
+    /// upstream"; `uc-direct`: "NOT Bearer").
     ApiKeyHeader(&'static str),
+    /// The key goes out in `Authorization` under a scheme that is **not**
+    /// `Bearer`: `Authorization: <scheme> <key>`. The payload is a scheme
+    /// name, NOT a header name.
+    ///
+    /// There is exactly one such entry, `maritalk`, whose registry value is
+    /// `key` — the upstream expects `Authorization: Key <key>`. BOTH of the
+    /// reference's chat-surface auth builders make the same distinction:
+    /// `executors/default.ts` with a hard-coded per-vendor case (`case
+    /// "maritalk": headers["Authorization"] = \`Key ${token}\`;`) and
+    /// `services/provider.ts` generically (`else if (authHeader === "key")
+    /// headers["Authorization"] = \`Key ${token}\`;`). Merging the two shapes
+    /// back into one variant loses exactly that fact: a consumer that
+    /// honours `ApiKeyHeader("key")` literally puts the secret in a header
+    /// named `key`, which the vendor does not read.
+    AuthorizationScheme(&'static str),
     /// No credential is sent. Unused by the current table — see the module
     /// docs — but part of the contract so keyless local servers can be
     /// onboarded without another breaking change.
     None,
 }
 
-// The table below is 190 rows; spelling the common shapes in short keeps it
+// The table below is 184 rows; spelling the common shapes in short keeps it
 // scannable and diffable.
-use PresetAuth::{ApiKeyHeader, Bearer};
+use PresetAuth::{ApiKeyHeader, AuthorizationScheme, Bearer};
 
 /// A vendor whose upstream is a plain OpenAI-shaped REST endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,10 +238,40 @@ pub struct PresetProvider {
     pub id: &'static str,
     /// Human label for provider pickers.
     pub display_name: &'static str,
-    /// Canonical upstream base URL, byte-identical to the source registry
-    /// entry. Point the connection's `api_base` at this.
+    /// **The rule: `base_url` is a BASE.** Point the connection's `api_base`
+    /// at it and the OpenAI family bridge appends `/chat/completions` to
+    /// reach the vendor's chat endpoint.
+    ///
+    /// A full endpoint is *tolerated* on the way in, not published as the
+    /// contract: the bridge's `strip_known_endpoint` removes a known OpenAI
+    /// operation (`/chat/completions`, `/embeddings`, …) before extending,
+    /// so `https://api.openai.com/v1/chat/completions` and
+    /// `https://api.openai.com/v1` both dispatch to the same place. The
+    /// reference draws the same line in the same words, with
+    /// `stripTrailingSlashes(...).replace(/\/chat\/(?:completions|inference)$/,
+    /// "")` before re-appending — see `open-sse/config/maritalk.ts`'s
+    /// `normalizeMaritalkBaseUrl` / `buildMaritalkChatUrl`, and
+    /// `open-sse/executors/default/urlNormalizers.ts`'s
+    /// `normalizeXiaomiMimoChatUrl`.
+    ///
+    /// Because the source registry spells the field inconsistently — 169 of
+    /// these rows are the full endpoint and 15 are a base, both taken
+    /// byte-identical from `open-sse/config/providers/registry/*/index.ts` —
+    /// `presets_tests::BASE_URL_ROWS` names the base-form rows explicitly
+    /// and `every_row_dispatches_to_its_own_base_url` holds both forms
+    /// against `bridge::resolve_base_for` itself.
+    ///
+    /// What is NOT a valid `base_url` is a path whose trailing segment
+    /// already names a different operation (`/v1/responses`, `/chat`,
+    /// `/api/chat-with-ai`) or a chat path the bridge cannot produce at all
+    /// (`command-code`'s `/provider/v1/chat/completions`, `nlpcloud`'s
+    /// `/<model>/chatbot`): extending such a row yields a URL the vendor
+    /// does not serve. Those vendors are in the
+    /// *endpoints the OpenAI family bridge cannot reach* exclusion class.
+    /// Cohere shows the shape that IS expressible: a base the bridge
+    /// rewrites before extending it (`crate::cohere`).
     pub base_url: &'static str,
-    /// Which header carries the credential.
+    /// Which header carries the credential — see [`PresetAuth`].
     pub auth: PresetAuth,
     /// Static non-secret headers every request to this vendor must carry,
     /// e.g. `HTTP-Referer`/`X-Title` for OpenRouter. Empty when the
@@ -227,7 +329,6 @@ pub const PRESET_PROVIDERS: &[PresetProvider] = &[
     preset("cloudcode-one", "Cloudcode One", "https://api.cloudcode.one/v1/chat/completions", Bearer, &[]),
     preset("codestral", "Codestral", "https://codestral.mistral.ai/v1/chat/completions", Bearer, &[]),
     preset("cohere", "Cohere", "https://api.cohere.com/compatibility/v1/chat/completions", Bearer, &[]),
-    preset("command-code", "Command Code", "https://api.commandcode.ai", Bearer, &[]),
     preset("coze", "Coze", "https://api.coze.com/v1/chat/completions", Bearer, &[]),
     preset("crof", "Crof", "https://crof.ai/v1/chat/completions", Bearer, &[]),
     preset("dahl", "Dahl", "https://inference.dahl.global/v1/chat/completions", Bearer, &[]),
@@ -245,7 +346,6 @@ pub const PRESET_PROVIDERS: &[PresetProvider] = &[
     preset("fastrouter", "Fastrouter", "https://api.fastrouter.ai/api/v1/chat/completions", Bearer, &[]),
     preset("featherless-ai", "Featherless AI", "https://api.featherless.ai/v1/chat/completions", Bearer, &[]),
     preset("fireworks", "Fireworks", "https://api.fireworks.ai/inference/v1/chat/completions", Bearer, &[]),
-    preset("free-ai", "Free.ai", "https://api.free.ai/v1/chat/", Bearer, &[]),
     preset("freeaiapikey", "FreeAI API Key", "https://api.freeaiapikey.com/v1/chat/completions", Bearer, &[]),
     preset("freebuff", "Codebuff Free", "https://www.codebuff.com/api/v1", Bearer, &[]),
     preset("freeinference", "Freeinference", "https://freeinference.org/v1/chat/completions", Bearer, &[]),
@@ -263,18 +363,29 @@ pub const PRESET_PROVIDERS: &[PresetProvider] = &[
     preset("glm", "GLM", "https://api.z.ai/api/coding/paas/v4/chat/completions", Bearer, &[]),
     preset("greenpt", "GreenPT", "https://api.greenpt.ai/v1/chat/completions", Bearer, &[]),
     preset("groq", "Groq", "https://api.groq.com/openai/v1/chat/completions", Bearer, &[]),
-    preset("haiper", "Haiper", "https://api.haiper.ai/v1", ApiKeyHeader("HAIPER_KEY"), &[]),
+    // `HAIPER_KEY` is the registry's `authHeader`, but it names the vendor's
+    // IMAGE/VIDEO api, not its chat surface: the reference sends the key in
+    // `HAIPER_KEY` from `handlers/imageGeneration/providers/haiper.ts` and
+    // `handlers/videoGeneration.ts`, and its chat executor
+    // (`executors/default.ts`, `services/provider.ts`) honours only
+    // `x-api-key` / `x-goog-api-key` and Bearer-falls-back on everything
+    // else. Recording the header here would promise the operator something
+    // no chat path in either implementation ever sends.
+    preset("haiper", "Haiper", "https://api.haiper.ai/v1", Bearer, &[]),
     preset("hcnsec", "HCNSEC", "https://api.hcnsec.cn/v1/chat/completions", Bearer, &[]),
     preset("helixmind", "HelixMind", "https://helixmind.online/v1/chat/completions", Bearer, &[]),
     preset("helyxai", "HelyxAI", "https://helyxai.space/v1/chat/completions", Bearer, &[]),
     preset("heroku", "Heroku", "https://us.inference.heroku.com/v1/chat/completions", Bearer, &[]),
     preset("huggingface", "Hugging Face", "https://router.huggingface.co/v1/chat/completions", Bearer, &[]),
     preset("hyperbolic", "Hyperbolic", "https://api.hyperbolic.xyz/v1/chat/completions", Bearer, &[]),
-    preset("ideogram", "Ideogram", "https://api.ideogram.ai", ApiKeyHeader("Api-Key"), &[]),
+    // `Api-Key` is the same story as `haiper`'s `HAIPER_KEY`: the reference
+    // sends it from `handlers/imageGeneration/providers/ideogram.ts`, and
+    // both of its chat-surface auth builders Bearer-fall-back on it. See the
+    // `haiper` row.
+    preset("ideogram", "Ideogram", "https://api.ideogram.ai", Bearer, &[]),
     preset("iflytek", "iFlytek", "https://spark-api-open.xf-yun.com/v1/chat/completions", Bearer, &[]),
     preset("inception", "Inception", "https://api.inceptionlabs.ai/v1/chat/completions", Bearer, &[]),
     preset("inference-net", "Inference Net", "https://api.inference.net/v1/chat/completions", Bearer, &[]),
-    preset("inner-ai", "Inner AI", "https://chatapi.innerai.com/chat", Bearer, &[]),
     preset("internlm", "InternLM", "https://chat.intern-ai.org.cn/api/v1/chat/completions", Bearer, &[]),
     preset("kenari", "Kenari", "https://kenari.id/v1/chat/completions", Bearer, &[]),
     preset("kie", "Kie.ai", "https://api.kie.ai/v1/chat/completions", Bearer, &[]),
@@ -291,7 +402,7 @@ pub const PRESET_PROVIDERS: &[PresetProvider] = &[
     preset("logfare", "Logfare", "https://logfare.ai/v1/chat/completions", Bearer, &[]),
     preset("longcat", "LongCat", "https://api.longcat.chat/openai/v1/chat/completions", Bearer, &[]),
     preset("lyceum", "Lyceum", "https://api.lyceum.technology/openai/v1/chat/completions", Bearer, &[]),
-    preset("maritalk", "Maritalk", "https://chat.maritaca.ai/api", ApiKeyHeader("key"), &[]),
+    preset("maritalk", "Maritalk", "https://chat.maritaca.ai/api", AuthorizationScheme("Key"), &[]),
     preset("meganova-ai", "MegaNova AI", "https://api.meganova.ai/v1/chat/completions", Bearer, &[]),
     preset("meta-llama", "Meta Llama", "https://api.llama.com/compat/v1/chat/completions", Bearer, &[]),
     preset("minimax", "MiniMax", "https://api.minimax.io/v1/chat/completions", Bearer, &[]),
@@ -305,14 +416,12 @@ pub const PRESET_PROVIDERS: &[PresetProvider] = &[
     preset("monsterapi", "MonsterAPI", "https://api.monsterapi.ai/v1/chat/completions", Bearer, &[]),
     preset("moonshot", "Moonshot AI", "https://api.moonshot.ai/v1/chat/completions", Bearer, &[]),
     preset("morph", "Morph", "https://api.morphllm.com/v1/chat/completions", Bearer, &[]),
-    preset("muse-code", "Meta Muse Code", "https://api.meta.ai/v1/responses", Bearer, &[("User-Agent", "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)")]),
     preset("naga-ac", "NAGA AC", "https://api.naga.ac/v1/chat/completions", Bearer, &[]),
     preset("naga-ai", "NAGA AI", "https://api.naga.ac/v1/chat/completions", Bearer, &[]),
     preset("nanogpt", "NanoGPT", "https://nano-gpt.com/api/v1/chat/completions", Bearer, &[]),
     preset("nara", "Nara", "https://router.bynara.id/v1/chat/completions", Bearer, &[]),
     preset("navy", "Navy", "https://api.navy/v1/chat/completions", Bearer, &[("User-Agent", "OmniRoute/1.0")]),
     preset("nebius", "Nebius", "https://api.tokenfactory.nebius.com/v1/chat/completions", Bearer, &[]),
-    preset("nlpcloud", "NLP Cloud", "https://api.nlpcloud.io/v1/gpu", Bearer, &[]),
     preset("nous-research", "Nous Research", "https://inference-api.nousresearch.com/v1/chat/completions", Bearer, &[]),
     preset("novita", "Novita", "https://api.novita.ai/openai/v1/chat/completions", Bearer, &[]),
     preset("nscale", "Nscale", "https://inference.api.nscale.com/v1/chat/completions", Bearer, &[]),
@@ -320,7 +429,6 @@ pub const PRESET_PROVIDERS: &[PresetProvider] = &[
     preset("nvidia", "NVIDIA", "https://integrate.api.nvidia.com/v1/chat/completions", Bearer, &[]),
     preset("ofoxai", "OFOX AI", "https://api.ofox.ai/v1/chat/completions", Bearer, &[]),
     preset("ollama-cloud", "Ollama Cloud", "https://ollama.com/v1/chat/completions", Bearer, &[]),
-    preset("oneminai", "OneMin AI", "https://api.1min.ai/api/chat-with-ai", ApiKeyHeader("api-key"), &[]),
     preset("openadapter", "OpenAdapter", "https://api.openadapter.in/v1/chat/completions", Bearer, &[]),
     preset("openai", "OpenAI", "https://api.openai.com/v1/chat/completions", Bearer, &[]),
     preset("opencode", "OpenCode Zen", "https://opencode.ai/zen/v1", Bearer, &[]),
@@ -409,7 +517,6 @@ pub const PRESET_ALIASES: &[(&str, &str)] = &[
     ("bm", "bluesminds"),
     ("bpm", "byteplus"),
     ("cinf", "cheaperinference"),
-    ("cmd", "command-code"),
     ("ds", "deepseek"),
     ("dai", "dit"),
     ("featherless", "featherless-ai"),
@@ -429,7 +536,6 @@ pub const PRESET_ALIASES: &[(&str, &str)] = &[
     ("hyp", "hyperbolic"),
     ("ideo", "ideogram"),
     ("inet", "inference-net"),
-    ("in-ai", "inner-ai"),
     ("kg", "kilo-gateway"),
     ("lambda", "lambda-ai"),
     ("leo", "leonardo"),
@@ -438,12 +544,9 @@ pub const PRESET_ALIASES: &[(&str, &str)] = &[
     ("meta", "meta-llama"),
     ("ms", "modelscope"),
     ("monster", "monsterapi"),
-    ("mc", "muse-code"),
     ("naga", "naga-ac"),
-    ("nlpc", "nlpcloud"),
     ("nous", "nous-research"),
     ("ollamacloud", "ollama-cloud"),
-    ("1min", "oneminai"),
     ("oad", "openadapter"),
     ("oc", "opencode"),
     ("ofa", "openference-api"),

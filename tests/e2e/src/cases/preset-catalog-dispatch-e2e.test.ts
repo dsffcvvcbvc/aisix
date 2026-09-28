@@ -20,18 +20,18 @@ import { harnessRequest } from "../harness/http.js";
 /**
  * The WHOLE preset catalog dispatches, driven through a local mock upstream.
  *
- * `crates/aisix-provider-openai/src/presets.rs` catalogs 190 vendors whose
+ * `crates/aisix-provider-openai/src/presets.rs` catalogs 184 vendors whose
  * upstream is a plain OpenAI-shaped REST endpoint, and
  * `crates/aisix-proxy/src/dispatch.rs::resolve_bridge` falls back to the
  * OpenAI family bridge for any catalogued provider. That fallback is a
  * `find_preset` membership test, so a catalog entry is a claim that a vendor
- * will dispatch — and until now only 18 of the 190 had been spot-checked.
+ * will dispatch — and until now only 18 of the 184 had been spot-checked.
  * This spec drives all of them.
  *
  * The catalog is read from the product's own surface
  * (`GET /admin/v1/preset_providers`) rather than parsed out of the Rust
  * source, so what is driven is what an onboarding dashboard is offered, and
- * the "190" is the product's count rather than a literal this file repeats.
+ * the "184" is the product's count rather than a literal this file repeats.
  *
  * Each vendor gets its own `api_base` path (`/v-<id>`) on one shared mock, so
  * a request that reached the wrong vendor's base is visible in the recorded
@@ -40,7 +40,7 @@ import { harnessRequest } from "../harness/http.js";
  * WHAT THIS SPEC DOES NOT CLAIM: the real upstream URLs in the catalog are
  * unreachable from here, so `base_url` is proven as "the request went to the
  * base the resource names", never as "the vendor answered". Only
- * `maritalk`'s path shape is not derivable from `api_base` — the bridge
+ * `cohere`'s path shape is not derivable from `api_base` — the bridge
  * rewrites Cohere's base (see `cohere::is_cohere`), and the rewrite is
  * asserted below.
  */
@@ -54,7 +54,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 const UPSTREAM_SECRET = "sk-preset-catalog-upstream";
 
 /** The catalog size the crate pins (`PRESET_PROVIDER_COUNT`). */
-const EXPECTED_CATALOG_SIZE = 190;
+const EXPECTED_CATALOG_SIZE = 184;
 
 const REQUESTS = "aisix_llm_requests_total";
 const INPUT = "aisix_llm_input_tokens_total";
@@ -72,21 +72,37 @@ interface PresetRow {
   id: string;
   display_name: string;
   base_url: string;
-  auth: { type: string; header?: string };
+  /**
+   * `api_key_header` names a header NAME; `authorization_scheme` names an
+   * `Authorization` scheme. They are different `type` values because the
+   * payload means different things: `maritalk`'s is `Key`, and rendering it
+   * into a header literally called `Key` would put the secret where the
+   * vendor does not read it.
+   */
+  auth:
+    | { type: "bearer" | "none" }
+    | { type: "api_key_header"; header: string }
+    | { type: "authorization_scheme"; scheme: string };
   headers: Array<{ name: string; value: string }>;
 }
 
 /**
- * The 184 `Bearer` rows, i.e. the ones whose declared auth shape IS what the
- * OpenAI family bridge does. The six exceptions are the subject of their own
+ * The 181 `Bearer` rows, i.e. the ones whose declared auth shape IS what the
+ * OpenAI family bridge does. The three exceptions are the subject of their own
  * test below, and must not be silently folded into this count.
  */
 function bearerRows(rows: PresetRow[]): PresetRow[] {
   return rows.filter((r) => r.auth.type === "bearer");
 }
 
+/** The four rows whose credential replaces a header other than `Authorization`. */
 function apiKeyHeaderRows(rows: PresetRow[]): PresetRow[] {
   return rows.filter((r) => r.auth.type === "api_key_header");
+}
+
+/** The one row whose credential is an `Authorization` value under a non-Bearer scheme. */
+function authorizationSchemeRows(rows: PresetRow[]): PresetRow[] {
+  return rows.filter((r) => r.auth.type === "authorization_scheme");
 }
 
 /**
@@ -112,6 +128,8 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
   let catalog: PresetRow[] = [];
   /** `api_key_header` rows, kept for the auth-shape test. */
   let headerAuthRows: PresetRow[] = [];
+  /** `authorization_scheme` rows, kept for the auth-shape test. */
+  let schemeAuthRows: PresetRow[] = [];
   /** Bearer rows, kept for the per-vendor auth test. */
   let plainRows: PresetRow[] = [];
   /** Per-vendor outcome, filled in by the drive and asserted in bulk. */
@@ -158,6 +176,7 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
 
     catalog = await admin.json<PresetRow[]>("GET", "/admin/v1/preset_providers");
     headerAuthRows = apiKeyHeaderRows(catalog);
+    schemeAuthRows = authorizationSchemeRows(catalog);
     plainRows = bearerRows(catalog);
 
     // One ProviderKey + one Model per catalogued vendor, each pointed at its
@@ -197,7 +216,7 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
     await upstream?.close();
   });
 
-  test("the catalog read this spec drives is the full, well-formed 190", async (ctx) => {
+  test("the catalog read this spec drives is the full, well-formed 184", async (ctx) => {
     if (!reachable || !app || !admin) {
       ctx.skip();
       return;
@@ -213,14 +232,18 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
       expect(
         row.auth.type,
         `${row.id} auth.type must be one this spec models`,
-      ).toMatch(/^(bearer|api_key_header|none)$/);
+      ).toMatch(/^(bearer|api_key_header|authorization_scheme|none)$/);
       if (row.auth.type === "api_key_header") {
         expect(row.auth.header, `${row.id} must name its header`).toBeTruthy();
       }
+      if (row.auth.type === "authorization_scheme") {
+        expect(row.auth.scheme, `${row.id} must name its scheme`).toBeTruthy();
+      }
     }
     // The split the auth-shape test below is built on.
-    expect(plainRows).toHaveLength(184);
-    expect(headerAuthRows).toHaveLength(6);
+    expect(plainRows).toHaveLength(181);
+    expect(headerAuthRows).toHaveLength(2);
+    expect(schemeAuthRows).toHaveLength(1);
   });
 
   test("unauthenticated /admin/v1/preset_providers stays 401", async (ctx) => {
@@ -241,7 +264,7 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
     await res.body.dump();
   });
 
-  test("all 190 vendors dispatch: one request each, every one landing on its own base", async (ctx) => {
+  test("all 184 vendors dispatch: one request each, every one landing on its own base", async (ctx) => {
     if (!reachable || !proxy || !upstream) {
       ctx.skip();
       return;
@@ -279,7 +302,7 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
     expect(doubled, "vendors whose mock saw a count other than 1").toEqual([]);
 
     // No request landed anywhere other than a catalogued vendor's own base
-    // — the mock served 190 requests and nothing else.
+    // — the mock served 184 requests and nothing else.
     const cataloguedPaths = new Set(catalog.map(expectedPath));
     const strays = upstream.receivedRequests
       .map((r) => r.path)
@@ -343,60 +366,74 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
     }
   });
 
-  test.fails("KNOWN GAP — the 6 api_key_header vendors still get a Bearer; the catalog's shape is not applied on the data path", async (ctx) => {
+  // This was a `test.fails` — an honest named gap: the catalog published auth
+  // shapes the family bridge never applied, so every one of these vendors
+  // 401'd on its first real call. The gap is closed, so the marker is gone and
+  // the assertions below are the contract. Do not weaken them.
+  //
+  // It also asserted the WRONG contract for `maritalk` (a header literally
+  // named `key`), which would have flipped to green the moment the bridge
+  // honoured the shape literally, while the vendor kept rejecting every call.
+  // The scheme branch below is the corrected expectation, and the two id
+  // lists are asserted by value so a row silently moving between them fails
+  // here rather than quietly changing what "non-bearer" means.
+  test("every non-bearer vendor sends its key in exactly the shape the catalog declares", async (ctx) => {
     if (!reachable || !upstream) {
       ctx.skip();
       return;
     }
-    // `test.fails` is the point, not a workaround: the assertions below are
-    // the CORRECT contract (the credential belongs in the header the
-    // catalog names), they are expected to fail against the product as it
-    // stands, and the day the product applies the declared shape they
-    // START FAILING — which vitest reports, forcing this to be rewritten as
-    // a plain `test`. Deleting or weakening the assertions instead is how a
-    // gap like this rots.
-    //
-    // What `test.fails` deliberately does NOT cover: whether these six still
-    // dispatch at all. A failing test cannot tell "wrong auth shape" from
-    // "vendor unreachable", so a regression in dispatch would hide in here.
-    // That is covered by the plain `test` above — 200 from all 190, each on
-    // its own base path — so the only thing under `test.fails` is the auth
-    // SHAPE, which is the whole of the gap.
-    //
-    // Why it is a gap: the OpenAI family bridge builds
-    // `Authorization: Bearer <api_key>` unconditionally
-    // (`crates/aisix-provider-openai/src/bridge.rs`, `build_request_headers`)
-    // and merges `request.default_headers` skip-if-present, so an operator
-    // cannot displace it — and the header-template vocabulary
-    // (`crates/aisix-core/src/header_template.rs`) has no credential
-    // variable, so the secret cannot be routed into another header either.
-    // The etalon is no better: `open-sse/executors/default.ts` honours only
-    // `x-api-key` / `x-goog-api-key` generically and renders `maritalk`'s
-    // `key` via a hard-coded per-vendor switch case.
     expect(
       headerAuthRows.map((r) => r.id).sort(),
-      "the six vendors whose declared auth shape is not Bearer",
-    ).toEqual([
-      "haiper",
-      "ideogram",
-      "maritalk",
-      "oneminai",
-      "pioneer",
-      "uc-direct",
-    ]);
+      "the two vendors whose credential replaces a non-Authorization header",
+    ).toEqual(["pioneer", "uc-direct"]);
+    expect(
+      schemeAuthRows.map((r) => r.id).sort(),
+      "the vendors whose credential is an Authorization value under a non-Bearer scheme",
+    ).toEqual(["maritalk"]);
 
     for (const row of headerAuthRows) {
       const req = upstream.receivedRequests.find(
         (r) => r.path === expectedPath(row),
       );
       expect(req, `${row.id} never reached the mock`).toBeDefined();
-      const declared = row.auth.header!;
-      // CORRECT behaviour, expected to fail today: the credential goes out
-      // in the header the catalog names, not as a Bearer.
+      const declared = row.auth.header;
       expect(
         req!.headers[declared.toLowerCase()],
         `${row.id} should authenticate via ${declared}`,
       ).toBe(UPSTREAM_SECRET);
+      // The declared shape REPLACES the credential slot, it does not join
+      // it: a stray `Authorization` here means the bridge is sending the key
+      // twice, once where the vendor reads it and once where it does not.
+      expect(
+        req!.headerNames,
+        `${row.id} must carry the credential in exactly one slot`,
+      ).not.toContain("authorization");
+    }
+
+    // `maritalk` is the one row the reference renders as an Authorization
+    // SCHEME rather than a header name. BOTH of its chat-surface auth
+    // builders do it — `open-sse/executors/default.ts` with a hard-coded
+    // per-vendor case (`case "maritalk": headers["Authorization"] =
+    // \`Key ${token}\`;`) and `open-sse/services/provider.ts` generically
+    // (`else if (authHeader === "key") headers["Authorization"] = ...`) — so
+    // the contract is the Authorization VALUE, not a header name. Asserting
+    // `headers["key"]` here — as the old pin did — would have gone green the
+    // moment the bridge honoured the shape literally, while the vendor kept
+    // rejecting every call.
+    for (const row of schemeAuthRows) {
+      const req = upstream.receivedRequests.find(
+        (r) => r.path === expectedPath(row),
+      );
+      expect(req, `${row.id} never reached the mock`).toBeDefined();
+      const scheme = row.auth.scheme;
+      expect(
+        req!.headers.authorization,
+        `${row.id} should authenticate with the ${scheme} scheme`,
+      ).toBe(`${scheme} ${UPSTREAM_SECRET}`);
+      expect(
+        req!.headerNames,
+        `${row.id}'s scheme is not a header name`,
+      ).not.toContain(scheme.toLowerCase());
     }
   }, 60_000);
 
@@ -407,7 +444,7 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
     }
     // A second, isolated drive of one catalogued vendor, scraped either side,
     // so every family is a DELTA across exactly this request rather than an
-    // absolute value the 190-vendor drive already moved.
+    // absolute value the 184-vendor drive already moved.
     const row = plainRows.find((r) => r.id === "openai")!;
     const before: MetricSample[] = await scrapeMetrics(app.metricsUrl);
     const res = await new ProxyClient(app.proxyUrl, CALLER_PLAINTEXT).chat({

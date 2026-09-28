@@ -272,8 +272,21 @@ fn dependents_of(snapshot: &AisixSnapshot, id: &str) -> Vec<String> {
 /// dashboard offers and what dispatch resolves cannot drift.
 ///
 /// No secret is reachable from that table, and none is added here — only
-/// base URLs, the *name* of the header that carries the credential, and
-/// public header values.
+/// base URLs, the *name* of the header or `Authorization` scheme that
+/// carries the credential, and public header values.
+///
+/// `base_url` is the canonical `api_base` to set on the Provider Key,
+/// byte-identical to the source registry entry. The rule the gateway
+/// applies to it is "**a base**": the OpenAI family bridge appends
+/// `/chat/completions` to reach the vendor's chat endpoint. A full
+/// endpoint is TOLERATED rather than published as the contract — the
+/// bridge strips a known OpenAI operation before extending, so
+/// `https://api.openai.com/v1/chat/completions` and
+/// `https://api.openai.com/v1` both land on the same URL, which is what
+/// 169 of the 184 rows record and what the other 15 (bases such as
+/// `https://api.haiper.ai/v1`) need. Either form therefore gives the
+/// request a URL the vendor serves: the catalog carries no row whose path
+/// names an operation the family bridge cannot produce.
 pub async fn list_preset_providers(_auth: AdminAuth) -> Result<Json<Vec<Value>>, AdminError> {
     Ok(Json(
         aisix_provider_openai::PRESET_PROVIDERS
@@ -300,13 +313,24 @@ fn preset_provider_view(preset: &aisix_provider_openai::PresetProvider) -> Value
 }
 
 /// Where the credential goes on the wire. The payload is the shape, never
-/// the credential: `ApiKeyHeader` names the header (or, for a non-Bearer
-/// `Authorization` scheme, the scheme) the key replaces.
+/// the credential.
+///
+/// The two non-Bearer shapes are separate `type` values, not one type with
+/// a string that means different things per vendor: `api_key_header`'s
+/// `header` is a header NAME, while `authorization_scheme`'s `scheme` is a
+/// scheme name that belongs in `Authorization`. Collapsing them publishes
+/// `{"type":"api_key_header","header":"key"}` for `maritalk`, which reads
+/// as "send the secret in a header called `key`" — the one instruction a
+/// client cannot act on correctly, because the vendor reads
+/// `Authorization: Key <key>`.
 fn preset_auth_view(auth: aisix_provider_openai::PresetAuth) -> Value {
     match auth {
         aisix_provider_openai::PresetAuth::Bearer => json!({"type": "bearer"}),
         aisix_provider_openai::PresetAuth::ApiKeyHeader(header) => {
             json!({"type": "api_key_header", "header": header})
+        }
+        aisix_provider_openai::PresetAuth::AuthorizationScheme(scheme) => {
+            json!({"type": "authorization_scheme", "scheme": scheme})
         }
         aisix_provider_openai::PresetAuth::None => json!({"type": "none"}),
     }

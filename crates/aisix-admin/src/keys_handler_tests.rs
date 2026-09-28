@@ -774,6 +774,34 @@ async fn preset_providers_serve_the_embedded_catalog_as_an_array() {
         json!({"type": "api_key_header", "header": "x-api-key"})
     );
 
+    // `maritalk`'s registry value `key` is an Authorization SCHEME, so it
+    // must not be published as a header name. A client that read
+    // `{"type":"api_key_header","header":"key"}` literally would put the
+    // secret in a header the vendor never reads, and would have no way to
+    // tell from the payload that `key` means something else.
+    let maritalk = rows
+        .iter()
+        .find(|row| row["id"] == "maritalk")
+        .expect("the catalog carries maritalk");
+    assert_eq!(
+        maritalk["auth"],
+        json!({"type": "authorization_scheme", "scheme": "Key"})
+    );
+    let scheme_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row["auth"]["type"] == "authorization_scheme")
+        .collect();
+    assert!(
+        !scheme_rows.is_empty(),
+        "the non-Bearer Authorization-scheme arm is reached, not dead"
+    );
+    for row in scheme_rows {
+        assert!(
+            !row["auth"]["scheme"].as_str().unwrap_or_default().is_empty(),
+            "an authorization_scheme preset must name the scheme: {row}"
+        );
+    }
+
     // A vendor that needs static headers projects them as name/value pairs.
     let with_headers = rows
         .iter()
@@ -821,7 +849,9 @@ async fn the_preset_projection_carries_no_credential_field() {
             .collect();
         auth_fields.sort_unstable();
         assert!(
-            auth_fields == ["type"] || auth_fields == ["header", "type"],
+            auth_fields == ["type"]
+                || auth_fields == ["header", "type"]
+                || auth_fields == ["scheme", "type"],
             "auth carries a shape, never a credential: {row}"
         );
     }
