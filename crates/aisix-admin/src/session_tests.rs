@@ -697,3 +697,156 @@ fn session_token_from_cookies_reads_only_our_cookie() {
         Some("second")
     );
 }
+
+// ---- the bounded guessing oracle -----------------------------------------
+
+/// A wrong key is 401 until the budget is spent, and 429 after it — with a
+/// `Retry-After` a client can honour, and with the counter NOT advancing while
+/// it is spent.
+///
+/// The last part is the property that makes this a rate bound rather than a
+/// suggestion: if a refused guess still counted, an attacker could not spend
+/// the window faster, but they also could not be slowed, and a naive
+/// implementation that advanced the counter on every request would refuse a
+/// legitimate operator for as long as an attacker kept the pressure on.
+#[tokio::test]
+async fn the_key_exchange_is_a_bounded_guessing_oracle() {
+    let state = state(&admin_cfg(false));
+    let router = router(&state);
+
+    // Every attempt up to the budget is an ordinary 401.
+    for attempt in 1..LOGIN_FAILURE_BUDGET {
+        let (status, response) = post_session(router.clone(), "wrong-key").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} of {LOGIN_FAILURE_BUDGET} answered {status}"
+        );
+        // A 401 must not leak the budget: no `Retry-After` before the window
+        // is actually spent.
+        assert!(
+            response.headers().get(header::RETRY_AFTER).is_none(),
+            "attempt {attempt} announced a cooldown it had not started"
+        );
+    }
+
+    // The one that spends it, and every attempt inside the window after it.
+    for attempt in LOGIN_FAILURE_BUDGET..LOGIN_FAILURE_BUDGET + 3 {
+        let (status, response) = post_session(router.clone(), "wrong-key").await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "attempt {attempt} answered {status} rather than being rate limited"
+        );
+        let retry_after: u64 = response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .expect("a 429 must say when to come back")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap_or_else(|_| panic!("Retry-After must be a delay in seconds"));
+        assert!(
+            (1..=LOGIN_COOLDOWN_SECONDS as u64).contains(&retry_after),
+            "Retry-After was {retry_after}, outside the window"
+        );
+        // The budget does not advance while it is spent, so the window is not
+        // shortened by trying harder.
+        assert_eq!(
+            state.sessions.login_guard_state(),
+            (LOGIN_FAILURE_BUDGET, true),
+            "a refused guess changed the counter"
+        );
+    }
+}
+
+/// The guard bounds guessing; it does not lock the operator out. This is the
+/// property that makes the whole design acceptable, and the reason the key is
+/// compared BEFORE the budget is consulted: a correct key exchanges and clears
+/// the budget however many failures preceded it.
+#[tokio::test]
+async fn a_correct_key_is_never_rate_limited_and_clears_the_budget() {
+    let state = state(&admin_cfg(false));
+    let router = router(&state);
+
+    // Spend the budget, and one more so the window is CLOSED when the
+    // operator arrives — a rate-limited guesser and a locked-out operator are
+    // only different answers if the window state is what separates them.
+    for _ in 0..=LOGIN_FAILURE_BUDGET {
+        post_session(router.clone(), "wrong-key").await;
+    }
+    assert_eq!(
+        state.sessions.login_guard_state(),
+        (LOGIN_FAILURE_BUDGET, true),
+        "the window should be closed before the operator tries"
+    );
+
+    let (status, response) = post_session(router.clone(), KEY).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the operator's own key was refused by the guessing guard"
+    );
+    cookie_of(&response);
+    assert_eq!(
+        state.sessions.login_guard_state(),
+        (0, false),
+        "a successful exchange must hand the next window back"
+    );
+}
+
+/// The window is a window: once it elapses the budget is a new budget, not
+/// "no guesses, ever again". Without the reset an attacker who spent the
+/// budget once would have locked every FUTURE guess out too, which is both
+/// wrong and — for a real operator who mistypes the key — indistinguishable
+/// from a broken login.
+#[tokio::test]
+async fn the_budget_is_a_window_and_not_a_permanent_shutdown() {
+    let store = SessionStore::default();
+    let start = chrono::Utc::now();
+
+    // Every attempt short of the budget is an ordinary failure; the one that
+    // spends it is the next call.
+    for _ in 0..LOGIN_FAILURE_BUDGET - 1 {
+        assert_eq!(
+            store.record_login_failure(start),
+            None,
+            "the budget was spent before it was exhausted"
+        );
+    }
+    // The last failure is the one that closes the window.
+    assert_eq!(
+        store.record_login_failure(start),
+        Some(LOGIN_COOLDOWN_SECONDS as u64)
+    );
+    // Inside the window: refused, and the retry shrinks as the window runs
+    // down rather than resetting.
+    let inside = start + chrono::Duration::seconds(LOGIN_COOLDOWN_SECONDS - 10);
+    assert_eq!(store.record_login_failure(inside), Some(10));
+    assert_eq!(store.record_login_failure(inside), Some(10));
+
+    // Past the window: a fresh budget, whose first attempt is an ordinary
+    // failure again.
+    let after = start + chrono::Duration::seconds(LOGIN_COOLDOWN_SECONDS + 1);
+    assert_eq!(store.record_login_failure(after), None);
+    assert_eq!(store.login_guard_state(), (1, false));
+}
+
+/// A success resets the counter even mid-window, so a legitimate login is not
+/// followed by a fresh operator having to wait out somebody else's budget.
+#[test]
+fn a_success_resets_the_guessing_budget() {
+    let store = SessionStore::default();
+    let now = chrono::Utc::now();
+    for _ in 0..LOGIN_FAILURE_BUDGET {
+        store.record_login_failure(now);
+    }
+    assert!(
+        store.login_guard_state().1,
+        "the budget was not spent, so nothing was reset"
+    );
+
+    store.record_login_success();
+    assert_eq!(store.login_guard_state(), (0, false));
+    assert_eq!(store.record_login_failure(now), None);
+}

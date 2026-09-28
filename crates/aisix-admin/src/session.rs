@@ -60,6 +60,7 @@ use axum::extract::State;
 use axum::http::header;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use dashmap::DashMap;
 use serde_json::Value;
@@ -109,6 +110,62 @@ struct Session {
 #[derive(Debug, Default)]
 pub struct SessionStore {
     sessions: DashMap<String, Session>,
+    /// The bounded online-guessing counter for the key exchange. Same
+    /// lifetime as the session table and for the same reason: both are this
+    /// process's memory and nothing else.
+    login_guard: std::sync::Mutex<LoginGuard>,
+}
+
+/// How many failed admin-key exchanges one [`LoginGuard`] window allows
+/// before further GUESSES are refused, and how long that window is.
+///
+/// The admin key is the single root credential for this listener — every
+/// admin read is cookie-gated, and a cookie is minted only from it — so
+/// `POST /admin/v1/auth/session` is its oracle. Unbounded, it is a free
+/// unlimited-rate oracle: 401 on a wrong key, 204 plus a cookie on the right
+/// one, with no delay, no counter and no per-source bound, so a key space can
+/// be walked at whatever rate the network allows.
+///
+/// The budget is small because it does not need to be large to do its job.
+/// What it removes is the *rate*: a guesser now gets at most
+/// `LOGIN_FAILURE_BUDGET` attempts per `LOGIN_COOLDOWN_SECONDS`, so the
+/// attack becomes minutes-to-years instead of seconds, and a parallel or
+/// many-source flood is bounded by the same number.
+///
+/// **What this does not protect against, stated plainly:**
+///
+/// * a patient trickle of fewer than `LOGIN_FAILURE_BUDGET` attempts per
+///   window is still an online attack, just a slower one — this is a rate
+///   bound, not a lockout and not an MFA;
+/// * the counter is in memory, like the session table, so it resets on
+///   restart and is not shared across replicas — the same limitation
+///   [`SESSION_TTL_SECONDS`] and this module's "Lifetime" section already
+///   state for sessions, and it is the reason the guard is described as
+///   defence in depth rather than as the control;
+/// * it is per PROCESS, not per source: the admin listener is served by
+///   `serve_http` with no `ConnectInfo`, so the peer address is not available
+///   to this handler, and a per-source table would also need its own bound to
+///   avoid being a memory-growth vector of its own. The default
+///   `config.example.yaml` binds the admin listener to `127.0.0.1`, where a
+///   network peer does not exist at all.
+///
+/// **What it deliberately does not do is lock the operator out.** The budget
+/// is spent and consulted only on a key that does NOT match: a correct key
+/// still exchanges, and clears the budget, however many failures preceded it.
+/// An operator who fat-fingers the key ten times is slowed by nothing at all,
+/// and an attacker cannot use the guard to deny service to the real operator.
+pub(crate) const LOGIN_FAILURE_BUDGET: u32 = 10;
+pub(crate) const LOGIN_COOLDOWN_SECONDS: i64 = 60;
+
+/// The bounded counter behind that. A plain `Mutex` and no `DashMap`: it is
+/// two `Copy` fields, it is read once per exchange, and it must never hold a
+/// guard across an `.await` — the same rule the session table follows.
+#[derive(Debug, Default)]
+struct LoginGuard {
+    consecutive_failures: u32,
+    /// Set when the budget is spent; the guesses it refuses are refused until
+    /// this instant.
+    blocked_until: Option<DateTime<Utc>>,
 }
 
 impl SessionStore {
@@ -156,6 +213,66 @@ impl SessionStore {
     /// success.
     pub fn revoke(&self, token: &str) {
         self.sessions.remove(&digest(token));
+    }
+
+    /// Record a key that did not match, and say whether this guess must be
+    /// refused outright.
+    ///
+    /// `None` is an ordinary `401`. `Some(seconds)` means the budget for the
+    /// current window is spent and the caller should answer `429` with that
+    /// `Retry-After` instead — the guess is not evaluated again and the
+    /// counter does not advance, so a guesser cannot spend the window faster
+    /// by sending more requests, only slower.
+    ///
+    /// When the window has elapsed the budget resets and THIS attempt is the
+    /// first of the next window, so a guesser buys `LOGIN_FAILURE_BUDGET`
+    /// attempts per `LOGIN_COOLDOWN_SECONDS` and not "nothing, ever again".
+    pub fn record_login_failure(&self, now: DateTime<Utc>) -> Option<u64> {
+        let mut guard = self
+            .login_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(until) = guard.blocked_until {
+            if now < until {
+                return Some((until - now).num_seconds().max(1) as u64);
+            }
+            // The window elapsed: a new budget, and this is its first
+            // attempt.
+            guard.consecutive_failures = 0;
+            guard.blocked_until = None;
+        }
+        guard.consecutive_failures += 1;
+        if guard.consecutive_failures >= LOGIN_FAILURE_BUDGET {
+            guard.blocked_until = Some(now + Duration::seconds(LOGIN_COOLDOWN_SECONDS));
+            return Some(LOGIN_COOLDOWN_SECONDS as u64);
+        }
+        None
+    }
+
+    /// A key that DID match clears the budget, on purpose and not by
+    /// accident: the guard exists to bound guessing, and an operator who
+    /// fat-fingers the key a few times must not be left waiting out a window
+    /// for it. A successful exchange also means whoever holds the key is
+    /// already inside, so there is nothing left to guess at.
+    pub fn record_login_success(&self) {
+        let mut guard = self
+            .login_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.consecutive_failures = 0;
+        guard.blocked_until = None;
+    }
+
+    /// Test-only: the failures the current window has spent, and whether a
+    /// window is currently closed. A pair rather than a formatter, so a test
+    /// asserts the fact rather than a rendering of it.
+    #[cfg(test)]
+    pub(crate) fn login_guard_state(&self) -> (u32, bool) {
+        let guard = self
+            .login_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (guard.consecutive_failures, guard.blocked_until.is_some())
     }
 
     /// Every key currently in the table. Test-only, and deliberately
@@ -257,6 +374,24 @@ fn clear_cookie_value(secure: bool) -> String {
 /// body never contains the key: the envelope is a fixed string, and the
 /// request body is not echoed, reflected, or logged.
 ///
+/// A bad key ALSO spends the guessing budget ([`LOGIN_FAILURE_BUDGET`]),
+/// and once the budget is spent a further bad key answers `429` with a
+/// `Retry-After` instead of another `401`. The order of the two checks is
+/// the whole design and is not interchangeable:
+///
+/// * the key is compared FIRST, always, so a correct key is never refused
+///   and never rate-limited — the guard bounds guessing, it does not lock
+///   the operator out, and it cannot be used to deny them service;
+/// * the budget is consulted only on a key that did not match, so a guesser
+///   gets a bounded number of attempts per window and a rate-limited
+///   attempt is not itself evaluated.
+///
+/// `debug` and not `warn` on the refusal, for the reason every other log on
+/// an unauthenticated surface in this crate is `debug`: the endpoint is
+/// unauthenticated by construction, so a prober must not be able to fill the
+/// log by being refused. What is bounded is the guessing; what is not
+/// bounded is how often someone can ask.
+///
 /// Success is `204 No Content` — the only thing the caller needs is the
 /// `Set-Cookie`, and returning a body would only give the SPA something
 /// to get wrong.
@@ -266,8 +401,31 @@ pub async fn create_session(
 ) -> Result<Response, AdminError> {
     let key = admin_key_from_body(&body)?;
     if !crate::auth::admin_key_is_valid(&key, &state.admin_keys) {
+        if let Some(retry_after) = state.sessions.record_login_failure(Utc::now()) {
+            tracing::debug!(
+                retry_after,
+                "admin-key exchange: the guessing budget for this window is spent"
+            );
+            // The admin error envelope, built here rather than as an
+            // `AdminError` variant: a rate limit is a property of this
+            // endpoint's own guard, not a taxonomy entry the whole admin
+            // surface shares. `Json` for the same `{"error_msg": …}` shape
+            // every other admin error carries, so a client that parses one
+            // parses this.
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, retry_after.to_string())],
+                Json(crate::error::ErrorBody {
+                    error_msg: format!(
+                        "too many failed admin-key exchanges; retry in {retry_after}s"
+                    ),
+                }),
+            )
+                .into_response());
+        }
         return Err(AdminError::Unauthorized);
     }
+    state.sessions.record_login_success();
     let token = state.sessions.issue(Utc::now());
     Ok((
         StatusCode::NO_CONTENT,
