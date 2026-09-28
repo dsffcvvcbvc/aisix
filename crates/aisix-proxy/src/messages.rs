@@ -4602,8 +4602,8 @@ mod tests {
     /// test able to fail for its own subject: if the dispatch stops
     /// forwarding, there is no request left to count. The expected value is
     /// unchanged.
-    fn single_attempt(m: ResourceEntry<Model>) -> ResourceEntry<Model> {
-        // MUTANT: the budget is no longer pinned off.
+    fn single_attempt(mut m: ResourceEntry<Model>) -> ResourceEntry<Model> {
+        m.value.retries = Some(0);
         m
     }
 
@@ -7026,7 +7026,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .insert(single_attempt(anthropic_model("my-claude")));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let row: aisix_core::models::Guardrail = serde_json::from_str(
-            r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
+            r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
         )
         .unwrap();
         crate::seed_env_scoped_guardrail(&snap, ResourceEntry::new("g-open", row, 1));
