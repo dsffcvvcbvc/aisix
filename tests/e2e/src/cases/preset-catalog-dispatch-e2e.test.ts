@@ -87,6 +87,22 @@ interface PresetRow {
 }
 
 /**
+ * The two narrowed views of a row. `apiKeyHeaderRows` and
+ * `authorizationSchemeRows` used to declare `: PresetRow[]`, and THAT
+ * annotation is what broke them: the `filter` narrows `r.auth` correctly, and
+ * the explicit return type then widens it straight back, so `row.auth.header`
+ * and `row.auth.scheme` were errors at the point of use. Naming the narrowed
+ * shape here fixes it at the boundary rather than casting at every read, and
+ * keeps the payload's meaning attached to the type that carries it.
+ */
+type ApiKeyHeaderRow = PresetRow & {
+  auth: { type: "api_key_header"; header: string };
+};
+type AuthorizationSchemeRow = PresetRow & {
+  auth: { type: "authorization_scheme"; scheme: string };
+};
+
+/**
  * The 181 `Bearer` rows, i.e. the ones whose declared auth shape IS what the
  * OpenAI family bridge does. The three exceptions are the subject of their own
  * test below, and must not be silently folded into this count.
@@ -96,12 +112,12 @@ function bearerRows(rows: PresetRow[]): PresetRow[] {
 }
 
 /** The four rows whose credential replaces a header other than `Authorization`. */
-function apiKeyHeaderRows(rows: PresetRow[]): PresetRow[] {
+function apiKeyHeaderRows(rows: PresetRow[]): ApiKeyHeaderRow[] {
   return rows.filter((r) => r.auth.type === "api_key_header");
 }
 
 /** The one row whose credential is an `Authorization` value under a non-Bearer scheme. */
-function authorizationSchemeRows(rows: PresetRow[]): PresetRow[] {
+function authorizationSchemeRows(rows: PresetRow[]): AuthorizationSchemeRow[] {
   return rows.filter((r) => r.auth.type === "authorization_scheme");
 }
 
@@ -127,9 +143,9 @@ describe("preset catalog: every vendor in the catalog dispatches to its own base
   let reachable = false;
   let catalog: PresetRow[] = [];
   /** `api_key_header` rows, kept for the auth-shape test. */
-  let headerAuthRows: PresetRow[] = [];
+  let headerAuthRows: ApiKeyHeaderRow[] = [];
   /** `authorization_scheme` rows, kept for the auth-shape test. */
-  let schemeAuthRows: PresetRow[] = [];
+  let schemeAuthRows: AuthorizationSchemeRow[] = [];
   /** Bearer rows, kept for the per-vendor auth test. */
   let plainRows: PresetRow[] = [];
   /** Per-vendor outcome, filled in by the drive and asserted in bulk. */
