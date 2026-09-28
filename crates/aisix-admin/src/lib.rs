@@ -248,28 +248,27 @@ pub fn build_router(state: AdminState) -> Router {
             "/icon-512.png",
             get(resources_handler::serve_dashboard_path),
         )
-        // The provider logos the origin-root documents link to (`landing` and
-        // `home` render them as `<img src>`). Named rather than wildcarded, so
-        // the surface is exactly the set a document asks for — the same
-        // choice as the icons above.
+        // The vendor-logo tree. Mounted as a TREE, not as a list of names: the
+        // catalog draws a vendor as `<img src="/providers/<id>.svg">`, and the
+        // export ships 141 of those — the five mounted by name until now were
+        // the ones an origin-root document happened to link to, so
+        // `/dashboard/providers/openai` rendered a grid of empty logo frames
+        // with nothing on the page saying why. A name list is a list that rots
+        // silently against every catalog change, which is the same failure the
+        // rest of this mount list is written to avoid.
+        //
+        // What the tree exposes is bounded in the chokepoint, not here:
+        // `is_provider_logo` admits only what the mime table classifies as an
+        // image, so a `.js`/`.html` a future export drops into `providers/` is
+        // not served from the admin origin. `/providers` and `/providers/` are
+        // mounted for the reason `/docs/` is: `matchit` 0.7.3 leaves a
+        // trailing-slash path unmatched against a catch-all, and an unmounted
+        // one would answer the router's bare 404 rather than this surface's
+        // explanation of what is and is not in the build.
+        .route("/providers", get(resources_handler::serve_dashboard_path))
+        .route("/providers/", get(resources_handler::serve_dashboard_path))
         .route(
-            "/providers/claude.svg",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/providers/cline.svg",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/providers/codex.svg",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/providers/cursor.svg",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/providers/kimi-logomark-light.svg",
+            "/providers/*path",
             get(resources_handler::serve_dashboard_path),
         )
         // Route families a static export can never carry, mounted so they get
@@ -814,7 +813,7 @@ mod tests {
     fn origin_root_routes_cannot_take_an_admin_path() {
         // First segments the admin listener already owns, and what each one
         // carries. Measured against `build_router`'s own mount list.
-        let reserved: [(&str, &str); 7] = [
+        let reserved: [(&str, &str); 8] = [
             ("admin", "/admin/* — the Admin API and the OpenAPI pair"),
             ("livez", "/livez"),
             ("readyz", "/readyz"),
@@ -822,6 +821,7 @@ mod tests {
             ("metrics", "the scrape path, owned by the metrics listener"),
             ("_next", "/_next/*path — the content-hashed asset tree"),
             ("dashboard", "/dashboard, /dashboard/, /dashboard/*path"),
+            ("providers", "/providers, /providers/, /providers/*path"),
         ];
         // Every path `build_router` mounts by hand, so a table entry that
         // duplicates one of them is caught here rather than as a boot panic.
@@ -841,11 +841,9 @@ mod tests {
             "/sw.js",
             "/apple-touch-icon.png",
             "/icon-512.png",
-            "/providers/claude.svg",
-            "/providers/cline.svg",
-            "/providers/codex.svg",
-            "/providers/cursor.svg",
-            "/providers/kimi-logomark-light.svg",
+            "/providers",
+            "/providers/",
+            "/providers/*path",
             "/docs",
             "/docs/",
             "/docs/*path",
@@ -1071,7 +1069,17 @@ mod tests {
         assert_ne!(resp.status(), StatusCode::NOT_FOUND, "/v1/models");
         // `/` is the proxy's ordinary miss path (a `passthrough_route` would
         // have to be configured to claim it), not the export's shell.
-        for uri in ["/", "/login", "/dashboard"] {
+        for uri in [
+            "/",
+            "/login",
+            "/dashboard",
+            // The logo tree, mounted by wildcard on the admin listener: the
+            // widest path shape the dashboard surface has, and still absent
+            // from the router bound to `proxy.addr`.
+            "/providers/claude.svg",
+            "/providers/baidu.svg",
+            "/providers/",
+        ] {
             let resp = run(
                 proxy.clone(),
                 Request::builder().uri(uri).body(Body::empty()).unwrap(),
