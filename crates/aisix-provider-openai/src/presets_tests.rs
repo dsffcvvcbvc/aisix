@@ -15,9 +15,14 @@
 //! belongs on this side of that line.
 //!
 //! `SPOT_CHECK` is a spread across the alphabet plus, deliberately, every
-//! vendor that is not boring: all six non-`Bearer` auth shapes and all
-//! seven vendors carrying custom headers. A bug that only affects an
-//! interesting row would otherwise hide behind 184 identical bearer rows.
+//! vendor that is not boring: all three non-`Bearer` auth shapes (the two
+//! header-name rows and the one `Authorization`-scheme row), the two rows
+//! whose registry `authHeader` is deliberately NOT honoured on the chat
+//! surface, and all seven vendors carrying custom headers. A bug that only
+//! affects an interesting row would otherwise hide behind 181 identical
+//! bearer rows. The remaining "not boring" axis — which `base_url` rows are
+//! a base rather than a full endpoint — is not a spot check's job, because
+//! `every_row_dispatches_to_its_own_base_url` already walks every row.
 
 use super::presets::{find_preset, PresetAuth, PresetProvider, PRESET_ALIASES, PRESET_PROVIDERS};
 
@@ -75,10 +80,14 @@ const SPOT_CHECK: &[Expected] = &[
         ("ollama-cloud", "https://ollama.com/v1/chat/completions", PresetAuth::Bearer, &[]),
         ("v0-vercel", "https://api.v0.dev/v1/chat/completions", PresetAuth::Bearer, &[]),
         ("zenmux", "https://zenmux.ai/api/v1/chat/completions", PresetAuth::Bearer, &[]),
-        ("haiper", "https://api.haiper.ai/v1", PresetAuth::ApiKeyHeader("HAIPER_KEY"), &[]),
-        ("ideogram", "https://api.ideogram.ai", PresetAuth::ApiKeyHeader("Api-Key"), &[]),
-        ("maritalk", "https://chat.maritaca.ai/api", PresetAuth::ApiKeyHeader("key"), &[]),
-        ("oneminai", "https://api.1min.ai/api/chat-with-ai", PresetAuth::ApiKeyHeader("api-key"), &[]),
+        // `HAIPER_KEY` / `Api-Key` are the registry's `authHeader` values and
+        // the reference honours them — from its image/video handlers, never
+        // from a chat path, which Bearer-falls-back on both. See the
+        // `haiper` and `ideogram` rows in `presets.rs` and
+        // `bridge::tests::a_registry_auth_header_the_reference_ignores_on_chat_stays_bearer`.
+        ("haiper", "https://api.haiper.ai/v1", PresetAuth::Bearer, &[]),
+        ("ideogram", "https://api.ideogram.ai", PresetAuth::Bearer, &[]),
+        ("maritalk", "https://chat.maritaca.ai/api", PresetAuth::AuthorizationScheme("Key"), &[]),
         ("pioneer", "https://api.pioneer.ai/v1/chat/completions", PresetAuth::ApiKeyHeader("x-api-key"), &[]),
         ("uc-direct", "https://api.uncensored.com/api/v1", PresetAuth::ApiKeyHeader("x-api-key"), &[]),
         ("api-airforce", "https://api.airforce/v1/chat/completions", PresetAuth::Bearer, &[("HTTP-Referer", "https://endpoint-proxy.local"), ("X-Title", "Endpoint Proxy")]),
@@ -86,7 +95,6 @@ const SPOT_CHECK: &[Expected] = &[
         ("gitlawb", "https://opengateway.gitlawb.com/v1/xiaomi-mimo", PresetAuth::Bearer, &[("User-Agent", "OpenClaude/1.0 (linux; x86_64)"), ("X-Title", "OpenClaude CLI"), ("HTTP-Referer", "https://github.com/Gitlawb/openclaude")]),
         ("navy", "https://api.navy/v1/chat/completions", PresetAuth::Bearer, &[("User-Agent", "OmniRoute/1.0")]),
         ("routeway", "https://api.routeway.ai/v1/chat/completions", PresetAuth::Bearer, &[("User-Agent", "Mozilla/5.0 OmniRoute/1.0")]),
-        ("muse-code", "https://api.meta.ai/v1/responses", PresetAuth::Bearer, &[("User-Agent", "muse-build/1.3.0 (interactive; macos-aarch64; build ac7280f2aca67769d1455a8847bb502b617d50f6)")]),
         ("mlx-gemma", "http://localhost:11435/v1", PresetAuth::Bearer, &[]),
         ("mlx-qwen", "http://localhost:11436/v1", PresetAuth::Bearer, &[]),
 ];
@@ -97,7 +105,6 @@ const ALIAS_CHECK: &[(&str, &str)] = &[
     ("pplx", "perplexity"),
     ("oc", "opencode"),
     ("hf", "huggingface"),
-    ("1min", "oneminai"),
     ("zm", "zenmux"),
     ("vag", "vercel-ai-gateway"),
     ("llmkiwi", "llm-kiwi"),
@@ -326,8 +333,14 @@ fn unknown_and_excluded_ids_do_not_resolve_to_a_preset() {
         "maxai",
         "promptql",
         "snowflake",
-        "databricks",
         "bedrock",
+        // endpoints the family bridge cannot reach
+        "command-code",
+        "free-ai",
+        "inner-ai",
+        "muse-code",
+        "nlpcloud",
+        "oneminai",
     ] {
         assert!(
             find_preset(id).is_none(),
@@ -337,11 +350,27 @@ fn unknown_and_excluded_ids_do_not_resolve_to_a_preset() {
 }
 
 #[test]
-fn alias_of_an_excluded_vendor_does_not_resolve() {
+fn no_alias_points_at_an_excluded_vendor() {
     // "pql" was promptql's registry alias; the vendor is excluded, so the
-    // alias must be gone with it rather than dangling into the table.
+    // alias must be gone with it rather than dangling into the table — and
+    // an alias that resolved would be the worst kind of leak, because
+    // `aliases_are_unique_and_all_point_at_a_real_vendor` only proves the
+    // target EXISTS, never that it belongs in the catalog. `cmd`,
+    // `nlpc`, `in-ai` and `1min` are the four this has already caught.
+    for (class, ids) in EXCLUDED_IDS {
+        for (alias, canonical) in PRESET_ALIASES {
+            assert!(
+                !ids.contains(canonical),
+                "alias {alias} -> {canonical} points into the {class:?} exclusion class; drop \
+                 the alias with the row"
+            );
+        }
+    }
     assert!(find_preset("pql").is_none());
-    assert!(!PRESET_ALIASES.iter().any(|(a, _)| *a == "pql"));
+    assert!(find_preset("cmd").is_none());
+    assert!(find_preset("nlpc").is_none());
+    assert!(find_preset("in-ai").is_none());
+    assert!(find_preset("1min").is_none());
 }
 
 #[test]
@@ -466,6 +495,34 @@ const EXCLUDED_IDS: &[(&str, &[&str])] = &[
             "uc",
         ],
     ),
+    // endpoints the OpenAI family bridge cannot reach (6), for two provable
+    // reasons. (1) The row's `base_url` already ends in a path segment that
+    // is not one of the seven OpenAI operations `strip_known_endpoint`
+    // knows, so the family bridge extends it into a URL the vendor does not
+    // serve (`…/v1/responses/chat/completions`,
+    // `…/chat-with-ai/chat/completions`, `…/chat/chat/completions`) —
+    // `free-ai`, `inner-ai`, `muse-code`, `oneminai`. (2) The reference
+    // reaches the vendor on a path the bridge cannot produce at all:
+    // `command-code`'s registry `chatPath` is
+    // `/provider/v1/chat/completions` (and `executors/commandCode.ts`
+    // appends it to the base), and `executors/nlpcloud.ts` builds
+    // `<base>/<model>/chatbot` — so `<base_url>/chat/completions` is a URL
+    // the reference never requests for either. The criterion is
+    // "provable from the reference source", never a guess about a live
+    // vendor. `every_row_dispatches_to_its_own_base_url` is the invariant
+    // that keeps the class honest; this list is what stops a row that now
+    // qualifies from being re-added on autopilot.
+    (
+        "family-bridge-unreachable",
+        &[
+            "command-code",
+            "free-ai",
+            "inner-ai",
+            "muse-code",
+            "nlpcloud",
+            "oneminai",
+        ],
+    ),
     // a second id for an endpoint the catalog already carries (1). The
     // registry spells this vendor twice; counting it as another vendor
     // inflates the total without adding a reachable endpoint, and it is
@@ -491,7 +548,7 @@ const ENDPOINT_FAMILIES: &[&[&str]] = &[
 #[test]
 fn the_catalog_is_the_reconciled_size() {
     // A decision, not a placeholder: the module's "Reconciling the count"
-    // section derives 190 from the source registry by subtracting each
+    // section derives 184 from the source registry by subtracting each
     // exclusion class. A count larger than the source is not a count of a
     // subset, so there is no pool of "missing" vendors to add — and the
     // assertions below are what make that a hard failure rather than a
@@ -502,7 +559,7 @@ fn the_catalog_is_the_reconciled_size() {
     );
     assert_eq!(
         PRESET_PROVIDERS.len(),
-        190,
+        184,
         "the catalog size changed; update the reconciliation table in the module docs in the same \
          commit, with the per-class counts that justify the new number"
     );
@@ -544,14 +601,171 @@ fn the_excluded_classes_are_still_excluded() {
     // claims, so the documented arithmetic cannot drift from them.
     let excluded: usize = EXCLUDED_IDS.iter().map(|(_, ids)| ids.len()).sum();
     assert_eq!(
-        excluded, 67,
-        "the exclusion classes no longer sum to the 67 the module docs subtract"
+        excluded,
+        73,
+        "the exclusion classes no longer sum to the 73 the module docs subtract"
     );
     assert_eq!(
         EXCLUDED_IDS.len(),
-        6,
+        7,
         "a new exclusion class needs a matching bullet in the module docs"
     );
+}
+
+/// The rows whose `base_url` is a **base** the family bridge extends, rather
+/// than the full chat-completions endpoint the row already names. Every other
+/// row is a full endpoint, which is 169 of 184 and the reason nothing in the
+/// product has to know about this list.
+///
+/// Listing the bases is what makes the contract checkable in both
+/// directions: a row that is neither a full endpoint nor a declared base is a
+/// row the bridge would extend into a URL the vendor does not serve, and a
+/// declared base the bridge now reproduces verbatim is a stale entry rather
+/// than a silent pass. Membership is transcribed from the source registry's
+/// `baseUrl` — the same field either form is taken from.
+const BASE_URL_ROWS: &[&str] = &[
+    "dify",
+    "freebuff",
+    "gigachat",
+    "gitlawb",
+    "haiper",
+    "ideogram",
+    "leonardo",
+    "maritalk",
+    "mlx-gemma",
+    "mlx-qwen",
+    "opencode",
+    "regolo",
+    "uc-direct",
+    "xiaomi-mimo",
+    "xiaomi-mimo-token-plan",
+];
+
+/// Path segments a vendor never publishes as a BASE, because by the time a
+/// path ends in one of them it IS the operation, not a prefix. The reference
+/// draws the same line and in the same words:
+/// `open-sse/executors/default/urlNormalizers.ts` returns `…/chat` and
+/// `…/responses` **verbatim** rather than extending them, because appending
+/// an operation to a complete endpoint is the doubling the
+/// `family-bridge-unreachable` class exists for.
+const OPERATION_SEGMENTS: &[&str] = &["chat", "responses", "completions"];
+
+/// The catalog's central promise, held against the code that has to honour
+/// it: pasting `base_url` into a ProviderKey's `api_base` must make the
+/// family bridge dispatch to the URL the catalog names.
+///
+/// Two forms satisfy it, and both are the reference's own forms:
+///
+/// * a **full endpoint** — `strip_known_endpoint` + `/chat/completions` is
+///   the identity on it, so the dispatched URL is byte-identical to
+///   `base_url`. Asserted on every row that is one.
+/// * a **base** listed in [`BASE_URL_ROWS`] — the bridge appends
+///   `/chat/completions`, and the dispatched URL is
+///   `<base_url>/chat/completions`.
+///
+/// A base that already names an operation fails even when it is listed: a
+/// base ending in `/chat` is an endpoint, and extending it is the
+/// `…/chat/chat/completions` doubling that put `free-ai`, `inner-ai`,
+/// `muse-code` and `oneminai` in the `family-bridge-unreachable` class. The
+/// class's other two members (`command-code`, `nlpcloud`) are not caught by
+/// this rule — their `base_url` is a clean base — but by the registry's own
+/// `chatPath` and by `executors/nlpcloud.ts`, so no amount of reading the
+/// base alone can rescue them. That is why the class is documented as two
+/// reasons and not one.
+#[test]
+fn every_row_dispatches_to_its_own_base_url() {
+    for p in PRESET_PROVIDERS {
+        let dispatched = format!(
+            "{}/chat/completions",
+            super::bridge::resolve_base_for(p.id, p.base_url)
+        );
+        if dispatched == p.base_url {
+            assert!(
+                !BASE_URL_ROWS.contains(&p.id),
+                "{}: declared a base, but the bridge now reproduces the catalog URL verbatim — \
+                 remove it from BASE_URL_ROWS",
+                p.id
+            );
+            continue;
+        }
+        assert!(
+            BASE_URL_ROWS.contains(&p.id),
+            "{}: the bridge dispatched to {dispatched:?}, which is neither the catalog's URL nor \
+             a base the catalog declares. Either the row is a full endpoint the bridge can \
+             reproduce (fix `base_url`), or it is a base (add it to BASE_URL_ROWS) — a row the \
+             family bridge extends into a URL the vendor does not serve is the \
+             `family-bridge-unreachable` exclusion class, not a catalog row.",
+            p.id
+        );
+        assert_eq!(
+            dispatched,
+            format!("{}/chat/completions", p.base_url.trim_end_matches('/')),
+            "{}: the bridge did not extend the declared base either — the two readings of \
+             base_url disagree",
+            p.id
+        );
+        let last_segment = p
+            .base_url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !OPERATION_SEGMENTS.contains(&last_segment),
+            "{}: base_url {:?} already ends in the {last_segment:?} operation, so it is an \
+             endpoint the family bridge cannot reproduce — the bridge would dispatch to \
+             {dispatched:?}. Exclude the row or teach the bridge the vendor's path; do not \
+             widen OPENAI_ENDPOINT_SUFFIXES to hide it.",
+            p.id,
+            p.base_url
+        );
+    }
+    for id in BASE_URL_ROWS {
+        let p = find_preset(id)
+            .unwrap_or_else(|| panic!("BASE_URL_ROWS names unknown id {id:?}"));
+        assert_ne!(
+            format!(
+                "{}/chat/completions",
+                super::bridge::resolve_base_for(p.id, p.base_url)
+            ),
+            p.base_url,
+            "{id} is listed as a base but the bridge reproduces it as a full endpoint — the \
+             list has a dead entry"
+        );
+    }
+}
+
+/// Every declared non-Bearer shape names something the bridge can actually
+/// build a header from, and the two shapes stay distinguishable. `maritalk`
+/// is why they are separate variants: its registry value `key` is an
+/// `Authorization` SCHEME, so a consumer that reads one shape as the other
+/// sends the secret to a header the vendor never reads — and the type is
+/// the only place that distinction is still provable.
+#[test]
+fn a_non_bearer_auth_shape_is_a_valid_header_name() {
+    for p in PRESET_PROVIDERS {
+        match p.auth {
+            PresetAuth::Bearer | PresetAuth::None => continue,
+            PresetAuth::ApiKeyHeader(name) => assert!(
+                http::HeaderName::from_bytes(name.as_bytes()).is_ok(),
+                "{}: {name:?} is catalogued as a header name but is not one",
+                p.id
+            ),
+            PresetAuth::AuthorizationScheme(scheme) => {
+                assert!(
+                    !scheme.is_empty() && !scheme.contains(char::is_whitespace),
+                    "{}: {scheme:?} is catalogued as an Authorization scheme but is not one",
+                    p.id
+                );
+                assert!(
+                    !scheme.eq_ignore_ascii_case("bearer"),
+                    "{}: Bearer is its own variant; spelling it out here would render the \
+                     prefix twice",
+                    p.id
+                );
+            }
+        }
+    }
 }
 
 #[test]
