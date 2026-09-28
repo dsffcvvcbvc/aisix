@@ -871,7 +871,7 @@ mod tests {
     fn origin_root_routes_cannot_take_an_admin_path() {
         // First segments the admin listener already owns, and what each one
         // carries. Measured against `build_router`'s own mount list.
-        let reserved: [(&str, &str); 10] = [
+        let reserved: [(&str, &str); 7] = [
             ("admin", "/admin/* — the Admin API and the OpenAPI pair"),
             ("livez", "/livez"),
             ("readyz", "/readyz"),
@@ -879,11 +879,11 @@ mod tests {
             ("metrics", "the scrape path, owned by the metrics listener"),
             ("_next", "/_next/*path — the content-hashed asset tree"),
             ("dashboard", "/dashboard, /dashboard/, /dashboard/*path"),
-            // The three origin-root asset trees, three mounts each, derived
-            // from the one table that also carries the chokepoint's bound.
-            ("providers", "/providers, /providers/, /providers/*path"),
-            ("images", "/images, /images/, /images/*path"),
-            (".well-known", "/.well-known, /.well-known/, /.well-known/*path"),
+            // The three origin-root asset trees are deliberately NOT listed
+            // here. This array is the set of segments owned by OTHER routes
+            // and listeners, and the assertion below is that an asset tree
+            // does not collide with one of them. Listing the trees here would
+            // make the test compare them against themselves.
         ];
         // Every path `build_router` mounts by hand, so a table entry that
         // duplicates one of them is caught here rather than as a boot panic.

@@ -1818,10 +1818,17 @@ mod tests {
         // Absent, a dotted path at the root is a ROUTE name, not a missing
         // artifact: no Next build protocol ever asks for `/favicon.png`, so
         // its absence says nothing about the build and 500 would be a lie.
+        //
+        // `openapi.yaml` used to be in this list. It is not any more, and not
+        // because the rule stopped holding: the export census above needs a
+        // PRESENT origin-root file to rule on, and the shared fixture now
+        // carries one. A dotted path that EXISTS is a file — the first
+        // assertion in this test proves that for `dashboard.txt` — so the
+        // four names below are the absent case, which is what the rule is
+        // actually about, and `openapi.yaml` is now the present case.
         for url_path in [
             "dashboard.txt",
             "favicon.png",
-            "openapi.yaml",
             "sitemap.xml",
             "status.json",
         ] {
@@ -3821,12 +3828,13 @@ mod tests {
             // The three directives that make the header a policy and not a
             // decoration, asserted on the header itself so a shortened value
             // is a failure here.
-            // `HeaderValue` derefs to `[u8]`, not to `str`, so the substring
-            // assertions have to go through `to_str`. Every value this crate
-            // builds is a `&'static str`, so the unwrap cannot fire.
+            // This crate's `get` helper hands back header values as `String`,
+            // not `HeaderValue`, so the substring assertions go through
+            // `String::as_str` — the same conversion the equality assertion
+            // above uses. Reaching for `to_str()` here does not compile.
             let csp = headers
                 .get("content-security-policy")
-                .and_then(|value| value.to_str().ok())
+                .map(String::as_str)
                 .expect("the header was just compared equal to a &str literal");
             assert!(csp.contains("sandbox"), "{uri} csp is not sandboxed: {csp}");
             assert!(
@@ -3848,7 +3856,7 @@ mod tests {
                 "{uri} x-content-type-options"
             );
             assert!(
-                headers.get("content-security-policy").is_none(),
+                !headers.contains_key("content-security-policy"),
                 "{uri} carries a document CSP it was never scoped to"
             );
         }
@@ -4276,7 +4284,7 @@ mod tests {
         // bound rather than by the root containment, which is the point of
         // listing them separately.
         for uri in ["/providers/escape.svg", "/providers/hop/leaf.svg"] {
-            let (status, body, headers) = get(dashboard_app(), uri).await;
+            let (status, body, _headers) = get(dashboard_app(), uri).await;
             assert!(
                 status.is_client_error(),
                 "{uri} answered {status} with {body:?}"
