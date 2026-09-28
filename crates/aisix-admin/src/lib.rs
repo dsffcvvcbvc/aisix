@@ -248,29 +248,39 @@ pub fn build_router(state: AdminState) -> Router {
             "/icon-512.png",
             get(resources_handler::serve_dashboard_path),
         )
-        // The vendor-logo tree. Mounted as a TREE, not as a list of names: the
-        // catalog draws a vendor as `<img src="/providers/<id>.svg">`, and the
-        // export ships 141 of those — the five mounted by name until now were
-        // the ones an origin-root document happened to link to, so
-        // `/dashboard/providers/openai` rendered a grid of empty logo frames
-        // with nothing on the page saying why. A name list is a list that rots
-        // silently against every catalog change, which is the same failure the
-        // rest of this mount list is written to avoid.
+        // The origin-root ASSET TREES, derived rather than written out.
         //
-        // What the tree exposes is bounded in the chokepoint, not here:
-        // `is_provider_logo` admits only what the mime table classifies as an
-        // image, so a `.js`/`.html` a future export drops into `providers/` is
-        // not served from the admin origin. `/providers` and `/providers/` are
-        // mounted for the reason `/docs/` is: `matchit` 0.7.3 leaves a
-        // trailing-slash path unmatched against a catch-all, and an unmounted
-        // one would answer the router's bare 404 rather than this surface's
-        // explanation of what is and is not in the build.
-        .route("/providers", get(resources_handler::serve_dashboard_path))
-        .route("/providers/", get(resources_handler::serve_dashboard_path))
-        .route(
-            "/providers/*path",
-            get(resources_handler::serve_dashboard_path),
-        )
+        // `providers/`, `images/` and `.well-known/` are directories the
+        // export lays down at its root, and they are mounted as TREES rather
+        // than as a list of names: the catalog draws a vendor as `<img
+        // src="/providers/<id>.svg">` and the export ships 141 of those, so
+        // the five mounted-by-name form left 136 of them 404ing on
+        // `/dashboard/providers/openai` — a grid of empty logo frames with
+        // nothing on the page saying why. A name list is a list that rots
+        // silently against every catalog change, which is the same failure
+        // the rest of this mount list is written to avoid, and
+        // `resources_handler::ORIGIN_ROOT_ASSET_TREES` is the ONE list: it
+        // also carries the type bound the chokepoint refuses against, so a
+        // tree cannot be mounted without one or bounded without being
+        // mounted.
+        //
+        // What each tree exposes is bounded in the chokepoint, not here: a
+        // `.js`/`.html` a future export drops into `providers/` is not served
+        // from the admin origin, and the image trees additionally answer with
+        // `nosniff` and a `sandbox` CSP (`file_response`).
+        //
+        // Three mounts each, not one, because `matchit` 0.7.3 (`tree.rs:519`)
+        // leaves a trailing-slash path unmatched against a catch-all: `/images`
+        // and `/images/` are mounted for the reason `/docs/` is, and an
+        // unmounted one would answer the router's bare 404 rather than this
+        // surface's explanation of what is and is not in the build.
+        //
+        // Whether an origin-root directory is MISSING from the table is a
+        // separate question the export answers, and
+        // `every_origin_root_directory_of_the_export_is_mounted_or_declared_dead`
+        // is what asks it: a directory a future export adds has to be mounted
+        // or explicitly declared unmounted, with a reason.
+
         // Route families a static export can never carry, mounted so they get
         // the honest 404 instead of the router's bare one: `/docs/*` is
         // force-dynamic by design, and `/connect/codex/[token]` is a
@@ -406,10 +416,33 @@ pub fn build_router(state: AdminState) -> Router {
     // measured route list, and `resources_handler`'s tests own the layout
     // rules every mount here resolves through.
     //
-    // Deliberately NOT a catch-all fallback: a fallback would make this the
-    // answer for every unmatched path on the admin listener, including a
-    // mistyped `/admin/v1/...`, and answer it in a body that names the
-    // dashboard. What is left unmatched stays the router's own answer.
+    // The unmatched path, and the ONE fallback on this router. It exists
+    // because the router's own answer for an unmatched path is a zero-length
+    // 404 with no content type: an operator who fat-fingers a dashboard URL
+    // gets silence, which is indistinguishable from a hung proxy or a
+    // mis-pointed ingress. Every family above is mounted "so they get the
+    // honest 404 instead of the router's bare one"; leaving the rest silent
+    // was the same defect one level up.
+    //
+    // **Why the body is generic, which is the whole design.** This fallback is
+    // the answer for EVERY unmatched path on the admin listener, including a
+    // mistyped `/admin/v1/...` — and the reason this router originally had no
+    // fallback at all was that doing so would "answer it in a body that names
+    // the dashboard". That objection is about the NAMING, not about the body:
+    // a mistyped admin API path must not come back as a page about a
+    // dashboard. So the body names the LISTENER and nothing else — no
+    // dashboard, no SPA, no export, no `~/.aisix`, in any language or fragment.
+    // `resources_handler::serve_no_such_route` is where that sentence is
+    // enforced and where the tests that pin it live.
+    //
+    // **Why it does not collapse the mounted-vs-unmounted distinction.** Before
+    // this, a 404 with a text body meant "a mount covered this and the build
+    // does not carry it", and a 404 with no body meant "no mount covers this".
+    // The fallback makes both a `text/plain` 404, so the difference MOVES
+    // rather than dies: the fallback alone sets `x-aisix-route-state`, and
+    // its PRESENCE is the signal. **Making the three bodies identical for
+    // tidiness is the change that would genuinely destroy it**, which is why
+    // `resources_handler`'s `the_two_404s_stay_distinguishable` exists.
     let mut router = router;
     for route in resources_handler::ORIGIN_ROOT_ROUTES {
         router = router
@@ -428,7 +461,32 @@ pub fn build_router(state: AdminState) -> Router {
             );
     }
 
+    // The origin-root asset trees, the same three spellings for the same
+    // `matchit` reason, derived from the ONE table that also carries the
+    // chokepoint's type bound — see the comment above for why a tree is
+    // mounted as a tree and what bounds it.
+    for tree in resources_handler::ORIGIN_ROOT_ASSET_TREES {
+        router = router
+            .route(
+                &format!("/{}", tree.dir),
+                get(resources_handler::serve_dashboard_path),
+            )
+            .route(
+                &format!("/{}/", tree.dir),
+                get(resources_handler::serve_dashboard_path),
+            )
+            .route(
+                &format!("/{dir}/*path", dir = tree.dir),
+                get(resources_handler::serve_dashboard_path),
+            );
+    }
+
     router
+        // The unmatched path, and the only fallback on this router. Before
+        // it, an unmatched path got axum's own answer — a zero-length 404 with
+        // no content type — and the rationale for leaving it that way is
+        // recorded in the comment above the route table.
+        .fallback(resources_handler::serve_no_such_route)
         // One chokepoint for CSRF, hoisted over the whole router rather
         // than into the mutating handlers: a cookie credential is ambient
         // authority, so EVERY unsafe method on this router is
@@ -813,7 +871,7 @@ mod tests {
     fn origin_root_routes_cannot_take_an_admin_path() {
         // First segments the admin listener already owns, and what each one
         // carries. Measured against `build_router`'s own mount list.
-        let reserved: [(&str, &str); 8] = [
+        let reserved: [(&str, &str); 10] = [
             ("admin", "/admin/* — the Admin API and the OpenAPI pair"),
             ("livez", "/livez"),
             ("readyz", "/readyz"),
@@ -821,7 +879,11 @@ mod tests {
             ("metrics", "the scrape path, owned by the metrics listener"),
             ("_next", "/_next/*path — the content-hashed asset tree"),
             ("dashboard", "/dashboard, /dashboard/, /dashboard/*path"),
+            // The three origin-root asset trees, three mounts each, derived
+            // from the one table that also carries the chokepoint's bound.
             ("providers", "/providers, /providers/, /providers/*path"),
+            ("images", "/images, /images/, /images/*path"),
+            (".well-known", "/.well-known, /.well-known/, /.well-known/*path"),
         ];
         // Every path `build_router` mounts by hand, so a table entry that
         // duplicates one of them is caught here rather than as a boot panic.
@@ -841,9 +903,9 @@ mod tests {
             "/sw.js",
             "/apple-touch-icon.png",
             "/icon-512.png",
-            "/providers",
-            "/providers/",
-            "/providers/*path",
+            // `/providers`, `/images` and `/.well-known` are NOT here: they
+            // are derived from ORIGIN_ROOT_ASSET_TREES below, and listing them
+            // by hand as well is exactly the second list that would drift.
             "/docs",
             "/docs/",
             "/docs/*path",
@@ -853,6 +915,37 @@ mod tests {
             "/playground/chat/completions",
         ];
         let mut mounted: Vec<String> = Vec::new();
+        for tree in resources_handler::ORIGIN_ROOT_ASSET_TREES {
+            let first = tree.dir;
+            for (segment, owns) in reserved {
+                assert_ne!(
+                    first, segment,
+                    "the asset tree {first} would take {owns}"
+                );
+            }
+            for derived in [
+                format!("/{first}"),
+                format!("/{first}/"),
+                format!("/{first}/*path"),
+            ] {
+                assert!(
+                    !handwritten.contains(&derived.as_str()),
+                    "{derived} is mounted by hand as well as from the asset-tree table"
+                );
+                assert!(!mounted.contains(&derived), "{derived} is mounted twice");
+                mounted.push(derived);
+            }
+            // …and a tree that claims a mount already claimed is a boot panic
+            // rather than a silent shadow, so catch it here where the message
+            // can say which two lists collided.
+            for route in resources_handler::ORIGIN_ROOT_ROUTES {
+                let route_first = route.trim_start_matches('/').split('/').next().unwrap();
+                assert_ne!(
+                    route_first, first,
+                    "the asset tree {first} and the route {route} claim the same mount"
+                );
+            }
+        }
         for route in resources_handler::ORIGIN_ROOT_ROUTES {
             let first = route.trim_start_matches('/').split('/').next().unwrap();
             for (segment, owns) in reserved {

@@ -8,9 +8,11 @@
 //!   exported documents request without the `dashboard` prefix
 //! - `GET /` and the origin-root app routes: the export's own non-dashboard
 //!   surface, resolved by the same chokepoint as the two above
-//! - `GET /providers/*path`: the vendor-logo tree, whose contents are a
-//!   property of the catalog rather than of the build, so it is mounted as a
-//!   tree — see [`PROVIDERS_DIR`]
+//! - `GET /providers/*path`, `GET /images/*path`, `GET /.well-known/*path`:
+//!   the origin-root ASSET TREES, whose contents are a property of the vendor
+//!   catalog or of the export's `public/` directory rather than of the build's
+//!   route table, so each is mounted as a tree rather than by a list of names —
+//!   see [`ORIGIN_ROOT_ASSET_TREES`]
 
 use std::path::{Path, PathBuf};
 
@@ -228,7 +230,7 @@ fn mime_for_path(path: &Path) -> &'static str {
 /// resolves to [`DashboardResolution::NoBuildAtEntry`]. `/` is the same
 /// handler: which of the two a URL is comes from the path, not the mount.
 pub async fn serve_dashboard_index(uri: Uri) -> Response {
-    dashboard_response(&uri)
+    dashboard_off_runtime(uri).await
 }
 
 /// Every other dashboard URL: route documents, RSC payloads, per-segment
@@ -240,19 +242,55 @@ pub async fn serve_dashboard_index(uri: Uri) -> Response {
 /// `/connect/codex/:token`).
 ///
 /// Mounted on `/dashboard/*path`, on `/_next/*path`, on `/`, on each entry of
-/// [`ORIGIN_ROOT_ROUTES`], and on the handful of named root-level files a
-/// document links to. All of them resolve identically, so they are all one
+/// [`ORIGIN_ROOT_ROUTES`], on each origin-root asset tree in
+/// [`ORIGIN_ROOT_ASSET_TREES`], and on the handful of named root-level files
+/// a document links to. All of them resolve identically, so they are all one
 /// handler: a mount that had its own copy of this logic is exactly how the
 /// layout rules would drift.
 pub async fn serve_dashboard_path(uri: Uri) -> Response {
-    dashboard_response(&uri)
+    dashboard_off_runtime(uri).await
+}
+
+/// Both entry points, and the reason neither runs its resolution on the
+/// calling thread: every candidate [`dashboard_response`] consults is a
+/// synchronous syscall — `canonicalize` on the root, then `is_file` +
+/// `canonicalize` per candidate, and finally a full `read` of a file that is
+/// routinely tens of megabytes — and every one of these mounts is an
+/// UNAUTHENTICATED `GET` on the runtime whose worker threads also carry
+/// `/admin/v1/*` and `/livez`. Same reasoning as `lib.rs`'s `off_runtime`,
+/// for the same reason: neither listener may block a worker on filesystem
+/// I/O. One helper rather than two copies, so a mount added later inherits it.
+async fn dashboard_off_runtime(uri: Uri) -> Response {
+    match tokio::task::spawn_blocking(move || dashboard_response(&uri)).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "dashboard chokepoint task did not complete");
+            plain_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error: the dashboard chokepoint task did not complete",
+            )
+        }
+    }
 }
 
 /// The script the exported dashboard registers, at the origin root.
 const SERVICE_WORKER_FILE: &str = "sw.js";
 
-/// The one dashboard-origin URL this host answers WITHOUT consulting the
-/// export, and the reasoning that makes it the only one.
+/// The one dashboard-origin URL this host answers with a script of its own
+/// rather than the export's, and the enforcement that makes it the only one.
+///
+/// The claim is enforced, not asserted. `resolve_dashboard` refuses ANY
+/// resolved file named [`SERVICE_WORKER_FILE`], from every URL shape that
+/// reaches the export root — including `/dashboard/sw.js`, which the
+/// `origin_asset` candidate made a second URL for the export's real worker
+/// (that is how it was served at `application/javascript` under `no-cache`
+/// before this bound existed). So the export's worker cannot reach a browser
+/// through this host at all, and a mount added later cannot reintroduce it
+/// without also removing the bound. It is also the only URL that ANSWERS with
+/// a worker at all: the re-rooted `/dashboard/sw.js` spelling gets a 404
+/// carrying this surface's plain explanation rather than the router's bare
+/// one, so the answer does not change with the mount. Both halves are pinned
+/// by `tests::the_export_s_own_worker_is_not_served_from_any_url_shape`.
 ///
 /// The export ships a real service worker at its root and registers it from
 /// `_next/static/chunks/*` as `serviceWorker.register("/sw.js?v=<build stamp>")`
@@ -365,7 +403,14 @@ const ADMIN_ORIGIN_SERVICE_WORKER: &str = r#"// AISIX admin origin — this host
 // plane an offline operator cannot act on.
 //
 // The only thing that runs is the sweep: storage an earlier build left on this
-// origin is removed rather than left on an operator's disk.
+// origin is removed rather than left on an operator's disk. It runs on install
+// AND calls skipWaiting(), because without it a newly installed worker parks
+// in `waiting` until every tab on the origin closes — and the operators who
+// have storage to sweep are exactly the ones who ran the pre-fix build and
+// still have a tab open on it. The export's own worker skips waiting in its
+// install chain too; this is the established behaviour of the file, not a
+// house style invented here. There is no `fetch` handler whose activation
+// would need negotiating with a live page, and the sweep is idempotent.
 const sweep = async () => {
   try {
     const keys = await caches.keys();
@@ -377,7 +422,9 @@ const sweep = async () => {
   }
 };
 
-self.addEventListener("install", (event) => event.waitUntil(sweep()));
+self.addEventListener("install", (event) => {
+  event.waitUntil(sweep().then(() => self.skipWaiting()));
+});
 self.addEventListener("activate", (event) => event.waitUntil(sweep()));
 "#;
 
@@ -386,8 +433,12 @@ self.addEventListener("activate", (event) => event.waitUntil(sweep()));
 fn dashboard_response(uri: &Uri) -> Response {
     let root = dashboard_root();
     match resolve_dashboard(&root, uri.path()) {
-        DashboardResolution::File { path, immutable } => match std::fs::read(&path) {
-            Ok(bytes) => file_response(bytes, &path, immutable),
+        DashboardResolution::File {
+            path,
+            immutable,
+            tree,
+        } => match std::fs::read(&path) {
+            Ok(bytes) => file_response(bytes, &path, immutable, tree),
             Err(error) => broken_build_response(&path, error),
         },
         // A sub-resource of a build that is not deployed is absent, not the
@@ -404,7 +455,34 @@ fn dashboard_response(uri: &Uri) -> Response {
     }
 }
 
-fn file_response(bytes: Vec<u8>, path: &Path, immutable: bool) -> Response {
+/// `X-Content-Type-Options: nosniff` on EVERY file this chokepoint serves,
+/// and not only on the image trees.
+///
+/// The media type here comes from one table whose default arm is
+/// `application/octet-stream`, and without `nosniff` a browser is free to
+/// sniff an octet-stream body into whatever it likes — which is how a file
+/// the export ships under an extension the table has never heard of becomes
+/// `text/html` on the origin `/admin/v1/*` answers on. The header costs
+/// nothing, is what every static origin sets, and is recorded as missing on
+/// all dashboard files in `context.md` §4.2.
+///
+/// The `Content-Security-Policy` goes on the ASSET TREES only, and only
+/// because those are the files a browser may render as a top-level
+/// DOCUMENT: `sandbox` with no `allow-same-origin` puts such a document in an
+/// opaque origin, so a `<script>` inside a logo SVG — every one of the 141
+/// shipped logos is an `.svg`, so this is not hypothetical — runs with no
+/// access to this origin's cookies and cannot reach `/admin/v1/*`; and
+/// `default-src 'none'` stops it loading or exfiltrating anything. It does
+/// not affect the normal case: the same bytes loaded through `<img>` are an
+/// image, not a document, and a CSP on an image response is not applied to
+/// the embedding page. Route documents and chunks are untouched — a CSP on
+/// them would break the app this host exists to serve.
+fn file_response(
+    bytes: Vec<u8>,
+    path: &Path,
+    immutable: bool,
+    tree: Option<OriginRootAssetTree>,
+) -> Response {
     let mut resp = bytes.into_response();
     let headers = resp.headers_mut();
     if let Ok(value) = HeaderValue::from_str(mime_for_path(path)) {
@@ -417,8 +495,25 @@ fn file_response(bytes: Vec<u8>, path: &Path, immutable: bool) -> Response {
     }) {
         headers.insert(CACHE_CONTROL, value);
     }
+    // `from_static` is a `const fn` returning the value, not a `Result` —
+    // unlike `from_str`, whose `if let Ok` arms are the convention elsewhere
+    // in this file. A static string cannot fail to be a header value.
+    headers.insert("x-content-type-options", HeaderValue::from_static("nosniff"));
+    if tree.is_some() {
+        headers.insert(
+            "content-security-policy",
+            HeaderValue::from_static(ORIGIN_ROOT_ASSET_TREE_CSP),
+        );
+    }
     resp
 }
+
+/// The marker that says "this 404 came from the FALLBACK, not from a mount
+/// that consulted the export". Set by [`serve_no_such_route`] and by nothing
+/// else in the crate — see that function for why the absence of this header
+/// is itself the signal.
+const ROUTE_STATE_HEADER: &str = "x-aisix-route-state";
+const ROUTE_STATE_UNMOUNTED: &str = "unmounted";
 
 fn route_absent_response(url_path: &str) -> Response {
     // Honest 404: the export carries no such route. Route families that are
@@ -434,6 +529,61 @@ fn route_absent_response(url_path: &str) -> Response {
         StatusCode::NOT_FOUND,
         "not found: this route is not part of the deployed dashboard build",
     )
+}
+
+/// The answer for a path this listener mounts NOTHING for — the fallback.
+///
+/// **Why this exists.** Without it the router's own answer is a zero-length
+/// 404 with no content type, and an operator who fat-fingers a dashboard URL
+/// gets silence, which is indistinguishable from a hung proxy or a
+/// mis-pointed ingress. This host already mounts families a static export can
+/// never carry (`/docs/*`, `/connect/codex/:token`) and every entry of the
+/// route table specifically "so they get the honest 404 instead of the
+/// router's bare one"; leaving the remaining unmatched paths silent was the
+/// same defect one level up.
+///
+/// **What it deliberately does NOT say: the word "dashboard".** The original
+/// objection to a fallback, recorded at the mount loop, was that a fallback
+/// "would make this the answer for every unmatched path on the admin listener,
+/// including a mistyped `/admin/v1/...`, and answer it in a body that names
+/// the dashboard". That objection is about the NAMING, not about the body: a
+/// mistyped admin API path must not be answered with a page about a
+/// dashboard. So this body names the listener and nothing else, and
+/// `tests::the_fallback_does_not_name_the_dashboard` pins that.
+///
+/// **Why the marker header, stated so the next reader does not "tidy" it
+/// away.** Before the fallback there were two 404s with different meanings —
+/// a zero-byte bare one (nothing mounted) and a text-body one from this
+/// module (mounted, file absent) — and the difference was a fact an operator
+/// debugging a 404 had to know about. A fallback erases it: both now answer
+/// 404 with a `text/plain` body. So the difference MOVES rather than dies —
+/// into [`ROUTE_STATE_HEADER`], which a log filter can key on and a test can
+/// assert on. **The change that would genuinely destroy the signal is making
+/// the two bodies identical for tidiness.** They are close on purpose and they
+/// must stay distinguishable; `tests::the_two_404s_stay_distinguishable` is
+/// what stops that from happening quietly.
+pub async fn serve_no_such_route(uri: Uri) -> Response {
+    tracing::debug!(
+        url_path = uri.path(),
+        "no route is mounted on this listener for this path"
+    );
+    let mut response = plain_response(
+        StatusCode::NOT_FOUND,
+        "not found: no route is mounted on this listener",
+    );
+    route_state_header(&mut response);
+    response
+}
+
+/// The marker. Set on the fallback and on nothing else, so its PRESENCE is
+/// the whole signal: a 404 carrying it had no mount to consult, and a 404
+/// without it did. A `&'static str` cannot fail to be a header value, so this
+/// is infallible by construction rather than by a silent `if let`.
+fn route_state_header(response: &mut Response) {
+    response.headers_mut().insert(
+        ROUTE_STATE_HEADER,
+        HeaderValue::from_static(ROUTE_STATE_UNMOUNTED),
+    );
 }
 
 fn asset_missing_response(url_path: &str) -> Response {
@@ -582,8 +732,9 @@ const NEXT_STATIC_DIR: &str = "_next/static";
 /// to what a logo tree is for — see [`is_provider_logo`].
 const PROVIDERS_DIR: &str = "providers";
 
-/// Whether a file inside [`PROVIDERS_DIR`] is one this mount may serve: what
-/// the mime table classifies as an image.
+/// Whether a file inside an image asset tree — [`PROVIDERS_DIR`] or
+/// [`IMAGES_DIR`], the two trees [`AssetTreeBound::Image`] names — is one this
+/// host may serve: what the mime table classifies as an image.
 ///
 /// The alternative — answering for every file in the tree — would put
 /// whatever a future export drops into `providers/` on the admin origin,
@@ -603,6 +754,130 @@ const PROVIDERS_DIR: &str = "providers";
 /// better one than serving it.
 fn is_provider_logo(path: &Path) -> bool {
     mime_for_path(path).starts_with("image/")
+}
+
+/// The export's other origin-root tree: the onboarding tier-flow diagram, at
+/// its root, selected by the client's theme. `dashboard/onboarding.html`
+/// loads the chunk that emits `/images/tier-flow-{dark,light}.svg` into an
+/// unoptimized `next/image` with no `onError` fallback, so an unmounted
+/// `/images/*` is an empty 800×420 frame on the operator's first-run page
+/// with nothing saying why.
+const IMAGES_DIR: &str = "images";
+
+/// The A2A discovery documents, at the export root. The export ships
+/// `.well-known/agent.json` and `.well-known/agent-card.json`; the shipped
+/// i18n bundles and the origin-root landing page both render
+/// `/.well-known/agent.json` to the operator as the path to fetch, so an
+/// unmounted tree makes the host contradict its own instructions.
+///
+/// AISIX itself serves agent cards at `/a2a/<name>/.well-known/agent.json`
+/// — see `aisix_core::models::a2a_agent` — so serving the EXPORT's copy here
+/// is not the gateway claiming an identity; it is the static export's own
+/// discovery document, which the export puts at the origin root and which
+/// this origin is what serves. It is bounded to `application/json` (see
+/// [`OriginRootAssetTree::admits`]), so a `.html` or a `.js` a future export
+/// drops into the same directory is not served from the admin origin.
+const WELL_KNOWN_DIR: &str = ".well-known";
+
+/// One origin-root ASSET TREE: a directory the export lays down at its root
+/// whose contents are a property of the catalog or of `public/` rather than of
+/// the build's route table.
+///
+/// This one table is what makes the mount list and the chokepoint's type bound
+/// the same fact rather than two lists that can drift:
+/// `build_router` derives `/{dir}`, `/{dir}/` and `/{dir}/*path` from it (three
+/// spellings, because `matchit` 0.7.3 leaves a trailing-slash path unmatched
+/// against a catch-all), and [`resolve_dashboard`] refuses anything inside it
+/// that [`OriginRootAssetTree::admits`] does not. Admitting a new asset tree
+/// is therefore one line HERE, and a tree cannot be mounted without a bound
+/// or bounded without being mounted.
+///
+/// Whether an omission is ever still possible is a separate question, and the
+/// export is the authority on it: `tests::every_origin_root_directory_of_the_export_is_mounted_or_declared_dead`
+/// walks the fixture's own top level, so a directory a future export adds has
+/// to be mounted or explicitly declared unmounted with a reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OriginRootAssetTree {
+    /// The directory name at the export root, which is also the first path
+    /// segment of every URL that reaches it.
+    pub dir: &'static str,
+    /// What a file in this tree may be served as.
+    pub bound: AssetTreeBound,
+}
+
+/// The type bound one origin-root asset tree is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetTreeBound {
+    /// An image — the vendor-logo and onboarding-diagram trees. Bounded by
+    /// [`is_provider_logo`], which every one of the 141 shipped logos and both
+    /// tier-flow diagrams satisfies.
+    Image,
+    /// A discovery document — the A2A cards. The export ships two `.json`
+    /// files; the same media-type rule admits the `.map` the mime table also
+    /// types as `application/json` and nothing else.
+    Json,
+}
+
+impl OriginRootAssetTree {
+    /// Whether a file this tree resolved to is one the tree may serve.
+    ///
+    /// Decided on the TYPE the response would carry and never on the name of
+    /// a second extension list, for the reason [`is_provider_logo`] gives:
+    /// the file is servable here exactly when the ONE mime table already in
+    /// this file gives it a type the tree is for. A tree that named
+    /// extensions instead would be a list that rots silently against every
+    /// export — which is the failure the whole table exists to remove.
+    pub(crate) fn admits(&self, path: &Path) -> bool {
+        match self.bound {
+            AssetTreeBound::Image => is_provider_logo(path),
+            AssetTreeBound::Json => mime_for_path(path) == "application/json",
+        }
+    }
+}
+
+/// The response policy every origin-root asset tree is served under. See
+/// [`file_response`], which is where it is set and why it does not apply to
+/// the rest of the export.
+const ORIGIN_ROOT_ASSET_TREE_CSP: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+/// Every origin-root asset tree the host mounts. Measured from the deployed
+/// export artifact `omniroute-dashboard-out` #10932864997: `providers/` (141
+/// `.svg`), `images/` (2 `.svg`) and `.well-known/` (2 `.json`). The one
+/// origin-root directory the export lays down that is deliberately NOT here
+/// is `sponsors/`, and `tests::every_origin_root_directory_of_the_export_is_mounted_or_declared_dead`
+/// is what says so out loud rather than leaving it to the next reader's
+/// memory.
+pub(crate) const ORIGIN_ROOT_ASSET_TREES: &[OriginRootAssetTree] = &[
+    OriginRootAssetTree {
+        dir: PROVIDERS_DIR,
+        bound: AssetTreeBound::Image,
+    },
+    OriginRootAssetTree {
+        dir: IMAGES_DIR,
+        bound: AssetTreeBound::Image,
+    },
+    OriginRootAssetTree {
+        dir: WELL_KNOWN_DIR,
+        bound: AssetTreeBound::Json,
+    },
+];
+
+/// The tree a candidate was SPELLED in, or `None` when it was spelled
+/// outside every origin-root asset tree.
+///
+/// Spelled, deliberately: [`resolve_dashboard`] also checks where the file
+/// resolved to, but only a spelling can say "this request addressed a logo
+/// tree" at all. A symlink inside a tree that points at something outside it
+/// is caught by the second check there — the resolved path has to still be
+/// in the same tree — so a mount cannot be laundered through a link.
+fn origin_root_asset_tree(
+    real_root: &Path,
+    candidate: &Path,
+) -> Option<&'static OriginRootAssetTree> {
+    ORIGIN_ROOT_ASSET_TREES
+        .iter()
+        .find(|tree| candidate.starts_with(real_root.join(tree.dir)))
 }
 
 /// The export root's own document: a null-rendering `EntryRedirector` whose
@@ -644,7 +919,19 @@ const BUILD_ARTIFACT_EXTENSIONS: &[&str] = &[
 #[derive(Debug, PartialEq, Eq)]
 enum DashboardResolution {
     /// A file inside the dashboard root, safe to serve.
-    File { path: PathBuf, immutable: bool },
+    ///
+    /// `tree` is the origin-root asset tree the request was SPELLED in, or
+    /// `None` when it was spelled outside every one. It rides along rather
+    /// than being recomputed from `path` because the two are not the same
+    /// fact: `path` is the resolved location (a symlink may have moved it
+    /// out of the tree entirely) and it is the SPELLING that says the
+    /// response is being served as a public asset and so owes
+    /// `file_response`'s `nosniff` + `sandbox` CSP.
+    File {
+        path: PathBuf,
+        immutable: bool,
+        tree: Option<OriginRootAssetTree>,
+    },
     /// The request is a route document the deployed build does not carry.
     RouteAbsent,
     /// The request is a build artifact the deployed build does not carry,
@@ -712,9 +999,14 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
         return no_build(rel.at_entry);
     }
 
-    // A candidate the logo bound rejected is remembered, so the answer for the
-    // request does not fall out of which mount spelled it: see the bound below.
-    let mut logo_bound_refused = false;
+    // A candidate the asset-tree bound rejected is remembered, so the answer
+    // for the request does not fall out of which mount spelled it: see the
+    // bound below.
+    let mut asset_bound_refused = false;
+    // The export's own service worker is never served by this chokepoint, from
+    // any spelling — see the bound below for why that is decided here rather
+    // than by a mount.
+    let mut export_worker_refused = false;
     for candidate in dashboard_candidates(&real_root, &rel) {
         if !candidate.is_file() {
             continue;
@@ -729,15 +1021,40 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
         if !real.starts_with(&real_root) {
             return DashboardResolution::Refused;
         }
-        // The logo tree is mounted as a tree, so it is bounded to what a logo
-        // tree holds. Decided on the RESOLVED path, not on how the URL spelled
-        // the request, so neither the re-rooted `/dashboard/providers/x.svg`
-        // form nor a symlink into the tree can present a file the tree is not
-        // for — and so the app-route documents under `dashboard/providers/`
-        // (`openai.html`, `openai.txt`, the per-segment files), which are a
-        // different tree at a different place, are untouched by it.
-        if real.starts_with(real_root.join(PROVIDERS_DIR)) && !is_provider_logo(&real) {
-            logo_bound_refused = true;
+        // An origin-root asset tree is mounted as a tree, so it is bounded to
+        // what such a tree holds. BOTH halves of the check are load-bearing
+        // and they answer different questions:
+        //
+        // * `origin_root_asset_tree` keys on where the request was SPELLED —
+        //   it is the only thing that can say "this URL addressed a logo tree",
+        //   and it is what keeps the re-rooted `/dashboard/providers/x.svg`
+        //   form on the same verdict as `/providers/x.svg` and the app-route
+        //   documents under `dashboard/providers/` (a different tree at a
+        //   different place) on the other.
+        // * The `real.starts_with` half then re-checks where the file landed:
+        //   an in-tree symlink pointing OUT of the tree resolves to a path
+        //   that is no longer in it, so `providers/pwn.svg -> _next/static/
+        //   chunks/app.js` would otherwise be served as `application/javascript`
+        //   from the origin `/admin/v1/*` answers on. Deciding on the resolved
+        //   path ALONE cannot catch that, because the resolved path is not in
+        //   the tree at all — which is exactly the case the old
+        //   resolved-path-only check let through.
+        if let Some(tree) = origin_root_asset_tree(&real_root, &candidate) {
+            if !real.starts_with(real_root.join(tree.dir)) || !tree.admits(&real) {
+                asset_bound_refused = true;
+                continue;
+            }
+        }
+        // The export's own service worker, refused from EVERY spelling, which
+        // is what makes the claim on [`serve_service_worker_standing_down`]
+        // true rather than aspirational. It is a NAME and not a tree, so it is
+        // decided on the resolved file's last segment: `/dashboard/sw.js` and
+        // every other mount that reaches `<root>/sw.js` as an origin asset all
+        // land here, while the standing-down mount answers the one URL a
+        // browser registers. Decided beside the resolution rather than by
+        // removing mounts, so a mount added later cannot reintroduce it.
+        if real.file_name().and_then(|name| name.to_str()) == Some(SERVICE_WORKER_FILE) {
+            export_worker_refused = true;
             continue;
         }
         // Decided here, next to the resolution, so the caching contract cannot
@@ -749,21 +1066,36 @@ fn resolve_dashboard(root: &Path, url_path: &str) -> DashboardResolution {
         return DashboardResolution::File {
             immutable: real.starts_with(real_root.join(NEXT_STATIC_DIR)),
             path: real,
+            tree: origin_root_asset_tree(&real_root, &candidate).copied(),
         };
     }
 
     // The bound refused a file that IS in the build, so the request is not
     // asking for a route this build does not have and its absence indicts
-    // nothing either: it is asking for something the logo mount does not
+    // nothing either: it is asking for something the asset-tree mount does not
     // serve. Answering from the artifact classification below would make a
     // perfectly complete build answer 500 "the build is incomplete" — and log
     // it — for a URL no document emits, on a request anyone can make. `debug`
     // is the same reasoning as `refused_response`: this is an unauthenticated
     // surface and a prober must not be able to fill the log.
-    if logo_bound_refused {
+    if asset_bound_refused {
         tracing::debug!(
             url_path,
-            "a file in the provider-logo tree is not a logo and was not served"
+            "a file in an origin-root asset tree is not of that tree's type and was not served"
+        );
+        return DashboardResolution::RouteAbsent;
+    }
+
+    // The same 404, and the same reasoning, for the export's service worker:
+    // it IS in the build, so its absence at this URL indicts nothing and a 500
+    // would tell an operator their build is broken when it is not. It also
+    // keeps the refusal from being an existence oracle — a `/providers/sw.js`
+    // answers exactly as a name that was never shipped does.
+    if export_worker_refused {
+        tracing::debug!(
+            url_path,
+            "the export's own service worker is not served by the chokepoint; /sw.js is answered \
+             by the standing-down mount"
         );
         return DashboardResolution::RouteAbsent;
     }
@@ -1062,8 +1394,60 @@ mod tests {
         fs::write(route.join("__next._full.txt"), "SEGMENT FULL").unwrap();
         fs::create_dir_all(root.join("_next/static/chunks")).unwrap();
         fs::write(root.join("_next/static/chunks/app.js"), b"console.log(1)").unwrap();
+        // The A2A discovery documents, exactly as the export ships them: two
+        // `.json` files in a `.well-known` directory at the root, plus the two
+        // non-JSON files a future export could drop in the same place and
+        // that the tree's `application/json` bound must keep off the admin
+        // origin.
         fs::create_dir_all(root.join(".well-known")).unwrap();
         fs::write(root.join(".well-known/agent.json"), b"{}").unwrap();
+        fs::write(root.join(".well-known/agent-card.json"), b"{}").unwrap();
+        fs::write(
+            root.join(".well-known/agent.html"),
+            b"<html>aisix-well-known-escape</html>",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".well-known/agent.js"),
+            b"console.log('aisix-well-known-escape')",
+        )
+        .unwrap();
+        // The onboarding tier-flow diagram, the real `<img src>` on the
+        // operator's first-run page, selected by the client's theme.
+        fs::create_dir_all(root.join("images")).unwrap();
+        for theme in ["dark", "light"] {
+            fs::write(
+                root.join(format!("images/tier-flow-{theme}.svg")),
+                format!("<svg viewBox='0 0 800 420' id='tier-flow-{theme}'/>"),
+            )
+            .unwrap();
+        }
+        // …and the same non-image a wildcard newly invites in THAT tree, so
+        // the image bound is proven to be shared rather than to be a
+        // `providers/`-only special case.
+        fs::write(
+            root.join("images/loader.js"),
+            b"console.log('aisix-image-tree-escape')",
+        )
+        .unwrap();
+        // An origin-root tree the export really does ship and this host
+        // deliberately does NOT mount. Present so the census has something
+        // to declare dead rather than a hole to fall through.
+        fs::create_dir_all(root.join("sponsors")).unwrap();
+        fs::write(
+            root.join("sponsors/kimi-k3-banner.png"),
+            b"\x89PNG\r\n\x1a\naisix-unmounted-tree",
+        )
+        .unwrap();
+        // The origin-root FILES the export ships and that NO document, chunk
+        // or manifest references anywhere, so the host mounts none of them.
+        // They are in the fixture because the census below has to be able to
+        // say so out loud: a root file that no mount claims and nobody has
+        // declared is the same silent gap `sponsors/` would be, one level up.
+        fs::write(root.join("openapi.yaml"), b"openapi: {}\n").unwrap();
+        fs::write(root.join("deyin.svg"), b"<svg id='deyin'/>").unwrap();
+        fs::write(root.join("icon-192.svg"), b"<svg id='icon-192'/>").unwrap();
+        fs::write(root.join("apple-touch-icon.svg"), b"<svg id='ats'/>").unwrap();
         fs::write(root.join("manifest.webmanifest"), b"{}").unwrap();
         fs::write(root.join("favicon.ico"), b"ICO").unwrap();
         // The origin-root app routes: a document beside its payload and its
@@ -1141,7 +1525,9 @@ mod tests {
 
     fn resolved_file(root: &TempDir, url_path: &str) -> (PathBuf, bool) {
         match resolved(root, url_path) {
-            DashboardResolution::File { path, immutable } => (path, immutable),
+            DashboardResolution::File {
+                path, immutable, ..
+            } => (path, immutable),
             other => panic!("{url_path} should have resolved to a file, got {other:?}"),
         }
     }
@@ -2265,6 +2651,30 @@ mod tests {
             body.contains("caches.delete"),
             "the script must sweep Cache Storage on this origin, not just decline to write to it"
         );
+        // …and it actually TAKES EFFECT on install. Without `skipWaiting()` a
+        // newly installed worker parks in `waiting` until every tab on the
+        // origin closes, so the sweep above would not run for exactly the
+        // operators it exists for: the ones who ran the pre-fix build, whose
+        // export worker precached this origin's own document, and who still
+        // have that build open. The export's own worker skips waiting in its
+        // install chain too, so this matches the file's established behaviour
+        // rather than inventing a house style.
+        assert!(
+            body.contains("skipWaiting"),
+            "the sweep must run on install, not whenever the last tab happens to close. \
+             Body was {body:?}"
+        );
+        // In the install chain specifically: an `activate`-only call would be
+        // the thing this replaces.
+        let install = body
+            .split("addEventListener(\"install\"")
+            .nth(1)
+            .and_then(|tail| tail.split("addEventListener").next())
+            .expect("the script must have an install listener");
+        assert!(
+            install.contains("skipWaiting"),
+            "skipWaiting is not in the install handler: {install:?}"
+        );
         assert_eq!(
             content_type(&headers),
             Some("application/javascript; charset=utf-8"),
@@ -2287,6 +2697,236 @@ mod tests {
             StatusCode::NOT_FOUND,
             "/sw.js.txt answered the script: {body:?}"
         );
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The fallback names the LISTENER and nothing else.
+    ///
+    /// This is the objection the fallback was designed around, so it is the
+    /// one assertion that must be impossible to "improve" away. The fallback
+    /// answers EVERY unmatched path on the admin listener, including a
+    /// mistyped `/admin/v1/...`; a body that named the dashboard there would
+    /// answer a mistyped admin API call with a page about a dashboard, which
+    /// is strictly worse than the silence it replaced. The banned strings are
+    /// checked lowercased and as fragments, so "Dashboard", "the SPA" and
+    /// `.aisix` all fail here.
+    #[tokio::test]
+    async fn the_fallback_does_not_name_the_dashboard() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        for uri in [
+            "/this-route-does-not-exist-anywhere",
+            // A mistyped admin API path is the case the original objection was
+            // written for, so it is probed explicitly rather than assumed.
+            "/admin/v1/this-is-not-an-endpoint",
+            "/livez/deeper",
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri} answered {status}");
+            assert!(
+                !body.is_empty(),
+                "{uri} answered with nothing at all — the operator gets a blank page and no \
+                 indication the path does not exist"
+            );
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri} is not a readable sentence"
+            );
+            let lowered = body.to_lowercase();
+            for banned in [
+                "dashboard",
+                "spa",
+                "omniroute",
+                "export",
+                ".aisix",
+                ".cavora",
+                "build",
+            ] {
+                assert!(
+                    !lowered.contains(banned),
+                    "{uri} answers a mistyped path with a body naming {banned:?} — that is the \
+                     exact objection the fallback was designed around. Body was {body:?}"
+                );
+            }
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// Three different 404-shaped answers, three distinguishable ones.
+    ///
+    /// Before the fallback, "no mount covers this" was a zero-length body and
+    /// "a mount covers it and the build does not carry it" was a sentence. The
+    /// fallback makes both a `text/plain` 404, so the distinction had to move
+    /// rather than die: the fallback alone sets `x-aisix-route-state`, and its
+    /// PRESENCE is the signal.
+    ///
+    /// **This test exists so the bodies cannot quietly be made identical for
+    /// tidiness**, which is the one change that would genuinely destroy the
+    /// diagnostic — a caller would no longer be able to tell "you typed a path
+    /// nothing serves" from "that route is real but this build does not have
+    /// it", and those are different bugs with different fixes.
+    #[tokio::test]
+    async fn the_two_404s_stay_distinguishable() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        // `/status` is a route, so `/status/anything` is a MOUNTED path the
+        // build does not carry. `/this-route-does-not-exist-anywhere` is
+        // mounted by nothing at all. Both are 404s with a `text/plain` body —
+        // that is exactly why a marker is needed.
+        let (fallback_status, fallback_body, fallback_headers) =
+            get(dashboard_app(), "/this-route-does-not-exist-anywhere").await;
+        let (absent_status, absent_body, absent_headers) =
+            get(dashboard_app(), "/status/never-in-this-build").await;
+
+        assert_eq!(fallback_status, StatusCode::NOT_FOUND);
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        assert_ne!(
+            fallback_body, absent_body,
+            "the fallback and the mounted-but-absent 404 say the same thing, so a caller can no \
+             longer tell 'nothing serves this path' from 'that route is real but this build does \
+             not have it'"
+        );
+
+        // The marker is what survives in logs, so its presence is itself the
+        // assertion: only the fallback carries it.
+        assert_eq!(
+            fallback_headers.get(ROUTE_STATE_HEADER).map(String::as_str),
+            Some(ROUTE_STATE_UNMOUNTED),
+            "the fallback stopped marking itself, so the 404s are no longer distinguishable \
+             by anything a log filter can key on"
+        );
+        assert_eq!(
+            absent_headers.get(ROUTE_STATE_HEADER),
+            None,
+            "the mounted-but-absent 404 carries the fallback's marker, so the header no longer \
+             says which kind of 404 this was"
+        );
+
+        // And the third answer — a REQUIRED artifact missing — keeps its own
+        // status and stays distinguishable from both: 500, not 404, because a
+        // missing `_next/static` file indicts the deployment.
+        let (broken_status, broken_body, broken_headers) =
+            get(dashboard_app(), "/_next/static/chunks/a-chunk-that-vanished.js").await;
+        assert_eq!(
+            broken_status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a missing required chunk stopped being a broken deployment"
+        );
+        assert_ne!(
+            broken_body, absent_body,
+            "the 500 and the mounted-404 now share a body, so a broken deployment reads as a \
+             route this build does not have"
+        );
+        assert_ne!(broken_body, fallback_body);
+        assert_eq!(
+            broken_headers.get(ROUTE_STATE_HEADER),
+            None,
+            "the 500 carries the fallback's marker"
+        );
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The export's OWN worker is not served, from ANY url shape.
+    ///
+    /// This is the half of the standing-down mount's claim that the mount
+    /// itself cannot carry. `split_dashboard_entry` sets `origin_asset` for
+    /// every request that arrived under the `/dashboard` mount, so
+    /// `dashboard_candidates` appends `<root>/sw.js` as a candidate for
+    /// `/dashboard/sw.js` — and before the chokepoint refused it, that URL
+    /// answered 200 `application/javascript; charset=utf-8` with the real
+    /// `CACHE_NAME = "omniroute-pwa-v3"` worker, the file whose `install`
+    /// precaches this origin's own root document into credential-blind Cache
+    /// Storage. The handler doc said the standing-down mount was the one URL
+    /// answered without consulting the export; that was false, and the guard
+    /// test could not see it because it only probed `/sw.js`.
+    ///
+    /// Four spellings, and the one that matters is the one a router change
+    /// could plausibly create rather than the one an attacker would type: a
+    /// release that made `assetPrefix` relative would register
+    /// `/dashboard/sw.js` itself.
+    #[tokio::test]
+    async fn the_export_s_own_worker_is_not_served_from_any_url_shape() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root_shipping_a_service_worker();
+        // Decoys that put a file named `sw.js` INSIDE two asset trees, so the
+        // two bounds are exercised independently rather than one standing in
+        // for the other.
+        fs::write(root.path().join("providers/sw.js"), b"// AISIX-DECOY\n").unwrap();
+        fs::write(root.path().join("images/sw.js"), b"// AISIX-DECOY\n").unwrap();
+        let previous = with_test_dashboard_root(root.path());
+
+        // Non-vacuity: the file really is in the export, or "not served"
+        // would be true of a build that never shipped one.
+        let shipped = fs::read_to_string(root.path().join(SERVICE_WORKER_FILE)).unwrap();
+        assert!(
+            shipped.contains("EXPORT-PWA-WORKER-MARKER"),
+            "the fixture must ship the export's worker for this to mean anything"
+        );
+
+        for uri in [
+            // The spelling the `origin_asset` candidate invented.
+            "/dashboard/sw.js",
+            // …and the same name inside the asset trees, where the TREE bound
+            // is what refuses it.
+            "/providers/sw.js",
+            "/images/sw.js",
+            "/.well-known/sw.js",
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert!(
+                status.is_client_error(),
+                "{uri} served the export's own worker: {status}"
+            );
+            assert!(
+                !body.contains("EXPORT-PWA-WORKER-MARKER"),
+                "{uri} served the export's worker verbatim: {body:?}"
+            );
+            // And it is this surface's explained 404, not the router's bare
+            // one, so the answer a caller gets does not change with the mount
+            // the request happened to arrive through.
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri} answered the router's bare 404, not the honest one"
+            );
+            // 404 and never 500: the file IS in the build, so its absence at
+            // this URL indicts nothing, and a 500 would tell an operator their
+            // deployment is broken when it is not.
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri} answered {body:?}");
+        }
+
+        // A refused `providers/sw.js` and a name that was never shipped are
+        // indistinguishable, so the refusal is not an existence oracle over
+        // the export tree.
+        let refused = get(dashboard_app(), "/providers/sw.js").await;
+        let absent = get(dashboard_app(), "/providers/never-shipped.js").await;
+        assert_eq!(
+            (refused.0, content_type(&refused.2), refused.1),
+            (absent.0, content_type(&absent.2), absent.1),
+        );
+
+        // And the one URL that DOES answer is still the standing-down script,
+        // from a build that really does ship a worker at the other spelling.
+        let (status, body, _) = get(dashboard_app(), "/sw.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.contains("EXPORT-PWA-WORKER-MARKER"), "{body:?}");
 
         let mut guard = TEST_DASHBOARD_ROOT
             .lock()
@@ -2768,6 +3408,457 @@ mod tests {
         *guard = previous;
     }
 
+    // ---- the origin-root asset trees ------------------------------------
+    //
+    // The three mounts that did not exist, and the properties only the REAL
+    // router can prove: `resolve_dashboard` handled `/images/*` and
+    // `/.well-known/*` correctly all along, and the defect was that nothing
+    // routed a request there. A test that calls `resolve_dashboard` directly
+    // cannot see that at all — which is exactly how
+    // `origin_root_assets_answer_from_both_mounts` came to assert that
+    // `.well-known/agent.json` "answers from both mounts" while the router
+    // answered a bare 404 for every spelling of it.
+
+    /// Every asset tree answers, in all three mount spellings, and the file
+    /// that matters on each is byte-identical to what the export shipped.
+    ///
+    /// The `/images` half is a live product defect, not a tidy-up: the
+    /// onboarding chunk selects `/images/tier-flow-{dark,light}.svg` and
+    /// renders it through an unoptimized `next/image` with no `onError`, so
+    /// an unmounted tree is an empty 800x420 frame on the operator's
+    /// first-run page. The `/.well-known` half is a contract gap: the export
+    /// ships the card and the shipped landing page tells the operator to
+    /// fetch that exact path.
+    #[tokio::test]
+    async fn every_origin_root_asset_tree_answers_through_the_router() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        // (file inside the tree, media type the export's mime table gives it)
+        for (relative, mime) in [
+            ("providers/baidu.svg", "image/svg+xml"),
+            ("images/tier-flow-dark.svg", "image/svg+xml"),
+            ("images/tier-flow-light.svg", "image/svg+xml"),
+            (".well-known/agent.json", "application/json"),
+            (".well-known/agent-card.json", "application/json"),
+        ] {
+            let uri = format!("/{relative}");
+            let on_disk = fs::read(root.path().join(relative)).unwrap();
+            let (status, body, headers) = request(dashboard_app(), "GET", &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri} answered {status}");
+            assert_eq!(body, on_disk, "{uri} served other bytes");
+            assert_eq!(content_type(&headers), Some(mime), "{uri} content-type");
+            // Byte-identical, not merely "a 200 with something in it": an
+            // image the browser cannot parse is the empty frame this mount
+            // exists to remove.
+            //
+            // A stable name that is redeployed, so it must be revalidated —
+            // the same contract as every other non-hashed file.
+            assert_eq!(
+                headers.get("cache-control").map(String::as_str),
+                Some("no-cache"),
+                "{uri} cache-control"
+            );
+        }
+
+        // The re-rooted spelling under the `/dashboard` mount answers the same
+        // bytes, so the answer does not depend on which mount was typed.
+        for relative in ["images/tier-flow-dark.svg", ".well-known/agent.json"] {
+            let origin = request(dashboard_app(), "GET", &format!("/{relative}")).await;
+            let rerooted =
+                request(dashboard_app(), "GET", &format!("/dashboard/{relative}")).await;
+            assert_eq!(rerooted.0, origin.0, "/dashboard/{relative}");
+            assert_eq!(rerooted.1, origin.1, "/dashboard/{relative} bytes");
+        }
+
+        // The `HEAD` probe an image decider issues, so it cannot be the one
+        // request form that 404s.
+        for relative in ["images/tier-flow-dark.svg", ".well-known/agent.json"] {
+            let uri = format!("/{relative}");
+            let (status, body, _) = head(dashboard_app(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "HEAD {uri} answered {status}");
+            assert!(body.is_empty(), "HEAD {uri} carried a body");
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The bare and trailing-slash spellings of every tree, which is why
+    /// each is mounted three times and not once.
+    ///
+    /// This is the test that goes red if a mount is removed, and it goes red
+    /// in the shape the defect takes: the router's own 404 is a ZERO-LENGTH
+    /// body with NO content type, so asserting on the body and the type is
+    /// what distinguishes "this route is not mounted" from "this route is
+    /// mounted and the file is not in the build" — two different facts that
+    /// share a status code. A status-only assertion would pass either way.
+    #[tokio::test]
+    async fn every_asset_tree_directory_spelling_answers_the_explained_404() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        for tree in ORIGIN_ROOT_ASSET_TREES {
+            for uri in [format!("/{}", tree.dir), format!("/{}/", tree.dir)] {
+                let (status, body, headers) = get(dashboard_app(), &uri).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{uri} answered {body:?}");
+                assert_eq!(
+                    content_type(&headers),
+                    Some("text/plain; charset=utf-8"),
+                    "{uri} answered the router's bare 404, not the honest one — is the mount there?"
+                );
+                assert!(
+                    body.contains("not part of the deployed dashboard build"),
+                    "{uri} body was {body:?}"
+                );
+            }
+            // The fixture really does carry the tree, so the answers above are
+            // about how a MOUNTED tree answers and not about a fixture with
+            // nothing in it. (A `never-shipped` probe would add nothing: it
+            // answers the same way whether the mount is there or not, which is
+            // the whole reason the type and the body are what is asserted.)
+            assert!(
+                fs::read_dir(root.path().join(tree.dir)).is_ok(),
+                "the fixture has no {} tree, so this would pass while nothing is mounted",
+                tree.dir
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The export is the authority on which origin-root directories exist,
+    /// and this is the check that keeps the mount table honest against it.
+    ///
+    /// A directory a future export adds must be EITHER mounted (as a tree, or
+    /// through the route table that derives the four app-route spellings) OR
+    /// declared unmounted here, with the reason. A table that only grows when
+    /// somebody remembers is the rot the `/providers` name list already
+    /// demonstrated once: 136 of 141 logos 404ing with nothing failing.
+    #[test]
+    fn every_origin_root_directory_of_the_export_is_mounted_or_declared_dead() {
+        let root = export_root();
+        // Measured from the deployed export artifact
+        // `omniroute-dashboard-out` #10932864997, which the fixture is shaped
+        // from. A directory the export lays down and this host deliberately
+        // does not serve, with the reason, is not a gap to be closed by
+        // reflex — it is a decision that has to survive re-reading.
+        const DELIBERATELY_UNMOUNTED: &[(&str, &str)] = &[
+            (
+                "sponsors",
+                "1.0 MB of banner art the export ships and no document, chunk \
+                 or manifest references anywhere; serving it would add a \
+                 megabyte-scale unauthenticated download to the admin origin \
+                 for zero requests",
+            ),
+        ];
+
+        let mounted_trees: Vec<&str> = ORIGIN_ROOT_ASSET_TREES.iter().map(|t| t.dir).collect();
+        // The first segment each route-table entry mounts, which is what
+        // covers a route's own per-segment directory.
+        let route_firsts: Vec<&str> = ORIGIN_ROOT_ROUTES
+            .iter()
+            .map(|route| route.trim_start_matches('/').split('/').next().unwrap())
+            .collect();
+        // The origin-root prefixes no table owns: the two trees the export
+        // root always has, and `/docs`, a force-dynamic family a static export
+        // can never carry — mounted precisely so it answers an explained 404.
+        const MOUNTED_BY_HAND: &[&str] = &["_next", "dashboard", "docs"];
+
+        for name in fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| root.path().join(name).is_dir())
+        {
+            assert!(
+                mounted_trees.contains(&name.as_str())
+                    || route_firsts.contains(&name.as_str())
+                    || MOUNTED_BY_HAND.contains(&name.as_str())
+                    || DELIBERATELY_UNMOUNTED.iter().any(|(dir, _)| *dir == name),
+                "the export lays down /{name}/ and neither the asset-tree table, the route table \
+                 nor the declared-unmounted list accounts for it. Mount it as a tree in \
+                 ORIGIN_ROOT_ASSET_TREES, or add it to DELIBERATELY_UNMOUNTED with the reason."
+            );
+        }
+
+        // And the other direction, because the table must not claim a tree
+        // the export does not have: a mount for a directory that is not there
+        // answers an explained 404 for a build that has nothing to say about
+        // it, which is a claim this host cannot make.
+        for tree in ORIGIN_ROOT_ASSET_TREES {
+            assert!(
+                root.path().join(tree.dir).is_dir(),
+                "ORIGIN_ROOT_ASSET_TREES mounts /{}/ but the export does not lay it down",
+                tree.dir
+            );
+        }
+        // Every declared-unmounted entry is real, so the list cannot rot into
+        // an excuse for a directory that has since been added and mounted.
+        for (dir, reason) in DELIBERATELY_UNMOUNTED {
+            assert!(root.path().join(dir).is_dir(), "/{dir} is not in the export");
+            assert!(reason.len() > 40, "/{dir} is declared dead with no reason");
+            assert!(
+                !mounted_trees.contains(dir),
+                "/{dir} is declared unmounted and mounted at the same time"
+            );
+        }
+    }
+
+    /// The same census for the origin-root FILES, which is where the decision
+    /// about `openapi.yaml` lives.
+    ///
+    /// `openapi.yaml` (187 KB) ships at the export root and no mount claims
+    /// it, so `GET /openapi.yaml` answers the router's own zero-length 404.
+    /// That was an accident of the mount list rather than a decision, and an
+    /// accident is what the directory census above exists to stop being.
+    ///
+    /// It is left UNMOUNTED, deliberately, and the reason is worth stating
+    /// because the obvious "just mount it" is wrong: the only reference to the
+    /// file anywhere in the export is
+    /// `_next/static/chunks/2zzuwlbnofzba.js` → `<a href="/docs/openapi.yaml" download>`,
+    /// which points at a path the export does not contain. Mounting
+    /// `/openapi.yaml` would therefore serve 187 KB on an origin where nothing
+    /// ever asks for it, and would NOT repair the one link an operator can
+    /// actually click. The link is wrong in the export's own source, so the
+    /// fix is a source change there, not a mount here.
+    #[test]
+    fn every_origin_root_file_of_the_export_is_mounted_or_declared_dead() {
+        let root = export_root();
+        // Mounted by exact path in `build_router`, and in the same shape the
+        // router-side census in `lib.rs` measures. Kept as names rather than
+        // re-derived, because the point of this test is to catch a file that
+        // NO list claims — deriving the list from the lists would make it
+        // agree with them by construction.
+        const MOUNTED_BY_HAND: &[&str] = &[
+            "index.html",
+            "index.txt",
+            "__next._tree.txt",
+            "__next.__PAGE__.txt",
+            "dashboard.html",
+            "dashboard.txt",
+            "manifest.webmanifest",
+            "favicon.ico",
+            // Answered by the standing-down handler, not by this chokepoint —
+            // and `resolve_dashboard` refuses it from every other spelling.
+            SERVICE_WORKER_FILE,
+        ];
+        const DELIBERATELY_UNMOUNTED: &[(&str, &str)] = &[
+            (
+                "openapi.yaml",
+                "187 KB at the export root, referenced by exactly one chunk and that \
+                 reference points at /docs/openapi.yaml, a path the export does not \
+                 contain. Mounting it here would serve a file nothing requests and \
+                 would not repair the link an operator can actually click.",
+            ),
+            (
+                "deyin.svg",
+                "6 KB of brand art the export ships and no document, chunk or manifest \
+                 references anywhere in src/. Serving unreferenced art on the admin \
+                 origin is a cost with no request behind it.",
+            ),
+            (
+                "icon-192.svg",
+                "The manifest asks for /icon-192.png, which the export does not ship, so \
+                 this file is never requested. Repairing the PWA install icon is a \
+                 manifest source fix, not a mount here — mounting a different \
+                 extension would not change what the manifest names.",
+            ),
+            (
+                "apple-touch-icon.svg",
+                "1.5 KB the export ships alongside apple-touch-icon.png, which IS \
+                 mounted, and which no document references in place of it. Two icons \
+                 for one purpose, one of them dead weight.",
+            ),
+        ];
+
+        for name in fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| root.path().join(name).is_file())
+        {
+            // Route documents and their RSC payloads are mounted by the route
+            // table's four-form expansion, which is a routing statement about
+            // routes rather than an asset table.
+            let is_route_document = ORIGIN_ROOT_ROUTES.iter().any(|route| {
+                let bare = route.trim_start_matches('/');
+                name == format!("{bare}.html") || name == format!("{bare}.txt")
+            }) || ORIGIN_ROOT_ROUTES
+                .iter()
+                .any(|route| route.trim_start_matches('/') == name);
+            assert!(
+                is_route_document
+                    || MOUNTED_BY_HAND.contains(&name.as_str())
+                    || DELIBERATELY_UNMOUNTED.iter().any(|(file, _)| *file == name),
+                "the export lays down /{name} and no mount, route table or declared-unmounted \
+                 list accounts for it. Mount it by exact path in build_router, or add it to \
+                 DELIBERATELY_UNMOUNTED with the reason."
+            );
+        }
+
+        // Both directions, for the same reason the directory census checks
+        // both: the list must not excuse a file that has since been mounted,
+        // and must not declare dead something that is not there.
+        for (file, reason) in DELIBERATELY_UNMOUNTED {
+            assert!(root.path().join(file).is_file(), "/{file} is not in the export");
+            assert!(reason.len() > 40, "/{file} is declared dead with no reason");
+            assert!(
+                !MOUNTED_BY_HAND.contains(file),
+                "/{file} is declared unmounted and mounted at the same time"
+            );
+        }
+    }
+
+    /// The bound is one predicate per TREE, and each tree gets the bound its
+    /// contents are for — a `.js` in `/images` and a `.html` in
+    /// `/.well-known` are refused exactly as a `.js` in `/providers` is, and
+    /// they are refused for the same reason: whatever a future export drops
+    /// into a mounted directory must not become a script or a document on the
+    /// origin `/admin/v1/*` answers on.
+    ///
+    /// The assertion is on the body and the type, not on the status, for the
+    /// reason the sibling test gives: a 200 that leaked a script is the
+    /// failure that matters, and a status check alone would call that green.
+    #[tokio::test]
+    async fn a_file_that_is_not_of_its_tree_s_type_is_not_served() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        for (uri, marker) in [
+            ("/images/loader.js", "aisix-image-tree-escape"),
+            ("/.well-known/agent.html", "aisix-well-known-escape"),
+            ("/.well-known/agent.js", "aisix-well-known-escape"),
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert!(
+                status.is_client_error(),
+                "{uri} is in the build and was served: {status} {body:?}"
+            );
+            assert!(
+                !body.contains(marker),
+                "{uri} leaked its content: {body:?}"
+            );
+            assert_eq!(
+                content_type(&headers),
+                Some("text/plain; charset=utf-8"),
+                "{uri} carried a content type other than the explanation's"
+            );
+        }
+
+        // And the refusal is indistinguishable from a file that was never
+        // shipped, so the mount is not an existence oracle over the export
+        // tree.
+        for (present, absent) in [
+            ("/images/loader.js", "/images/never-shipped.js"),
+            ("/.well-known/agent.html", "/.well-known/never-shipped.html"),
+        ] {
+            let one = get(dashboard_app(), present).await;
+            let other = get(dashboard_app(), absent).await;
+            assert_eq!(
+                (one.0, content_type(&one.2), one.1),
+                (other.0, content_type(&other.2), other.1),
+                "{present} is distinguishable from {absent}"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
+    /// The response policy that makes serving an SVG on the admin origin
+    /// defensible.
+    ///
+    /// `svg` is the one `image/*` type that is also a document a browser
+    /// executes on a top-level navigation, and every one of the 141 shipped
+    /// logos is an `.svg` — so banning it would re-create the exact defect
+    /// this tree mount fixed. It is served, under two headers that close the
+    /// hazard instead:
+    ///
+    /// * `sandbox` with no `allow-same-origin` puts a top-level navigation
+    ///   to an SVG into an OPAQUE origin, so a `<script>` inside it runs with
+    ///   no access to this origin's cookies and cannot reach `/admin/v1/*`
+    ///   even though the cookie is `Path=/admin/v1` on the same host.
+    /// * `default-src 'none'` stops that document loading or exfiltrating
+    ///   anything.
+    ///
+    /// `nosniff` goes on EVERY dashboard file, not only these: the media
+    /// type comes from one table whose default arm is
+    /// `application/octet-stream`, and without `nosniff` a browser may sniff
+    /// such a body into `text/html`. `context.md` §4.2 records the header as
+    /// missing on all dashboard files.
+    #[tokio::test]
+    async fn the_asset_trees_answer_with_nosniff_and_a_sandboxing_csp() {
+        let _serialized = TEST_ROOT_LOCK.lock().await;
+        let root = export_root();
+        let previous = with_test_dashboard_root(root.path());
+
+        for uri in [
+            "/providers/baidu.svg",
+            "/images/tier-flow-dark.svg",
+            "/.well-known/agent.json",
+        ] {
+            let (status, _, headers) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                headers.get("x-content-type-options").map(String::as_str),
+                Some("nosniff"),
+                "{uri} x-content-type-options"
+            );
+            assert_eq!(
+                headers.get("content-security-policy").map(String::as_str),
+                Some(ORIGIN_ROOT_ASSET_TREE_CSP),
+                "{uri} content-security-policy"
+            );
+            // The three directives that make the header a policy and not a
+            // decoration, asserted on the header itself so a shortened value
+            // is a failure here.
+            // `HeaderValue` derefs to `[u8]`, not to `str`, so the substring
+            // assertions have to go through `to_str`. Every value this crate
+            // builds is a `&'static str`, so the unwrap cannot fire.
+            let csp = headers
+                .get("content-security-policy")
+                .and_then(|value| value.to_str().ok())
+                .expect("the header was just compared equal to a &str literal");
+            assert!(csp.contains("sandbox"), "{uri} csp is not sandboxed: {csp}");
+            assert!(
+                !csp.contains("allow-same-origin"),
+                "{uri} csp grants the document this origin's identity: {csp}"
+            );
+            assert!(csp.contains("default-src 'none'"), "{uri} csp: {csp}");
+        }
+
+        // The rest of the export gets `nosniff` and NOT the CSP: a sandbox
+        // CSP on a route document or a chunk would break the application this
+        // host exists to serve, so the policy is scoped rather than global.
+        for uri in ["/dashboard", "/_next/static/chunks/app.js", "/favicon.ico"] {
+            let (status, _, headers) = get(dashboard_app(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                headers.get("x-content-type-options").map(String::as_str),
+                Some("nosniff"),
+                "{uri} x-content-type-options"
+            );
+            assert!(
+                headers.get("content-security-policy").is_none(),
+                "{uri} carries a document CSP it was never scoped to"
+            );
+        }
+
+        let mut guard = TEST_DASHBOARD_ROOT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = previous;
+    }
+
     /// A file that is in the logo tree and is not a logo is not served. The
     /// whole point of the mount being a directory rather than a name list is
     /// that nothing decides which files are in it by name — so the bound is on
@@ -3111,10 +4202,25 @@ mod tests {
         *guard = previous;
     }
 
-    /// A symlink inside the logo tree, in both shapes the previous mounts    /// A symlink inside the logo tree, in both shapes the previous mounts
-    /// already covered: the file, and a directory SEGMENT. Both are given a
-    /// `.svg` name so they pass the logo bound — otherwise a green result
-    /// would prove nothing about the containment check, only about the bound.
+    /// A symlink inside an image asset tree, in every shape that matters.
+    ///
+    /// Three distinct cases, and the second one is the case the resolved-path
+    /// check used to miss:
+    ///
+    /// * a symlinked FILE and a symlinked DIRECTORY SEGMENT pointing BESIDE
+    ///   the root — containment, already covered;
+    /// * a symlink that stays INSIDE THE ROOT but leaves the TREE, to a
+    ///   chunk and to a document. Deciding the bound on the resolved path
+    ///   alone cannot catch this, because the resolved path is not in the
+    ///   tree at all and the bound never ran — so `providers/pwn.svg ->
+    ///   _next/static/chunks/app.js` was served as `application/javascript`
+    ///   from the origin `/admin/v1/*` answers on;
+    /// * a symlink that stays inside both, which must be SERVED — the check
+    ///   is containment and type, not "is it a symlink".
+    ///
+    /// Every escapee is given a `.svg` name so it passes the image bound, and
+    /// a green result would therefore prove something about the second check
+    /// rather than nothing at all about the first.
     #[tokio::test]
     async fn a_symlink_in_the_logo_tree_is_refused() {
         let _serialized = TEST_ROOT_LOCK.lock().await;
@@ -3135,9 +4241,28 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("providers/hop"))
             .unwrap();
-        // And one INSIDE the root, which must be served — the check is
+        // …and one that stays inside the ROOT but leaves the TREE, which is
+        // the case the bound has to catch on the spelling as well as on the
+        // resolved path.
+        std::os::unix::fs::symlink(
+            root.join("_next/static/chunks/app.js"),
+            root.join("providers/to-chunk.svg"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("index.html"),
+            root.join("providers/to-shell.svg"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("openapi.yaml"),
+            root.join("images/to-spec.svg"),
+        )
+        .unwrap();
+        // And one INSIDE both, which must be served — the check is
         // containment, not "is it a symlink".
         fs::write(root.join("providers/real.svg"), b"<svg id='real'/>").unwrap();
+        fs::write(root.join("openapi.yaml"), b"openapi: {}").unwrap();
         std::os::unix::fs::symlink(
             root.join("providers/real.svg"),
             root.join("providers/alias.svg"),
@@ -3146,8 +4271,12 @@ mod tests {
 
         let previous = with_test_dashboard_root(&root);
 
+        // The two beside-the-root escapes and the two in-root-but-out-of-tree
+        // ones. All four are refused; the last two are refused by the TREE
+        // bound rather than by the root containment, which is the point of
+        // listing them separately.
         for uri in ["/providers/escape.svg", "/providers/hop/leaf.svg"] {
-            let (status, body, _) = get(dashboard_app(), uri).await;
+            let (status, body, headers) = get(dashboard_app(), uri).await;
             assert!(
                 status.is_client_error(),
                 "{uri} answered {status} with {body:?}"
@@ -3157,9 +4286,33 @@ mod tests {
                 "{uri} leaked file content through a symlink: {body:?}"
             );
         }
+        for (uri, forbidden_type) in [
+            ("/providers/to-chunk.svg", "javascript"),
+            ("/providers/to-shell.svg", "text/html"),
+            ("/images/to-spec.svg", "yaml"),
+        ] {
+            let (status, body, headers) = get(dashboard_app(), uri).await;
+            assert!(
+                status.is_client_error(),
+                "{uri} resolved out of its tree and was served: {status} {body:?}"
+            );
+            // Not merely a non-2xx: the type is the whole failure. A JS,
+            // HTML or YAML body from the origin `/admin/v1/*` answers on is a
+            // script, a document and a spec respectively.
+            assert!(
+                !content_type(&headers).is_some_and(|value| value.contains(forbidden_type)),
+                "{uri} leaked a {forbidden_type} body out of its tree: {:?}",
+                content_type(&headers)
+            );
+            assert!(
+                !body.contains("console.log"),
+                "{uri} leaked a script out of its tree: {body:?}"
+            );
+        }
 
-        // Both in-root symlinks still serve their bytes, so the two refusals
-        // above are about leaving the root and not about being a symlink.
+        // The in-root, in-tree symlink still serves its bytes, so the refusals
+        // above are about leaving the ROOT and leaving the TREE, and not
+        // about being a symlink at all.
         for name in ["real.svg", "alias.svg"] {
             let uri = format!("/providers/{name}");
             let (status, body, headers) = get(dashboard_app(), &uri).await;

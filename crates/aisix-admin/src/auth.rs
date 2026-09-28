@@ -156,14 +156,38 @@ fn strip_bearer(value: &str) -> Option<&str> {
 
 /// True iff `candidate` is one of `admin_keys`.
 ///
-/// The comparison is constant time in the length of the shared prefix and
-/// visits every key, because this is the check an exchange endpoint and a
-/// header both funnel through: a timing side channel here would be a
-/// side channel on the admin key, and routing two paths through one
-/// primitive means neither can quietly ship the weaker version. (Key
-/// *length* is not hidden — it is the operator's own value in their own
-/// config, and hiding it would need a fixed-width compare over a padded
-/// field, which is a different and larger design.)
+/// The comparison visits every key and every byte position of the longer of
+/// the two, and decides only at the end, because this is the check an
+/// exchange endpoint and a header both funnel through: a timing side channel
+/// here would be a side channel on the admin key, and routing two paths
+/// through one primitive means neither can quietly ship the weaker version.
+///
+/// The two properties that are easy to get wrong, and what they cost when
+/// they are:
+///
+/// * **Length is compared exactly, not modulo a word.** The form this
+///   replaced accumulated `(candidate.len() ^ key.len()) as u8`, which
+///   truncates: a 32-byte key with a candidate of `key + "A" * 256` has
+///   `32 ^ 288 == 256`, and `256u8 == 0` — so a 288-byte string beginning
+///   with the whole admin key was ACCEPTED. That is not a no-credential
+///   bypass (the key still has to be presented in full), but it makes this
+///   function's own contract false and makes "the length is compared" a
+///   claim about a truncated quantity. `diff` is a `usize` here, and the
+///   lengths are folded into it before the byte loop rather than truncated
+///   into it.
+/// * **`zip` alone hides the tail.** `bytes.iter().zip(other.iter())` walks
+///   `min(len)` pairs, so bytes past the shorter operand are never looked at
+///   even in principle. The loop is over `max(len)` and reads the missing
+///   side as a zero byte, which costs nothing to express and makes "every
+///   position is compared" true rather than approximately true.
+///
+/// What is still NOT hidden is the lengths themselves: the loop runs
+/// `max(len)` times, so an attacker learns how long the operator's key is.
+/// That is the operator's own value in their own config, and hiding it would
+/// need a fixed-width compare over a padded field — a different and larger
+/// design — so it is stated here rather than implied away. What is hidden is
+/// everything the attacker would actually brute-force: no position of the key
+/// can be probed by timing.
 ///
 /// A present-but-malformed `Authorization` never reaches here: a
 /// non-`Bearer` scheme is rejected by the caller's [`strip_bearer`].
@@ -176,9 +200,15 @@ pub(crate) fn admin_key_is_valid(candidate: &str, admin_keys: &[String]) -> bool
     // `|=` does not short-circuit, so every key is compared every time.
     for key in admin_keys {
         let other = key.as_bytes();
-        let mut diff = (bytes.len() ^ other.len()) as u8;
-        for (a, b) in bytes.iter().zip(other.iter()) {
-            diff |= a ^ b;
+        // Full-width, and exact: see the doc above for what `as u8` cost.
+        let mut diff = bytes.len() ^ other.len();
+        for i in 0..bytes.len().max(other.len()) {
+            // A position past the end of one side reads as zero. The lengths
+            // are already folded into `diff`, so the zero itself decides
+            // nothing — it only keeps the loop from skipping those positions.
+            let a = bytes.get(i).copied().unwrap_or(0);
+            let b = other.get(i).copied().unwrap_or(0);
+            diff |= usize::from(a ^ b);
         }
         matched |= diff == 0;
     }
@@ -383,6 +413,65 @@ mod tests {
         ));
         assert!(!is_admin_authorized(&bearer("Bearer nope"), &keys, &empty));
         assert!(!is_admin_authorized(&HeaderMap::new(), &keys, &empty));
+    }
+
+    /// The comparison is exact, on every axis, and not only in the way the
+    /// obvious cases check.
+    ///
+    /// The case this exists for is the one a length-only check gets wrong in
+    /// a way that is invisible until you compute it: the implementation this
+    /// replaces accumulated `(candidate.len() ^ key.len()) as u8`, which
+    /// truncates modulo 256, so for a 32-byte key a candidate of
+    /// `key + "A" * 256` has `32 ^ 288 == 256` and `256u8 == 0` — the whole
+    /// admin key followed by 256 bytes was ACCEPTED. Both halves are
+    /// asserted directly, because a test that only checked "the exact key is
+    /// accepted" would have stayed green through that bug.
+    #[test]
+    fn a_key_is_accepted_exactly_and_a_superstring_of_it_is_not() {
+        let key = "0123456789abcdef0123456789abcdef"; // 32 bytes, as shipped
+        let keys = vec![key.to_string()];
+        assert_eq!(key.len(), 32, "the fixture must be the length it claims");
+        assert!(admin_key_is_valid(key, &keys));
+
+        // The truncation case, spelled out: 32 ^ 288 == 256, and 256 & 0xFF
+        // == 0, so the old accumulator saw no difference at all.
+        let padded = format!("{key}{}", "A".repeat(256));
+        assert_eq!(padded.len(), 288);
+        assert_eq!(32 ^ 288, 256, "the arithmetic this test pins");
+        assert!(
+            !admin_key_is_valid(&padded, &keys),
+            "the admin key followed by 256 bytes authenticated as the admin key"
+        );
+        // A prefix, a suffix and a single flipped byte are all refused, and
+        // the byte position does not matter — the old `zip` walked only
+        // `min(len)`, so a difference past the shorter side was never in
+        // range to be found.
+        for candidate in [
+            format!("{key}A"),
+            format!("A{key}"),
+            format!("{key} "),
+            "0123456789abcdef0123456789abcdeZ".to_string(),
+            "0123456789abcdef0123456789abcdeF".to_string(),
+        ] {
+            assert!(
+                !admin_key_is_valid(&candidate, &keys),
+                "a near miss authenticated: {candidate:?}"
+            );
+        }
+        // An empty candidate is refused by the guard, not by the compare.
+        assert!(!admin_key_is_valid("", &keys));
+        // Membership, not equality with the first entry — and specifically a
+        // match in the LAST position, which is what a short-circuit that
+        // returned on the first key would get wrong. The key is deliberately
+        // the final element, so an implementation that stops comparing after
+        // the first non-match fails here.
+        let many = vec!["other".to_string(), "third".to_string(), key.to_string()];
+        assert!(admin_key_is_valid(key, &many));
+        assert!(!admin_key_is_valid("nope", &many));
+        // …and the first-position case is the same answer, so the result does
+        // not depend on where in the list the match sits.
+        let first = vec![key.to_string(), "other".to_string()];
+        assert!(admin_key_is_valid(key, &first));
     }
 
     // ---- the cookie credential ------------------------------------------
