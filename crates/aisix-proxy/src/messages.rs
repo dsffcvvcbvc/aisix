@@ -4580,6 +4580,50 @@ mod tests {
         ResourceEntry::new("m-1", m, 1)
     }
 
+    /// A model whose same-target retry budget is off.
+    ///
+    /// The tests that assert how many times the UPSTREAM was called assert
+    /// it over a real loopback socket, and the proxy ships a
+    /// deployment-wide retry budget for exactly that socket
+    /// (`DEFAULT_UPSTREAM_RETRIES`, 2 today) which it spends on any
+    /// transport / decode / 5xx fault. Left at the default, an unrelated
+    /// intermittent fault on that socket turns "one upstream call" into
+    /// two: `unparseable_body_with_a_fail_open_guardrail_is_forwarded`
+    /// failed that way on CI run 36405624827 with `left: 2, right: 1`,
+    /// having passed every other run — and 300 consecutive repetitions of
+    /// that exact scenario (run 36413799928) never reproduced it, so the
+    /// trigger is not in the scenario.
+    ///
+    /// What IS in the scenario is the ambiguity. These tests are about what
+    /// gets FORWARDED; "exactly one upstream call" is a property of the
+    /// retry budget, not of the forwarding, and this code path does not
+    /// promise it. Pinning the budget off makes the count a consequence of
+    /// the fixture instead of a lottery on the runner, and leaves each
+    /// test able to fail for its own subject: if the dispatch stops
+    /// forwarding, there is no request left to count. The expected value is
+    /// unchanged.
+    fn single_attempt(mut m: ResourceEntry<Model>) -> ResourceEntry<Model> {
+        m.value.retries = Some(0);
+        m
+    }
+
+    /// The upstream saw this request exactly once. A bare count leaves the
+    /// next reader no way to tell a retry from a second caller, so the
+    /// message names what it actually saw.
+    #[track_caller]
+    fn assert_one_upstream_call(received: &[wiremock::Request]) {
+        assert_eq!(
+            received.len(),
+            1,
+            "expected exactly one upstream request, got {}: {:?}",
+            received.len(),
+            received
+                .iter()
+                .map(|r| format!("{} {}", r.method, r.url))
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn openai_model(name: &str) -> ResourceEntry<Model> {
         let json = format!(
             r#"{{
@@ -4689,7 +4733,8 @@ mod tests {
             r#"{{"display_name":"byo-claude","provider":"byo","model_name":"claude-sonnet-4-5","provider_key_id":"{ANTHROPIC_PK_ID}"}}"#
         );
         let m: Model = serde_json::from_str(&model_json).unwrap();
-        snap.models.insert(ResourceEntry::new("m-1", m, 1));
+        snap.models
+            .insert(single_attempt(ResourceEntry::new("m-1", m, 1)));
         snap.apikeys.insert(apikey_entry(&["*"]));
 
         let app = build_app(snap);
@@ -4709,7 +4754,7 @@ mod tests {
 
         assert_eq!(resp.status(), StatusCode::OK);
         let received = upstream.received_requests().await.unwrap();
-        assert_eq!(received.len(), 1);
+        assert_one_upstream_call(&received);
         assert_eq!(received[0].url.path(), "/v1/messages");
         let sent: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(sent["model"], "claude-sonnet-4-5");
@@ -6909,7 +6954,8 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await;
 
         let snap = new_snap_anthropic(&upstream.uri());
-        snap.models.insert(anthropic_model("my-claude"));
+        snap.models
+            .insert(single_attempt(anthropic_model("my-claude")));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let row: aisix_core::models::Guardrail = serde_json::from_str(
             r#"{"name":"out-only","enabled":true,"kind":"keyword","hook_point":"output","fail_open":false,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
@@ -6951,7 +6997,7 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        assert_one_upstream_call(&upstream.received_requests().await.unwrap());
     }
 
     /// `fail_open: true` opts an input-hook row out of the refusal, on the
@@ -6976,7 +7022,8 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await;
 
         let snap = new_snap_anthropic(&upstream.uri());
-        snap.models.insert(anthropic_model("my-claude"));
+        snap.models
+            .insert(single_attempt(anthropic_model("my-claude")));
         snap.apikeys.insert(apikey_entry(&["*"]));
         let row: aisix_core::models::Guardrail = serde_json::from_str(
             r#"{"name":"in-open","enabled":true,"kind":"keyword","hook_point":"input","fail_open":true,"patterns":[{"kind":"literal","value":"NEVERAPPEARS"}]}"#,
@@ -7013,7 +7060,75 @@ event: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        assert_one_upstream_call(&upstream.received_requests().await.unwrap());
+    }
+
+    /// The upstream-call count the three tests above assert is a property
+    /// of the RETRY BUDGET, not of the forwarding — stated here as a test
+    /// rather than as a comment, because the whole point is that the
+    /// alternative is waiting for a transport fault to happen by accident.
+    ///
+    /// A 503 is retryable (`routing::is_retryable`: everything outside 4xx
+    /// gets the retry path) and the deployment default grants two
+    /// same-target retries, so the proxy re-hits the target and the
+    /// upstream sees the request twice. Pin the budget off and the same
+    /// 503 ends the request after one call, which the caller sees as 502
+    /// instead of 200. The two arms differ only in the fixture's budget.
+    ///
+    /// Without this, `single_attempt` is a comment-shaped no-op: a future
+    /// edit that drops it restores the flake and no test notices until one
+    /// of them goes red on a runner at the wrong moment.
+    #[tokio::test]
+    async fn the_retry_budget_is_what_would_make_the_upstream_count_two() {
+        for (label, budget_pinned_off, expected_calls, expected_status) in [
+            ("deployment default", false, 2, StatusCode::OK),
+            ("budget pinned off", true, 1, StatusCode::BAD_GATEWAY),
+        ] {
+            let upstream = MockServer::start().await;
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            Mock::given(method("POST"))
+                .and(path("/v1/messages"))
+                .respond_with(move |_: &wiremock::Request| {
+                    // One 503, then 200 — a retryable fault that clears.
+                    if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        ResponseTemplate::new(503).set_body_string("upstream is unwell")
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(anthropic_response())
+                    }
+                })
+                .mount(&upstream)
+                .await;
+
+            let snap = new_snap_anthropic(&upstream.uri());
+            let model = anthropic_model("my-claude");
+            snap.models.insert(if budget_pinned_off {
+                single_attempt(model)
+            } else {
+                model
+            });
+            snap.apikeys.insert(apikey_entry(&["*"]));
+
+            let app = build_app(snap);
+            let resp = app
+                .oneshot(make_req(serde_json::json!({
+                    "model": "my-claude",
+                    "max_tokens": 100,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                upstream.received_requests().await.unwrap().len(),
+                expected_calls,
+                "{label}: how many upstream calls this budget costs"
+            );
+            assert_eq!(
+                resp.status(),
+                expected_status,
+                "{label}: what the caller is told"
+            );
+        }
     }
 
     /// The forwarding above is a fail-open BYPASS, and it has to be
