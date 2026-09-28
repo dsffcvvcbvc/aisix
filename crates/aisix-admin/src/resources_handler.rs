@@ -205,11 +205,11 @@ fn mime_for_path(path: &Path) -> &'static str {
         // dumps raw Flight text at the operator.
         //
         // `__next._full.txt` is not in that list and must not be added to it:
-        // the exporter writes the file, and the client runtime has no `_full`
-        // case at all. See the table on [`resolve_dashboard`], which is where
-        // that is stated with the measurement. This arm is unaffected either
-        // way — `txt` is one arm, not a per-name list — so the correction is
-        // to the claim, not to the table below.
+        // the client runtime has no `_full` case at all, and the build deletes
+        // the file. See the table on [`resolve_dashboard`], which is where that
+        // is stated with the measurement. This arm is unaffected either way —
+        // `txt` is one arm, not a per-name list — so the correction is to the
+        // claim, not to the table below.
         "txt" => "text/plain; charset=utf-8",
         "webmanifest" => "application/manifest+json",
         "wasm" => "application/wasm",
@@ -1008,22 +1008,32 @@ enum DashboardResolution {
 /// | `/login.txt` | `login.txt` | its RSC payload on a client-side navigation |
 /// | `/login/__next._tree.txt` | same path, exact | its route tree on a cold segment cache |
 ///
-/// **`__next._full.txt` is deliberately not a row.** The exporter writes it:
-/// `next@16.3.5` `next/dist/esm/server/app-render/collect-segment-data.js:186`
-/// puts the whole page response into the segment map under the key `/_full`,
-/// and `convertSegmentPathToStaticExportFilename`
+/// **`__next._full.txt` is deliberately not a row, and the reason is
+/// measured on both sides.** The exporter writes it — `next@16.3.5`
+/// `next/dist/esm/server/app-render/collect-segment-data.js:186` puts the
+/// whole page response into the segment map under the key `/_full`, and
+/// `convertSegmentPathToStaticExportFilename`
 /// (`next/dist/esm/shared/lib/segment-cache/segment-value-encoding.js:61`)
-/// maps `/_full` to `__next._full.txt`. The client never asks for it — `_full`
+/// maps `/_full` to `__next._full.txt`. The client never asks for it: `_full`
 /// has ZERO occurrences anywhere under `next/dist/client/` or
-/// `next/dist/shared/` in `16.3.5`, which is exactly the check
-/// `cavora/scripts/build/pruneExportFullSegments.mjs` runs before it deletes
-/// the file out of OmniRoute's artifact. So it is a file the build emits and
-/// the router does not fetch; listing it as a request form described a
-/// protocol Next does not have. It is still SERVED if something asks, because
-/// the exact-name candidate answers any `__next.*` name present on disk, and
-/// that is load-bearing for `cavora`: its export does not run the prune
-/// (`.github/workflows/export.yml` records the omission), so the files are
-/// there and a prober that names one gets the bytes rather than a 500.
+/// `next/dist/shared/`, which is the reference guard
+/// `pruneExportFullSegments.mjs` runs before it deletes anything. And the
+/// build DOES delete it, identically for both exports:
+/// `cavora/scripts/build/build-next-isolated.mjs:449-458` calls the prune
+/// whenever `result.code === 0 && OMNIROUTE_EXPORT === "1"`, `build:export`
+/// sets exactly that (`cavora/package.json:113`), and a throw from the prune
+/// propagates to the build script's own `catch` (`:534`) and fails the build
+/// — so the prune is neither absent nor silently skipped. The file is
+/// therefore neither a request form nor a file on disk, and listing it
+/// described a protocol the artifact does not have.
+///
+/// Its ABSENCE is still not free, and the gap is [`names_build_artifact`]
+/// rather than this table: `/dashboard/x/__next._full.txt` carries the `txt`
+/// extension under the app-route tree, so it is classified as a build
+/// artifact and answered 500 "the build is incomplete" — for a file the
+/// build deliberately removed and no client will ever name. That is a defect
+/// rather than a description; it belongs to whoever owns the 500-vs-404
+/// policy, and is deliberately left undecided here.
 ///
 /// The candidates are tried in that order and the first existing file wins;
 /// nothing else is consulted, so no request shape can reach a file that is
