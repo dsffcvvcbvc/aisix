@@ -35,7 +35,7 @@ import {
 const execFileP = promisify(execFile);
 
 const BIN_PATH =
-  process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+  process.env.CAVORA_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "cavora");
 const ETCD_ENDPOINT = etcdEndpoint();
 
 const CALLER_PLAINTEXT = "sk-export-roundtrip-caller";

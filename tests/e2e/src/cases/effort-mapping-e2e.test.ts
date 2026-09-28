@@ -1395,8 +1395,8 @@ describe("direct-model effort mapping", () => {
 // the write contract rather than stored and never read.
 describe("resources file: the not-set key may not map to null", () => {
   const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
+    process.env.CAVORA_BIN ??
+    join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
   const file = (mapping: string) =>
     [

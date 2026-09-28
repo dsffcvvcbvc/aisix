@@ -23,7 +23,7 @@ ENTRANT_NAME=aisix
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-BIN="$SRC/target/release/aisix"
+BIN="$SRC/target/release/cavora"
 
 # ---- sanity -----------------------------------------------------------------
 
@@ -63,16 +63,16 @@ models:
     provider_key: mock-openai
 api_keys:
   - display_name: bench
-    key_env: BENCH_AISIX_KEY
+    key_env: BENCH_CAVORA_KEY
     allowed_models: ["*"]
 EOF
 
 start_gateway() {
     echo "== gateway ==" >&2
-    # aisix reads AISIX_* environment variables as config overrides; nothing
+    # aisix reads CAVORA_* environment variables as config overrides; nothing
     # from the harness environment may leak into the measured process.
-    while read -r v; do unset "$v"; done < <(compgen -v | grep '^AISIX_' || true)
-    BENCH_AISIX_KEY=bench-token taskset -c "$GW_CORES" "$BIN" --config "$OUT/config.yaml" \
+    while read -r v; do unset "$v"; done < <(compgen -v | grep '^CAVORA_' || true)
+    BENCH_CAVORA_KEY=bench-token taskset -c "$GW_CORES" "$BIN" --config "$OUT/config.yaml" \
         > "$OUT/gateway.log" 2>&1 &
     GW_PID=$!
     wait_http_200 "http://127.0.0.1:$GW_PORT$REQ_PATH" "gateway"

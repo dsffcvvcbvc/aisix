@@ -100,7 +100,7 @@
 //! the request path.
 //!
 //! Commit is an RCU swap of the whole snapshot, then a durable write to the
-//! configured `resources_file` (`AISIX_RESOURCES_PATH` / `resources.yaml`
+//! configured `resources_file` (`CAVORA_RESOURCES_PATH` / `resources.yaml`
 //! fallback) — the same order, and the same last-writer-wins semantics,
 //! [`crate::keys_handler`] and [`crate::resources_handler`] document. The
 //! persisted document carries the `models` and `provider_keys` collections
@@ -1000,14 +1000,14 @@ fn persist_snapshot(state: &AdminState, snapshot: &AisixSnapshot) -> Result<(), 
 }
 
 /// The configured durable path: `resources_file` first, then
-/// `AISIX_RESOURCES_PATH`, then `resources.yaml`. Same order the other write
+/// `CAVORA_RESOURCES_PATH`, then `resources.yaml`. Same order the other write
 /// paths use.
 fn resources_file_path(state: &AdminState) -> PathBuf {
     state
         .resources_file
         .clone()
         .or_else(|| {
-            std::env::var("AISIX_RESOURCES_PATH")
+            std::env::var("CAVORA_RESOURCES_PATH")
                 .ok()
                 .map(PathBuf::from)
         })

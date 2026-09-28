@@ -20,14 +20,14 @@ import { pickFreePort } from "../harness/ports.js";
 // entry stored by replica A must serve replica B both exactly AND
 // semantically, and a purge must invalidate across replicas.
 //
-// Capability-conditional: the vector suite runs iff AISIX_E2E_REDIS
+// Capability-conditional: the vector suite runs iff CAVORA_E2E_REDIS
 // speaks the vector-search command family (redis:8+ — what CI
 // provisions); the degradation suite runs iff it does NOT (a plain
 // redis 6/7), pinning that `semantic` on a backend=redis policy then
 // stays exact-only without failing traffic. Each suite skips honestly
 // when its capability precondition doesn't hold.
 
-const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
+const REDIS_URL = process.env.CAVORA_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
 const CALLER_PLAINTEXT = "sk-semredis-caller";
 const CALLER_KEY_HASH = createHash("sha256")
@@ -353,9 +353,9 @@ describe("semantic cache on shared redis (vector-capable)", () => {
 });
 
 // A dedicated vector-LESS redis for this suite when provided (CI sets
-// AISIX_E2E_REDIS_PLAIN to a redis:7 service); otherwise fall back to
+// CAVORA_E2E_REDIS_PLAIN to a redis:7 service); otherwise fall back to
 // the main URL and run only when IT happens to lack vector support.
-const PLAIN_REDIS_URL = process.env.AISIX_E2E_REDIS_PLAIN ?? REDIS_URL;
+const PLAIN_REDIS_URL = process.env.CAVORA_E2E_REDIS_PLAIN ?? REDIS_URL;
 
 describe("semantic on backend=redis degrades to exact-only without vector support", () => {
   let app: SpawnedApp | undefined;

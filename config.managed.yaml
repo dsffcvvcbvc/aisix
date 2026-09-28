@@ -1,7 +1,7 @@
-# AISIX gateway — managed-mode bootstrap configuration for AISIX Cloud.
+# Cavora gateway — managed-mode bootstrap configuration for Cavora Cloud.
 #
 # Baked into the official Docker image as `/etc/aisix/config.managed.yaml`.
-# Select it by setting `AISIX_CONFIG_PATH` to that path.
+# Select it by setting `CAVORA_CONFIG_PATH` to that path.
 # Only the bare minimum is set here:
 #
 #   - `managed.enabled: true`           always on in this bootstrap configuration
@@ -13,11 +13,11 @@
 #
 # Operators inject these env vars at `docker run` time:
 #
-#   AISIX_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud
-#   AISIX_MANAGED__CP_ETCD_ENDPOINT=etcd.us.aisix.cloud:7943
-#   AISIX_MANAGED__CP_CERT_PEM=...
-#   AISIX_MANAGED__CP_KEY_PEM=...
-#   AISIX_MANAGED__CP_CA_PEM=...
+#   CAVORA_MANAGED__CP_BASE_URL=https://api.us.aisix.cloud
+#   CAVORA_MANAGED__CP_ETCD_ENDPOINT=etcd.us.aisix.cloud:7943
+#   CAVORA_MANAGED__CP_CERT_PEM=...
+#   CAVORA_MANAGED__CP_KEY_PEM=...
+#   CAVORA_MANAGED__CP_CA_PEM=...
 #
 # `CP_BASE_URL` may omit the scheme — a bare `host:port` is read as
 # `https://host:port`, which is what a managed control plane serves.
@@ -35,16 +35,16 @@
 # bare `host[:port]` — a path, a query, userinfo, a port that is not a
 # number — fails the boot naming the variable.
 #
-# Plus optionally `AISIX_PROXY__ADDR`, `AISIX_OBSERVABILITY__LOG_LEVEL`,
-# `AISIX_CACHE__BACKEND`, etc. — every config field is reachable via
-# `AISIX_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
+# Plus optionally `CAVORA_PROXY__ADDR`, `CAVORA_OBSERVABILITY__LOG_LEVEL`,
+# `CAVORA_CACHE__BACKEND`, etc. — every config field is reachable via
+# `CAVORA_<UPPER>__<UPPER>` (see crates/aisix-core/src/config.rs).
 #
 # For a multi-replica deployment, enable cluster-level rate limiting so
 # the cluster enforces one global window instead of N× per replica
 # (api7/AISIX-Cloud#798):
-#   AISIX_RATELIMIT__BACKEND=redis
-#   AISIX_RATELIMIT__REDIS__URL=redis://<host>:6379
-#   AISIX_RATELIMIT__REDIS__TIMEOUT_SECS=5   # optional; this is the default
+#   CAVORA_RATELIMIT__BACKEND=redis
+#   CAVORA_RATELIMIT__REDIS__URL=redis://<host>:6379
+#   CAVORA_RATELIMIT__REDIS__TIMEOUT_SECS=5   # optional; this is the default
 #
 # `timeout_secs` bounds one Redis round trip, and the connection the
 # gateway makes at startup (in `cluster`/`sentinel` mode the startup
@@ -70,7 +70,7 @@
 # It is retried too: the credential may be corrected on the server, and
 # the shared backend is then attached without restarting the gateway.
 # The credential may be embedded in the URL or given separately as
-# `AISIX_RATELIMIT__REDIS__USERNAME` / `__PASSWORD` / `__DATABASE`,
+# `CAVORA_RATELIMIT__REDIS__USERNAME` / `__PASSWORD` / `__DATABASE`,
 # which override whatever the URL carries.
 #
 # Subsequent boots re-use the mTLS bundle written under
@@ -123,7 +123,7 @@ proxy:
   # apply to no listener is a configuration error. A managed deployment
   # reaches this through the environment rather than by editing this file,
   # as one JSON array:
-  # AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
+  # CAVORA_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
   # listeners:
   #   - addr: "0.0.0.0:3443"
   #     tls:
@@ -132,7 +132,7 @@ proxy:
   #   - addr: "0.0.0.0:3000"
   # Serving topology; on for Linux by default. A managed deployment
   # reaches these through the environment rather than by editing this
-  # file: AISIX_PROXY__THREAD_PER_CORE, AISIX_PROXY__WORKERS.
+  # file: CAVORA_PROXY__THREAD_PER_CORE, CAVORA_PROXY__WORKERS.
   # thread_per_core: true
   # workers: 4
   # Headers a caller may hand the gateway its own request id in; that id
@@ -140,7 +140,7 @@ proxy:
   # every attempt's usage event, and what the upstream sees. Defaults to
   # ["x-aisix-request-id"]. Add x-request-id only if the gateway is NOT
   # behind a proxy that stamps it. Comma-separated from the environment:
-  # AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
+  # CAVORA_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
   # request_id:
   #   accept_headers: ["x-aisix-request-id"]
   # Entry-level URL rewriting (first matching rule wins; `match` runs on
@@ -148,7 +148,7 @@ proxy:
   # $1 = capture group; the query string is preserved). Lets clients keep
   # legacy URL shapes, e.g. per-server MCP paths served on the
   # /mcp/{server} endpoint. When configuring through env vars only, set
-  # one JSON array: AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # one JSON array: CAVORA_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
   # Runs before ALL routing, including host-matched passthrough routes.
   # Optional hosts restrict a rule to those inbound hosts; omit for all hosts.
   # Host matching ignores case/port; *.example.com matches one extra label.
@@ -177,7 +177,7 @@ observability:
     # metrics always keep `side` (upstream/downstream) whether listed or not.
     # See the variable reference:
     # https://docs.api7.ai/ai-gateway/dev/reference/metric-labels
-    # Env: AISIX_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
+    # Env: CAVORA_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
     # labels:
     #   aisix_request_ttft_seconds:
     #     - env_id
@@ -194,7 +194,7 @@ observability:
       # Dedicated metrics listener — the only Prometheus scrape surface,
       # the same in every deployment mode. Expose this port in your
       # deployment and point Prometheus at it. Override with
-      # AISIX_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
+      # CAVORA_OBSERVABILITY__METRICS__PROMETHEUS__ADDR.
       addr: "0.0.0.0:9090"
     # Optional User-Agent -> client_type mapping rules for the
     # aisix_llm_tokens_by_client_total metric (first match wins, tried
@@ -207,7 +207,7 @@ observability:
     # keeps its own default when unset. See config.example.yaml for the
     # full annotation and the cardinality/contract caveats. Override with
     # a comma-separated list, e.g.
-    # AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT=0.1,0.5,1,5,30,300
+    # CAVORA_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT=0.1,0.5,1,5,30,300
     # buckets:
     #   request_ttft: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300]
 

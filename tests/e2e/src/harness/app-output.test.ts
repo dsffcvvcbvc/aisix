@@ -17,7 +17,7 @@ async function failingProcess(source: string) {
   const executable = join(dir, "process.cjs");
   await writeFile(executable, `#!/usr/bin/env node\n${source}`);
   await chmod(executable, 0o755);
-  vi.stubEnv("AISIX_BIN", executable);
+  vi.stubEnv("CAVORA_BIN", executable);
   vi.resetModules();
   return (await import("./app.js")).spawnApp;
 }
@@ -45,7 +45,7 @@ test("startup failure includes output drained after the child exits", async () =
 });
 
 test("a real gateway startup error survives surrounding output", async () => {
-  const binary = process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+  const binary = process.env.CAVORA_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "cavora");
   const spawnApp = await failingProcess(`
     const { writeFileSync } = require("node:fs");
     const { spawnSync } = require("node:child_process");
@@ -59,6 +59,6 @@ test("a real gateway startup error survives surrounding output", async () => {
     process.exit(result.status ?? 2);
   `);
   await expect(spawnApp({ resourcesFile: '_format_version: "1"\n', extraEnv: {
-    AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({ aisix_request_ttft_seconds: ["request_id"] }),
+    CAVORA_OBSERVABILITY__METRICS__LABELS: JSON.stringify({ aisix_request_ttft_seconds: ["request_id"] }),
   } })).rejects.toThrow(/unsupported variable.*request_id/);
 });

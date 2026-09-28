@@ -36,7 +36,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 const ETCD_ENDPOINT = etcdEndpoint();
-const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
+const REDIS_URL = process.env.CAVORA_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
 // Both envs use the SAME model alias so the request fingerprints collide
 // across environments — the env namespace is the only thing keeping their

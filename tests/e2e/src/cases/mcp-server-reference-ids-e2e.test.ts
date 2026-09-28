@@ -467,8 +467,8 @@ describe("mcp server reference ids: grants follow the server id, not its name", 
 // loading a file whose grants and limits silently point at nothing.
 describe("resources file: every MCP server reference id spelling is refused", () => {
   const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
+    process.env.CAVORA_BIN ??
+    join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
   const PRELUDE = [
     '_format_version: "1"',

@@ -9,7 +9,7 @@ authors.workspace = true
 description = "aisix — the single binary"
 
 [[bin]]
-name = "aisix"
+name = "cavora"
 path = "src/main.rs"
 
 [dependencies]

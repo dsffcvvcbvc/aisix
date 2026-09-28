@@ -17,21 +17,21 @@
 #   Settings → Secrets and variables → Actions → New repository secret
 #
 #   Amazon S3 (native AWS):
-#     AISIX_E2E_OBJSTORE_S3_BUCKET             test bucket name
-#     AISIX_E2E_OBJSTORE_S3_REGION             the bucket's region, e.g. us-east-1
-#     AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID      IAM user access key id
-#     AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY  IAM user secret access key
+#     CAVORA_E2E_OBJSTORE_S3_BUCKET             test bucket name
+#     CAVORA_E2E_OBJSTORE_S3_REGION             the bucket's region, e.g. us-east-1
+#     CAVORA_E2E_OBJSTORE_S3_ACCESS_KEY_ID      IAM user access key id
+#     CAVORA_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY  IAM user secret access key
 #     (For an S3-compatible host — MinIO / Cloudflare R2 — also set
-#      AISIX_E2E_OBJSTORE_S3_ENDPOINT.)
+#      CAVORA_E2E_OBJSTORE_S3_ENDPOINT.)
 #   Google Cloud Storage:
-#     AISIX_E2E_OBJSTORE_GCS_BUCKET            test bucket name
-#     AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT   the full service-account key JSON
+#     CAVORA_E2E_OBJSTORE_GCS_BUCKET            test bucket name
+#     CAVORA_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT   the full service-account key JSON
 #                                              (paste the downloaded key as one secret)
 #   Azure Blob:
-#     AISIX_E2E_OBJSTORE_AZURE_ACCOUNT         storage account name
-#     AISIX_E2E_OBJSTORE_AZURE_ACCESS_KEY      a storage account access key
-#     AISIX_E2E_OBJSTORE_AZURE_CONTAINER       test container name
-#     (For Azurite instead of a real account, also set AISIX_E2E_OBJSTORE_AZURE_ENDPOINT.)
+#     CAVORA_E2E_OBJSTORE_AZURE_ACCOUNT         storage account name
+#     CAVORA_E2E_OBJSTORE_AZURE_ACCESS_KEY      a storage account access key
+#     CAVORA_E2E_OBJSTORE_AZURE_CONTAINER       test container name
+#     (For Azurite instead of a real account, also set CAVORA_E2E_OBJSTORE_AZURE_ENDPOINT.)
 #
 # Least privilege — scope the identity to the test bucket only:
 #   AWS:    s3:PutObject, s3:GetObject, s3:DeleteObject on arn:aws:s3:::<bucket>/*
@@ -74,17 +74,17 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'objstore real cloud'))
     runs-on: ubuntu-latest
     env:
-      AISIX_E2E_OBJSTORE_S3_BUCKET: ${{ secrets.AISIX_E2E_OBJSTORE_S3_BUCKET }}
-      AISIX_E2E_OBJSTORE_S3_REGION: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
-      AISIX_E2E_OBJSTORE_S3_ENDPOINT: ${{ secrets.AISIX_E2E_OBJSTORE_S3_ENDPOINT }}
-      AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID: ${{ secrets.AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID }}
-      AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY: ${{ secrets.AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY }}
-      AISIX_E2E_OBJSTORE_GCS_BUCKET: ${{ secrets.AISIX_E2E_OBJSTORE_GCS_BUCKET }}
-      AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT: ${{ secrets.AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT }}
-      AISIX_E2E_OBJSTORE_AZURE_ACCOUNT: ${{ secrets.AISIX_E2E_OBJSTORE_AZURE_ACCOUNT }}
-      AISIX_E2E_OBJSTORE_AZURE_ACCESS_KEY: ${{ secrets.AISIX_E2E_OBJSTORE_AZURE_ACCESS_KEY }}
-      AISIX_E2E_OBJSTORE_AZURE_CONTAINER: ${{ secrets.AISIX_E2E_OBJSTORE_AZURE_CONTAINER }}
-      AISIX_E2E_OBJSTORE_AZURE_ENDPOINT: ${{ secrets.AISIX_E2E_OBJSTORE_AZURE_ENDPOINT }}
+      CAVORA_E2E_OBJSTORE_S3_BUCKET: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_BUCKET }}
+      CAVORA_E2E_OBJSTORE_S3_REGION: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_REGION }}
+      CAVORA_E2E_OBJSTORE_S3_ENDPOINT: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_ENDPOINT }}
+      CAVORA_E2E_OBJSTORE_S3_ACCESS_KEY_ID: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_ACCESS_KEY_ID }}
+      CAVORA_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY }}
+      CAVORA_E2E_OBJSTORE_GCS_BUCKET: ${{ secrets.CAVORA_E2E_OBJSTORE_GCS_BUCKET }}
+      CAVORA_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT: ${{ secrets.CAVORA_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT }}
+      CAVORA_E2E_OBJSTORE_AZURE_ACCOUNT: ${{ secrets.CAVORA_E2E_OBJSTORE_AZURE_ACCOUNT }}
+      CAVORA_E2E_OBJSTORE_AZURE_ACCESS_KEY: ${{ secrets.CAVORA_E2E_OBJSTORE_AZURE_ACCESS_KEY }}
+      CAVORA_E2E_OBJSTORE_AZURE_CONTAINER: ${{ secrets.CAVORA_E2E_OBJSTORE_AZURE_CONTAINER }}
+      CAVORA_E2E_OBJSTORE_AZURE_ENDPOINT: ${{ secrets.CAVORA_E2E_OBJSTORE_AZURE_ENDPOINT }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -93,9 +93,9 @@ jobs:
       - name: Report which providers are configured
         run: |
           s3=0; gcs=0; azure=0
-          if [ -n "$AISIX_E2E_OBJSTORE_S3_BUCKET" ]; then echo "S3: configured"; s3=1; else echo "::warning::S3 secrets absent — objstore_smoke_s3 will self-skip"; fi
-          if [ -n "$AISIX_E2E_OBJSTORE_GCS_BUCKET" ]; then echo "GCS: configured"; gcs=1; else echo "::warning::GCS secrets absent — objstore_smoke_gcs will self-skip"; fi
-          if [ -n "$AISIX_E2E_OBJSTORE_AZURE_ACCOUNT" ]; then echo "Azure: configured"; azure=1; else echo "::warning::Azure secrets absent — objstore_smoke_azure will self-skip"; fi
+          if [ -n "$CAVORA_E2E_OBJSTORE_S3_BUCKET" ]; then echo "S3: configured"; s3=1; else echo "::warning::S3 secrets absent — objstore_smoke_s3 will self-skip"; fi
+          if [ -n "$CAVORA_E2E_OBJSTORE_GCS_BUCKET" ]; then echo "GCS: configured"; gcs=1; else echo "::warning::GCS secrets absent — objstore_smoke_gcs will self-skip"; fi
+          if [ -n "$CAVORA_E2E_OBJSTORE_AZURE_ACCOUNT" ]; then echo "Azure: configured"; azure=1; else echo "::warning::Azure secrets absent — objstore_smoke_azure will self-skip"; fi
           # A manual dispatch or scheduled run is deliberate — secrets are
           # expected. Fail rather than pass green while testing nothing. PR
           # runs may legitimately have no secrets, so they still self-skip.

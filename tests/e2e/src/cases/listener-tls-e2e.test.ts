@@ -19,8 +19,8 @@ import { EtcdClient, etcdEndpoint, pickFreePorts, suiteThreadPerCore } from "../
 //   3. A plain-HTTP request to the TLS proxy port does NOT succeed.
 
 const BIN_PATH =
-  process.env.AISIX_BIN ??
-  join(process.cwd(), "..", "..", "target", "debug", "aisix");
+  process.env.CAVORA_BIN ??
+  join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
 const insecureAgent = new Agent({ connect: { rejectUnauthorized: false } });
 
@@ -109,7 +109,7 @@ describe("listener TLS (#473)", () => {
 
     const childEnv: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
+      if (v !== undefined && !k.startsWith("CAVORA_")) childEnv[k] = v;
     }
     childEnv.RUST_LOG = process.env.RUST_LOG ?? "warn";
     childEnv.NO_PROXY = "127.0.0.1,localhost";

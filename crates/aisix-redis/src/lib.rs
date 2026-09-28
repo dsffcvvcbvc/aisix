@@ -827,7 +827,7 @@ fn conn_config(timeout: Duration) -> AsyncConnectionConfig {
 ///
 /// The explicit fields WIN. That is what they exist for: `password` is
 /// documented as the way to keep the secret out of the config file
-/// (`AISIX_CACHE__REDIS__PASSWORD`), and a value supplied that way is
+/// (`CAVORA_CACHE__REDIS__PASSWORD`), and a value supplied that way is
 /// useless if a stale credential left in the URL quietly outranks it.
 ///
 /// The credential is taken as a PAIR. Overriding the two halves
@@ -1937,7 +1937,7 @@ mod boot_check_tests {
     }
 
     /// A `password` with no `username` — the documented shape, and what
-    /// `AISIX_RATELIMIT__REDIS__PASSWORD` produces — must go out as the
+    /// `CAVORA_RATELIMIT__REDIS__PASSWORD` produces — must go out as the
     /// legacy one-argument `AUTH`, which means the username stays
     /// `None` rather than becoming an empty string.
     ///
@@ -2659,7 +2659,7 @@ mod boot_connect_tests {
 
     // The label goes into a boot WARN, so what it must never carry is the
     // password — which is exactly what the shipped way of supplying one
-    // (`AISIX_RATELIMIT__REDIS__URL=redis://user:pass@host`) puts in the
+    // (`CAVORA_RATELIMIT__REDIS__URL=redis://user:pass@host`) puts in the
     // URL this is derived from.
     #[test]
     fn strips_scheme_userinfo_and_path() {

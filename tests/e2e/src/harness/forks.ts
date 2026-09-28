@@ -2,9 +2,9 @@ import { availableParallelism } from "node:os";
 
 import { RANGE_SLOTS } from "./ports.js";
 
-/** Endpoints from AISIX_E2E_ETCD_ENDPOINTS, trimmed, in order. */
+/** Endpoints from CAVORA_E2E_ETCD_ENDPOINTS, trimmed, in order. */
 export function configuredEtcdEndpoints(): string[] {
-  return (process.env.AISIX_E2E_ETCD_ENDPOINTS ?? "")
+  return (process.env.CAVORA_E2E_ETCD_ENDPOINTS ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
@@ -29,7 +29,7 @@ export function configuredEtcdEndpoints(): string[] {
  * would buy nothing: the endpoint list is a ceiling on concurrency, not
  * a target.
  *
- * AISIX_E2E_MAX_FORKS can only LOWER the result. Letting it raise past
+ * CAVORA_E2E_MAX_FORKS can only LOWER the result. Letting it raise past
  * the endpoint count would put two gateways' watch sets on one cluster
  * — #157 exactly — while vitest.config.ts advertises the opposite as a
  * guarantee, so the knob is clamped by the same bound everything else
@@ -47,7 +47,7 @@ export function forkBudget(): number {
     // runs one fork rather than two gateways on one core.
     endpoints > 0 ? cores : Math.max(2, cores),
   );
-  const override = Number(process.env.AISIX_E2E_MAX_FORKS);
+  const override = Number(process.env.CAVORA_E2E_MAX_FORKS);
   if (Number.isInteger(override) && override >= 1) return Math.min(override, derived);
   return derived;
 }

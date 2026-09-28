@@ -84,7 +84,7 @@ jobs:
               spec = json.load(f)
 
           assert spec["openapi"].startswith("3.")
-          assert spec["info"]["title"] == "AISIX Admin API"
+          assert spec["info"]["title"] == "Cavora Admin API"
           assert spec["info"]["version"] == "dev"
           assert "/admin/v1/models" in spec["paths"]
           assert "Model" in spec["components"]["schemas"]
@@ -120,27 +120,27 @@ jobs:
       # Picked up by crates/aisix-cache/tests/redis_integration.rs.
       # The tests no-op when this is unset (local dev), so absence is safe.
       #
-      # MUST NOT start with the `AISIX_` prefix — Config::load_from_path
-      # owns that namespace (config-rs Environment::with_prefix("AISIX")).
-      # An AISIX_CACHE_* name reaches `Config` as an override of the cache
+      # MUST NOT start with the `CAVORA_` prefix — Config::load_from_path
+      # owns that namespace (config-rs Environment::with_prefix("CAVORA")).
+      # An CAVORA_CACHE_* name reaches `Config` as an override of the cache
       # section and breaks every Config::load_from_path test; any other
-      # AISIX_ name is dropped with a warning on every boot.
+      # CAVORA_ name is dropped with a warning on every boot.
       CACHE_TEST_REDIS_URL: redis://127.0.0.1:6379
       # Picked up by crates/aisix-cache/tests/semantic_redis_integration.rs
       # — needs the vector-capable redis:8 service above. The PLAIN url
       # points at a cluster node (redis:7, no vector search) to pin the
       # capability probe's failure path. Same skip-if-unset /
-      # no-AISIX_-prefix rules.
+      # no-CAVORA_-prefix rules.
       CACHE_TEST_REDIS_VECTOR_URL: redis://127.0.0.1:6379
       CACHE_TEST_REDIS_PLAIN_URL: redis://127.0.0.1:7000
       # Picked up by crates/aisix-ratelimit/tests/redis_integration.rs
       # (shared cluster-level counters, #798). Same skip-if-unset /
-      # no-AISIX_-prefix rules as CACHE_TEST_REDIS_URL above.
+      # no-CAVORA_-prefix rules as CACHE_TEST_REDIS_URL above.
       RATELIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379
       # Redis Cluster + Sentinel topologies started by the "Start Redis
       # Cluster + Sentinel" step below — exercise the `mode: cluster` /
       # `mode: sentinel` connection paths in both cache + ratelimit
-      # integration tests. Same skip-if-unset / no-AISIX_-prefix rules.
+      # integration tests. Same skip-if-unset / no-CAVORA_-prefix rules.
       RATELIMIT_TEST_REDIS_CLUSTER_NODES: redis://127.0.0.1:7000,redis://127.0.0.1:7001,redis://127.0.0.1:7002
       RATELIMIT_TEST_REDIS_SENTINELS: redis://127.0.0.1:26379
       RATELIMIT_TEST_REDIS_MASTER: mymaster
@@ -152,7 +152,7 @@ jobs:
       # below: `requirepass` is server-wide, so putting it on the shared
       # service would lock every other Redis test out of it. The URL
       # carries NO credential — the tests supply it, in each of the ways
-      # an operator can. Same skip-if-unset / no-AISIX_-prefix rules.
+      # an operator can. Same skip-if-unset / no-CAVORA_-prefix rules.
       REDIS_AUTH_TEST_URL: redis://127.0.0.1:6390
       REDIS_AUTH_TEST_PASSWORD: aisix-ci-redis
       # The cluster and sentinel halves of the same file, pointed at the
@@ -176,7 +176,7 @@ jobs:
       # A SECOND cluster, started with authentication ON by the step
       # below: enabling auth is cluster-wide, so doing it on the service
       # above would lock every other etcd test out of it. Same
-      # skip-if-unset / no-AISIX_-prefix rules.
+      # skip-if-unset / no-CAVORA_-prefix rules.
       ETCD_AUTH_TEST_URL: http://127.0.0.1:2479
       ETCD_AUTH_TEST_USER: root
       ETCD_AUTH_TEST_PASSWORD: aisix-ci-etcd
@@ -325,7 +325,7 @@ jobs:
       - name: exporter User-Agent uses the release version
         env:
           # Differ from Cargo's version so the old source cannot pass.
-          AISIX_BUILD_VERSION: 0.0.0-ci
+          CAVORA_BUILD_VERSION: 0.0.0-ci
         run: cargo test -p aisix-obs --lib otlp_http_sink::tests::otlp_sink_posts_one_request_with_all_spans -- --exact
 
   build-bin:
@@ -334,7 +334,7 @@ jobs:
     env:
       RUSTFLAGS: "-C instrument-coverage"
       LLVM_PROFILE_FILE: "coverage/aisix-%p-%m.profraw"
-      AISIX_BUILD_VERSION: 0.0.0-ci
+      CAVORA_BUILD_VERSION: 0.0.0-ci
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -343,11 +343,11 @@ jobs:
       - uses: ./.github/actions/setup-protoc
       - uses: Swatinem/rust-cache@v2
       - name: build
-        run: cargo build -p aisix-server --bin aisix
+        run: cargo build -p aisix-server --bin cavora
       - uses: actions/upload-artifact@v7
         with:
           name: aisix-bin
-          path: target/debug/aisix
+          path: target/debug/cavora
           # 72 MB binary × many runs will refill the quota quickly;
           # keep only as long as the downstream e2e job needs it.
           retention-days: 1
@@ -381,7 +381,7 @@ jobs:
       # One etcd per vitest fork. The suite ran at maxForks=2 because
       # 20+ files' gateways watching a SINGLE cluster pushed watch
       # dispatch past `waitConfigPropagation` (#157); the fork count is
-      # derived from AISIX_E2E_ETCD_ENDPOINTS below, so removing a
+      # derived from CAVORA_E2E_ETCD_ENDPOINTS below, so removing a
       # cluster here lowers it rather than doubling forks onto a shared
       # one. It does NOT work in the other direction: forkBudget is also
       # capped by the core count, and ubuntu-latest has exactly four — a
@@ -414,7 +414,7 @@ jobs:
         ports: ["2382:2379"]
       redis:
         # redis:8 = vector-capable, so the semantic-cache redis e2e
-        # exercises the real path against AISIX_E2E_REDIS.
+        # exercises the real path against CAVORA_E2E_REDIS.
         image: redis:8-alpine
         ports: ["6379:6379"]
       redis-plain:
@@ -429,7 +429,7 @@ jobs:
         with:
           name: aisix-bin
           path: target/debug
-      - run: chmod +x target/debug/aisix
+      - run: chmod +x target/debug/cavora
       - uses: actions/setup-node@v6
         with:
           # pnpm 11 requires Node 22.13 or newer — it imports `node:sqlite`
@@ -477,11 +477,11 @@ jobs:
           E2E_THREAD_PER_CORE: ${{ matrix.thread_per_core }}
           # Vector-less redis for the semantic-cache degradation suite;
           # the main 6379 service is redis:8 (vector-capable).
-          AISIX_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
+          CAVORA_E2E_REDIS_PLAIN: redis://127.0.0.1:6377
           # One entry per etcd service above. vitest derives maxForks
           # from this list (see tests/e2e/vitest.config.ts), and
           # harness/etcd.ts hands each fork its own entry.
-          AISIX_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
+          CAVORA_E2E_ETCD_ENDPOINTS: http://127.0.0.1:2379,http://127.0.0.1:2380,http://127.0.0.1:2381,http://127.0.0.1:2382
         run: pnpm test
       - name: tag coverage by leg
         # The gate downloads every leg with `merge-multiple: true`, which

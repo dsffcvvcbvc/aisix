@@ -13,7 +13,7 @@ import {
 // Both halves are observable contracts, so both are pinned here against a
 // real scrape rather than against the Rust constants: a dashboard reads
 // `le` values off this exposition, and the override half is the only way a
-// deployment can move them. The override is delivered through an `AISIX_*`
+// deployment can move them. The override is delivered through an `CAVORA_*`
 // environment variable because that is the channel the Kubernetes chart
 // uses — config there is injected as env vars on top of an image-baked
 // config file, so a knob that only works from YAML is unreachable in the
@@ -187,7 +187,7 @@ describe("histogram buckets e2e: an operator override replaces only the named me
     app = await spawnApp({
       resourcesFile: resources(upstream.baseUrl),
       extraEnv: {
-        AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT: "0.5,3",
+        CAVORA_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT: "0.5,3",
       },
     });
   });

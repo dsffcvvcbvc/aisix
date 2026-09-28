@@ -36,7 +36,7 @@ import { pickFreePort } from "../harness/ports.js";
 // this at all.
 
 const ETCD_ENDPOINT = etcdEndpoint();
-const REDIS_URL = process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
+const REDIS_URL = process.env.CAVORA_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
 const CALLER_PLAINTEXT = "sk-cache-outage-caller";
 const CALLER_KEY_HASH = createHash("sha256")

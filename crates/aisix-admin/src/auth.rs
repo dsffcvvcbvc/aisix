@@ -439,8 +439,8 @@ mod tests {
     }
 
     /// A cookie whose name merely *starts with* ours is a different
-    /// cookie. Without the `=` check, `aisix_admin_session_x` would
-    /// match the `aisix_admin_session` prefix and be read as a token.
+    /// cookie. Without the `=` check, `cavora_admin_session_x` would
+    /// match the `cavora_admin_session` prefix and be read as a token.
     ///
     /// Asserted on the READER, not on `is_admin_authorized`: an unknown
     /// token is unauthenticated either way, so a gate-level assertion

@@ -3,9 +3,9 @@
 //! The version comes only from two compile-time stamps, and an empty stamp
 //! counts as unset (the Dockerfile always exports both, possibly empty):
 //!
-//! - `AISIX_BUILD_VERSION` — set by the `docker-image` workflow on release
+//! - `CAVORA_BUILD_VERSION` — set by the `docker-image` workflow on release
 //!   tags only (`v1.4.0` → `1.4.0`). Reported unchanged.
-//! - `AISIX_BUILD_SHA` — the short commit sha every CI image build passes.
+//! - `CAVORA_BUILD_SHA` — the short commit sha every CI image build passes.
 //!   Without a release version the binary reports `dev+sha-<sha>`.
 //! - Neither → `dev` (plain `cargo build`, `docker build` without args).
 //!
@@ -16,8 +16,8 @@
 
 use std::sync::LazyLock;
 
-const BUILD_VERSION_STAMP: Option<&str> = option_env!("AISIX_BUILD_VERSION");
-const BUILD_SHA_STAMP: Option<&str> = option_env!("AISIX_BUILD_SHA");
+const BUILD_VERSION_STAMP: Option<&str> = option_env!("CAVORA_BUILD_VERSION");
+const BUILD_SHA_STAMP: Option<&str> = option_env!("CAVORA_BUILD_SHA");
 
 /// Version the binary reports about itself.
 pub static BUILD_VERSION: LazyLock<String> =

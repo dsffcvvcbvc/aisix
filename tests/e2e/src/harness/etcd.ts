@@ -25,7 +25,7 @@ export function onCI(): boolean {
  * like a propagation bug rather than a wiring one.
  * (harness/etcd-endpoint.test.ts fails if a file resolves it itself.)
  *
- * With `AISIX_E2E_ETCD_ENDPOINTS` set to a comma-separated list, forks
+ * With `CAVORA_E2E_ETCD_ENDPOINTS` set to a comma-separated list, forks
  * are spread across the entries by `VITEST_POOL_ID`. Concurrency in this
  * suite was capped at two forks because 20+ files' gateways sharing one
  * etcd pushed watch-dispatch latency past `waitConfigPropagation` (#157);
@@ -54,7 +54,7 @@ export function etcdEndpoint(): string {
  */
 export function etcdEndpointForPool(poolId: number): string {
   const list = configuredEtcdEndpoints();
-  if (list.length === 0) return process.env.AISIX_E2E_ETCD ?? DEFAULT_ETCD;
+  if (list.length === 0) return process.env.CAVORA_E2E_ETCD ?? DEFAULT_ETCD;
   return list[poolId % list.length];
 }
 

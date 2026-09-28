@@ -31,7 +31,7 @@ export default defineConfig({
     //     dispatch latency for the last resource of a write batch blew
     //     past even a 10s `waitConfigPropagation` (#157, still flaky
     //     after the budget bump). harness/etcd.ts now gives each fork
-    //     its own cluster from AISIX_E2E_ETCD_ENDPOINTS, which is what
+    //     its own cluster from CAVORA_E2E_ETCD_ENDPOINTS, which is what
     //     CI sets; the watchers per cluster go back to what they were
     //     at maxForks=2.
     //

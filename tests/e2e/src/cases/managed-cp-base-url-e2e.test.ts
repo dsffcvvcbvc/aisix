@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { spawnApp, type SpawnedApp } from "../harness/index.js";
 
-// `managed.cp_base_url` (env AISIX_MANAGED__CP_BASE_URL, Helm
+// `managed.cp_base_url` (env CAVORA_MANAGED__CP_BASE_URL, Helm
 // controlPlane.baseURL) reaches four consumers with two different
 // appetites: the etcd dial strips whatever scheme is present and
 // re-attaches `https://` itself, while heartbeat, telemetry and the
@@ -52,6 +52,6 @@ describe("managed.cp_base_url scheme handling", () => {
       await outcome.exit();
       throw new Error("the gateway booted on a control-plane URL it cannot call");
     }
-    expect(outcome.message).toMatch(/AISIX_MANAGED__CP_BASE_URL/);
+    expect(outcome.message).toMatch(/CAVORA_MANAGED__CP_BASE_URL/);
   });
 });

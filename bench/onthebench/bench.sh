@@ -36,11 +36,11 @@ echo "== provision rig =="
 ssh "$RIG" 'bash aisix-src/bench/onthebench/rig-setup.sh'
 
 echo "== build (native release on the rig) =="
-ssh "$RIG" 'source ~/.cargo/env && cd aisix-src && cargo build --locked --release --bin aisix'
+ssh "$RIG" 'source ~/.cargo/env && cd aisix-src && cargo build --locked --release --bin cavora'
 
 echo "== run baseline ($RUNID) =="
-# BENCH_-prefixed, never AISIX_-prefixed: aisix reads AISIX_* environment
-# variables as config overrides, so an AISIX_COMMIT in the gateway's
+# BENCH_-prefixed, never CAVORA_-prefixed: aisix reads CAVORA_* environment
+# variables as config overrides, so an CAVORA_COMMIT in the gateway's
 # environment becomes an unknown top-level config field and refuses boot.
 #
 # Method overrides (BENCH_GRID, BENCH_REPS, ...) forward to the rig so a

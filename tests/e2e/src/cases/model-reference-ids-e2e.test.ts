@@ -806,8 +806,8 @@ describe("model references by resource id", () => {
 // loading a file whose references silently point at nothing.
 describe("resources file: every model-reference id spelling is refused", () => {
   const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
+    process.env.CAVORA_BIN ??
+    join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
   const PRELUDE = [
     '_format_version: "1"',

@@ -52,12 +52,12 @@ that request's predecessors wrote is ahead of it in the queue.
 ## etcd is per-fork, and on CI it must be there
 
 CI runs one etcd cluster per vitest fork and hands each fork its own
-(`AISIX_E2E_ETCD_ENDPOINTS`, mapped by `VITEST_POOL_ID`). Two
+(`CAVORA_E2E_ETCD_ENDPOINTS`, mapped by `VITEST_POOL_ID`). Two
 consequences a spec author cannot see from the 200-odd call sites they
 would otherwise copy:
 
 - **`etcdEndpoint()` is the only permitted way to name an etcd.** Reading
-  `AISIX_E2E_ETCD` / `AISIX_E2E_ETCD_ENDPOINTS`, or writing a
+  `CAVORA_E2E_ETCD` / `CAVORA_E2E_ETCD_ENDPOINTS`, or writing a
   `127.0.0.1:2379` literal, pins ONE fork's cluster while the gateway
   the spec just spawned talks to its own — surfacing as a
   `waitConfigPropagation` timeout that reads like a product bug.

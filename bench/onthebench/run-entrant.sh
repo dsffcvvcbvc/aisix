@@ -78,10 +78,10 @@ fi
 
 start_target() {
     echo "== target ($ENTRANT_NAME) ==" >&2
-    # aisix reads AISIX_* environment variables as config overrides; no
+    # aisix reads CAVORA_* environment variables as config overrides; no
     # measured process gets them, whatever it is — same hygiene for every
     # entrant, and one less variable between two entrants' environments.
-    while read -r v; do unset "$v"; done < <(compgen -v | grep '^AISIX_' || true)
+    while read -r v; do unset "$v"; done < <(compgen -v | grep '^CAVORA_' || true)
     GW_PID=""
     entrant_start "$OUT"
     # /proc existence, not kill -0: a containerized target's pid belongs to

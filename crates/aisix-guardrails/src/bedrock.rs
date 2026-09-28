@@ -121,7 +121,7 @@ impl BedrockGuardrail {
     /// `None` means the SDK default, i.e. real AWS Bedrock).
     ///
     /// Empty-string overrides are treated as unset by the caller so
-    /// a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=` doesn't
+    /// a `docker run -e CAVORA_BEDROCK_ENDPOINT_URL=` doesn't
     /// accidentally redirect; this constructor doesn't filter again.
     ///
     /// Synchronous on purpose: the snapshot rebuild path is sync (a
@@ -1780,7 +1780,7 @@ mod tests {
     // BedrockGuardrail::new → with_endpoint) is exercised by the
     // wiremock tests above, which thread the URL in via the public
     // `new()` constructor. The Config-loading side (env var
-    // `AISIX_BEDROCK_ENDPOINT_URL` → `Config::bedrock_endpoint_url`)
+    // `CAVORA_BEDROCK_ENDPOINT_URL` → `Config::bedrock_endpoint_url`)
     // is covered by `aisix-core`'s config tests. The end-to-end
     // contract — operator sets env var, DP redirects Bedrock calls —
     // is verified by the downstream e2e suite against a real

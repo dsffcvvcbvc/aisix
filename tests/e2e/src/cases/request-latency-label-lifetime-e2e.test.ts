@@ -36,7 +36,7 @@ describe("request latency labels survive buffering and configuration reloads", (
 
   async function setup() {
     const app = await spawnApp({ extraEnv: {
-      AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
+      CAVORA_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
         ...Object.fromEntries([E2E, TTFT].map((metric) => [metric,
           ["endpoint", "model", "upstream_model", "status_class", "streaming", "api_key_id", "team_id", "user_id", "user_name"],
         ])),

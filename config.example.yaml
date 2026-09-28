@@ -6,7 +6,7 @@ etcd:
     - "http://127.0.0.1:2379"
   prefix: "/aisix"
   # user: "aisix"
-  # password_env: "AISIX_ETCD_PASSWORD"
+  # password_env: "CAVORA_ETCD_PASSWORD"
   # Optional bounds on etcd I/O. `0` means unbounded on either key — the
   # same reading a model's `timeout: 0` gets. (A model's
   # `stream_timeout: 0` is the odd one out: it falls back to the next
@@ -47,7 +47,7 @@ etcd:
   # dial_timeout_ms: 5000   # this is the default; 0 = unbounded
   # request_timeout_ms: 5000
   # Optional TLS / mTLS bundle. Required when connecting to an
-  # AISIX Cloud Data Plane Manager (endpoint is https:// and the control plane issues
+  # Cavora Cloud Data Plane Manager (endpoint is https:// and the control plane issues
   # a client cert via IssueAIDataplaneCertificate). Uncomment and
   # point to your mTLS bundle.
   # tls:
@@ -90,7 +90,7 @@ proxy:
   # Put the certificate on the entry that should serve it. Every
   # listener serves the same routes and the same configuration.
   # Env-only deployments set the whole set as one JSON array:
-  # AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
+  # CAVORA_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/etc/aisix/tls/proxy.crt","key_file":"/etc/aisix/tls/proxy.key"}},{"addr":"0.0.0.0:3000"}]'
   # listeners:
   #   - addr: "0.0.0.0:3443"
   #     tls:
@@ -102,7 +102,7 @@ proxy:
   # and logs the immediate TCP peer; configure trusted_proxies when the
   # gateway sits behind an L7 LB / ingress that sets x-forwarded-for.
   # Env-only deployments set the CIDR list comma-separated:
-  # AISIX_PROXY__REAL_IP__TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1/32
+  # CAVORA_PROXY__REAL_IP__TRUSTED_PROXIES=10.0.0.0/8,127.0.0.1/32
   # real_ip:
   #   trusted_proxies: ["10.0.0.0/8", "127.0.0.1/32"]
   #   recursive: true
@@ -122,7 +122,7 @@ proxy:
   # would make the correlation id come from the infrastructure rather
   # than from the caller. Set to [] to always mint a UUID.
   # Env-only deployments set the list comma-separated:
-  # AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
+  # CAVORA_PROXY__REQUEST_ID__ACCEPT_HEADERS=x-aisix-request-id,x-request-id
   # request_id:
   #   accept_headers: ["x-aisix-request-id", "x-request-id"]
   # Serve from independent worker threads, each with its own runtime,
@@ -135,7 +135,7 @@ proxy:
   # available to the process, so a container CPU limit or a taskset
   # affinity mask sizes it. Applied at startup.
   # workers: 4
-  # Entry-level URL rewriting: map legacy URL shapes onto AISIX endpoints
+  # Entry-level URL rewriting: map legacy URL shapes onto Cavora endpoints
   # before routing. The first rule whose `match` regex matches the request
   # path rewrites it (once, no cascading); the request then flows through
   # the normal endpoint — auth, ACL, quota — as if the client had sent the
@@ -145,7 +145,7 @@ proxy:
   # literal text); the query string is preserved. Invalid regexes, unknown
   # group references, and `?`/`#`/whitespace in the template fail startup.
   # In env-only deployments set the whole list as one JSON array:
-  # AISIX_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
+  # CAVORA_PROXY__URL_REWRITES='[{"match":"...","rewrite":"..."}]'
   # Example: serve per-server MCP URLs like /mcp-servers/github/mcp on
   # the /mcp/{server} endpoint.
   # Runs before ALL routing, including host-matched passthrough routes.
@@ -170,7 +170,7 @@ admin:
   addr: "127.0.0.1:3001"
   admin_keys:
     # Provide via env to avoid committing secrets.
-    # - "${AISIX_ADMIN_KEY}"
+    # - "${CAVORA_ADMIN_KEY}"
     - "admin-local-only-change-me"
   # TLS on the admin listener. This decides the `Secure` attribute on the
   # session cookie:
@@ -206,7 +206,7 @@ observability:
     # metrics always keep `side` (upstream/downstream) whether listed or not.
     # See the variable reference:
     # https://docs.api7.ai/ai-gateway/dev/reference/metric-labels
-    # Env: AISIX_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
+    # Env: CAVORA_OBSERVABILITY__METRICS__LABELS='{"aisix_request_ttft_seconds":["provider_key_name","model"]}'
     # labels:
     #   aisix_request_ttft_seconds:
     #     - env_id
@@ -236,7 +236,7 @@ observability:
     # only these fixed values (plus built-ins / "other" / "unknown") are
     # ever emitted — never the raw User-Agent.
     # Env-only deployments set the whole list as one JSON array:
-    # AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-billing-batcher/","client":"billing-batcher"}]'
+    # CAVORA_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-billing-batcher/","client":"billing-batcher"}]'
     # client_type_rules:
     #   - pattern: "^py-billing-batcher/"
     #     client: billing-batcher
@@ -262,9 +262,9 @@ observability:
     #   guardrail_latency: [0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
 
 # Managed-mode switch. Uncomment when connecting the gateway to
-# AISIX Cloud: the admin API and Playground will NOT be bound — all
+# Cavora Cloud: the admin API and Playground will NOT be bound — all
 # configuration flows from etcd via the mTLS channel above, driven
-# by the AISIX Cloud control plane.
+# by the Cavora Cloud control plane.
 # managed:
 #   enabled: true
 
@@ -299,7 +299,7 @@ cache:
   #   # Sentinel auth goes in the sentinels URLs; username/password/database
   #   # below authenticate the data node — the cluster nodes, or the master
   #   # Sentinel discovers, which has no URL of its own. Supply `password`
-  #   # via the matching env var (AISIX_CACHE__REDIS__PASSWORD) to keep it
+  #   # via the matching env var (CAVORA_CACHE__REDIS__PASSWORD) to keep it
   #   # out of this file.
   #   # sentinels: ["redis://10.0.0.1:26379", "redis://10.0.0.2:26379"]
   #   # master_name: "mymaster"
@@ -386,7 +386,7 @@ ratelimit:
   #   # tls: { ca_file: "/etc/aisix/tls/redis-ca.pem" }   # for rediss://
   #   # Data-node credentials, as in cache.redis above: applied in every
   #   # mode, and they override a credential embedded in the URL. Supply
-  #   # `password` via AISIX_RATELIMIT__REDIS__PASSWORD to keep it out of
+  #   # `password` via CAVORA_RATELIMIT__REDIS__PASSWORD to keep it out of
   #   # this file.
   #   # username: "default"
   #   # password: "s3cret"
@@ -578,7 +578,7 @@ shutdown:
 # Models, API keys, provider keys, guardrails, cache policies, and
 # observability exporters are NOT defined in this file. They come from
 # the configured resource source: the `resources_file` above, direct
-# etcd writes, or the AISIX Cloud control plane. This file only
+# etcd writes, or the Cavora Cloud control plane. This file only
 # bootstraps the gateway.
 
 # ---------------------------------------------------------------------------

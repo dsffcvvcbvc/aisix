@@ -276,7 +276,7 @@ jobs:
           set -eux
           VER="${GITHUB_REF_NAME#v}"
           IMG="${REGISTRY}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
-          docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
+          docker run --rm --entrypoint /usr/local/bin/cavora "$IMG" --version | tee /tmp/aisix-version
           grep -qx "aisix ${VER}" /tmp/aisix-version
 
       # Non-tag images get BUILD_VERSION="" and the short sha, so the binary
@@ -296,7 +296,7 @@ jobs:
             IMG="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
             docker pull "$IMG"
           fi
-          docker run --rm --entrypoint /usr/local/bin/aisix "$IMG" --version | tee /tmp/aisix-version
+          docker run --rm --entrypoint /usr/local/bin/cavora "$IMG" --version | tee /tmp/aisix-version
           test -n "$SHORT_SHA"
           grep -qxF "aisix dev+sha-${SHORT_SHA}" /tmp/aisix-version
 
@@ -452,7 +452,7 @@ jobs:
             docker pull "$IMAGE"
           fi
           cid="$(docker create "$IMAGE")"
-          docker cp "$cid:/usr/local/bin/aisix" /tmp/aisix-shipped
+          docker cp "$cid:/usr/local/bin/cavora" /tmp/aisix-shipped
           docker rm "$cid"
           ls -l /tmp/aisix-shipped
           test "$(nm /tmp/aisix-shipped | grep -c ' [tT] ')" -gt 1000

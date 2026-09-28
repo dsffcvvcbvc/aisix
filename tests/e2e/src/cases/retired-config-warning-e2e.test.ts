@@ -9,7 +9,7 @@ import { stringify as yamlStringify } from "yaml";
 const execFileP = promisify(execFile);
 
 const BIN_PATH =
-  process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+  process.env.CAVORA_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
 // E2E for the retired static OTLP blocks (AISIX-Cloud#1380).
 //
@@ -47,11 +47,11 @@ async function bootAndCollectLogs(
       "utf8",
     );
 
-    // Strip AISIX_* so the ambient harness environment cannot override the
+    // Strip CAVORA_* so the ambient harness environment cannot override the
     // config under test, then add back only this case's own override.
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
-      if (v !== undefined && !k.startsWith("AISIX_")) env[k] = v;
+      if (v !== undefined && !k.startsWith("CAVORA_")) env[k] = v;
     }
     Object.assign(env, extraEnv);
 
@@ -99,8 +99,8 @@ describe("retired startup settings are named at boot, not silently ignored", () 
     const logs = await bootAndCollectLogs(
       { log_level: "info", metrics: PROMETHEUS_OFF },
       {
-        AISIX_OBSERVABILITY__TRACING__OTLP__ENABLED: "true",
-        AISIX_OBSERVABILITY__TRACING__OTLP__ENDPOINT: "http://127.0.0.1:4317",
+        CAVORA_OBSERVABILITY__TRACING__OTLP__ENABLED: "true",
+        CAVORA_OBSERVABILITY__TRACING__OTLP__ENDPOINT: "http://127.0.0.1:4317",
       },
     );
     expect(logs).toContain("observability.tracing.otlp");

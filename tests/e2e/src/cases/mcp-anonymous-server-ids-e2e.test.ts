@@ -354,8 +354,8 @@ describe("mcp anonymous access: the allowlist may name servers by id", () => {
 // a `*`.
 describe("resources file: MCP server names and the anonymous ceiling", () => {
   const BIN_PATH =
-    process.env.AISIX_BIN ??
-    join(process.cwd(), "..", "..", "target", "debug", "aisix");
+    process.env.CAVORA_BIN ??
+    join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
   const run = async (
     contents: string,

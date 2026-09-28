@@ -31,7 +31,7 @@ const CALLER_KEY_HASH = createHash("sha256")
   .digest("hex");
 
 const REDIS_URL =
-  process.env.AISIX_E2E_REDIS ?? "redis://127.0.0.1:6379";
+  process.env.CAVORA_E2E_REDIS ?? "redis://127.0.0.1:6379";
 
 /** RESP-level PING so the redis-positive suite can skip honestly when
  *  no redis is reachable (CI provisions redis:7-alpine on :6379). */

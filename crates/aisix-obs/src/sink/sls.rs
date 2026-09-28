@@ -357,7 +357,7 @@ fn base_url_for(endpoint: &str, project: &str) -> String {
 /// only the reference), so the DP looks it up where it actually runs. The
 /// reference is upper-cased with non-alphanumerics folded to `_`, then read
 /// from `SLS_CRED_<REF>_AK_ID` / `SLS_CRED_<REF>_AK_SECRET`. The prefix is
-/// deliberately NOT `AISIX_`: that namespace is owned by the config loader
+/// deliberately NOT `CAVORA_`: that namespace is owned by the config loader
 /// (`Environment::with_prefix("AISIX")`), which reads such a name as a
 /// configuration override or warns about it on every boot. Returns `None` when either half is
 /// unset or blank — the caller then lets the misconfiguration surface as a

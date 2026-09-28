@@ -11,18 +11,18 @@
 //!
 //! The placeholder name is derived deterministically from the entry's
 //! identity and the field so it is stable across exports and greppable.
-//! It deliberately does **not** start with `AISIX_`: the gateway's
+//! It deliberately does **not** start with `CAVORA_`: the gateway's
 //! config loader owns that prefix (`Environment::with_prefix("AISIX")`),
 //! so a secret variable there is read as a configuration override when
 //! its first segment names a section, and otherwise warned about on every
 //! boot as a variable that overrode nothing. The same reason the e2e
 //! harness and the codebase's own `SLS_CRED_…` / `OBJSTORE_CRED_…`
-//! conventions keep secret variables off the `AISIX_` prefix.
+//! conventions keep secret variables off the `CAVORA_` prefix.
 
 use serde_json::Value;
 
 /// Namespace every derived secret variable shares. Config-safe (does not
-/// begin with the `AISIX_` config-override prefix) and greppable.
+/// begin with the `CAVORA_` config-override prefix) and greppable.
 pub const SECRET_ENV_PREFIX: &str = "AISIXSECRET";
 
 /// One placeholder emitted in place of a live credential. Collected so
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(a, "AISIXSECRET_PROVIDER_KEY_OPENAI_PROD_API_KEY");
         assert_eq!(a, secret_var("PROVIDER_KEY", "openai-prod", "api_key"));
         // Never the reserved config-override prefix.
-        assert!(!a.starts_with("AISIX_"));
+        assert!(!a.starts_with("CAVORA_"));
     }
 
     #[test]

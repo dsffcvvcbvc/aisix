@@ -87,12 +87,12 @@ pub async fn update_resources(
     let applied_version = state.snapshot.version();
 
     // Durable persistence: configured `resources_file` first, then
-    // `AISIX_RESOURCES_PATH`, then `resources.yaml`.
+    // `CAVORA_RESOURCES_PATH`, then `resources.yaml`.
     let target_path: PathBuf = state
         .resources_file
         .clone()
         .or_else(|| {
-            std::env::var("AISIX_RESOURCES_PATH")
+            std::env::var("CAVORA_RESOURCES_PATH")
                 .ok()
                 .map(PathBuf::from)
         })
@@ -167,11 +167,11 @@ fn dashboard_root() -> PathBuf {
             return root.clone();
         }
     }
-    if let Ok(custom) = std::env::var("AISIX_DASHBOARD_DIR") {
+    if let Ok(custom) = std::env::var("CAVORA_DASHBOARD_DIR") {
         PathBuf::from(custom)
     } else {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        let p1 = PathBuf::from(format!("{home}/.aisix/dashboard/out"));
+        let p1 = PathBuf::from(format!("{home}/.cavora/dashboard/out"));
         if p1.exists() {
             return p1;
         }
@@ -280,7 +280,7 @@ const SERVICE_WORKER_FILE: &str = "sw.js";
 /// * The Cache API is keyed by URL and has no notion of credentials, so
 ///   anything a worker stores is replayable by any client at the origin, with
 ///   or without a session. This origin's authenticated surface is
-///   `/admin/v1/*`, authorised by `aisix_admin_session`
+///   `/admin/v1/*`, authorised by `cavora_admin_session`
 ///   (`HttpOnly; SameSite=Strict; Path=/admin/v1`).
 /// * That document is never actually served from the cache today, and the
 ///   reason is incidental rather than stated: navigations return early
@@ -487,7 +487,7 @@ fn landing_page_response() -> Response {
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>AISIX Gateway Dashboard</title>
+  <title>Cavora Gateway Dashboard</title>
   <style>
     body { font-family: system-ui, sans-serif; background: #0a0a0c; color: #ededed; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
     .card { background: #141419; border: 1px solid #282832; border-radius: 12px; padding: 32px; max-width: 500px; text-align: center; }
@@ -500,9 +500,9 @@ fn landing_page_response() -> Response {
 </head>
 <body>
   <div class="card">
-    <div class="badge">AISIX Unified Native Gateway</div>
+    <div class="badge">Cavora Unified Native Gateway</div>
     <h1>Gateway dashboard</h1>
-    <p>The gateway core is running and serving requests. The static SPA dashboard is expected in <code>~/.aisix/dashboard/out</code>.</p>
+    <p>The gateway core is running and serving requests. The static SPA dashboard is expected in <code>~/.cavora/dashboard/out</code>.</p>
     <a href="/admin/openapi-scalar" class="btn">Open Scalar UI (OpenAPI)</a>
   </div>
 </body>

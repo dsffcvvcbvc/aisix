@@ -120,9 +120,9 @@ api_keys:
     allowed_models: ["*"]
 EOF
 
-# AISIX_* env vars are config overrides; nothing from the calling environment
+# CAVORA_* env vars are config overrides; nothing from the calling environment
 # may leak into the trained process (same discipline as the bench harness).
-while read -r v; do unset "$v"; done < <(compgen -v | grep '^AISIX_' || true)
+while read -r v; do unset "$v"; done < <(compgen -v | grep '^CAVORA_' || true)
 
 # ---- one gateway lifetime per shape -------------------------------------------
 for shape in "${SHAPES[@]}"; do

@@ -9,7 +9,7 @@
 //!
 //! Decisions are cached in an LRU (capacity 10000, TTL 5s) keyed by
 //! api_key_id. When cp-api is unreachable we honor the last cached
-//! decision (sticky) up to AISIX_DP_BUDGET_STALE_MAX_SECONDS (default
+//! decision (sticky) up to CAVORA_DP_BUDGET_STALE_MAX_SECONDS (default
 //! 600s); past that we apply the fail_mode that came back on the last
 //! good response.
 
@@ -165,7 +165,7 @@ impl BudgetClient {
     /// equivalent) using the same persisted `MtlsBundle`.
     pub fn new(base_url: impl Into<String>, http: reqwest::Client) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
-        let stale_max = std::env::var("AISIX_DP_BUDGET_STALE_MAX_SECONDS")
+        let stale_max = std::env::var("CAVORA_DP_BUDGET_STALE_MAX_SECONDS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(DEFAULT_STALE_MAX_SECONDS);

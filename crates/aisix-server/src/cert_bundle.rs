@@ -12,10 +12,10 @@
 //!
 //! Wire shape, three required PEMs:
 //!
-//!   AISIX_MANAGED__CP_CERT_PEM   — leaf certificate
-//!   AISIX_MANAGED__CP_KEY_PEM    — SEC1 EC private key paired with
+//!   CAVORA_MANAGED__CP_CERT_PEM   — leaf certificate
+//!   CAVORA_MANAGED__CP_KEY_PEM    — SEC1 EC private key paired with
 //!                                  the leaf
-//!   AISIX_MANAGED__CP_CA_PEM     — CA cert the DP installs as the
+//!   CAVORA_MANAGED__CP_CA_PEM     — CA cert the DP installs as the
 //!                                  trust anchor for dp-manager mTLS
 //!
 //! `_FILE` variants take the same content but load from disk; useful

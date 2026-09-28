@@ -36,9 +36,9 @@ use serde_json::{json, Map, Value};
 const OPENAPI_JSON_BASE: &str = r##"{
   "openapi": "3.1.0",
   "info": {
-    "title": "AISIX Admin API",
+    "title": "Cavora Admin API",
     "version": "dev",
-    "description": "The AISIX Admin API is the operational surface of an open-source AISIX gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, drive the playground, and apply declarative resources via `POST /admin/v1/resources`.\n\n`POST /admin/v1/resources` validates a `resources.yaml` payload, hot-reloads it in memory, and persists it to the configured `resources_file` (`AISIX_RESOURCES_PATH` / `resources.yaml` fallback). Other resource writes stay declarative: edit the `resources_file` (`resources.yaml`, reloaded on SIGHUP) or write to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\n## Authenticating a browser\n\nRequests authenticate with an admin key from `config.admin.admin_keys`, as `Authorization: Bearer <key>` or `x-api-key: <key>`. A browser cannot send either, so `POST /admin/v1/auth/session` exchanges the key for an `HttpOnly` session cookie that carries the same authority and is scoped to `/admin/v1`.\n\nWhere a request presents more than one credential, the first of `Authorization`, then `x-api-key`, then the session cookie is the one that decides, and an invalid one is refused rather than falling through to the next.\n\n## Cross-origin requests\n\nBecause the session cookie is attached by the browser on its own, every unsafe method on this API (`POST`, `PUT`, `PATCH`, `DELETE`) additionally checks that the request came from this server's own host: a request that carries an `Origin` or `Referer` naming a different host is refused with `403`. Requests that carry neither header are not browsers and are allowed through.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
+    "description": "The Cavora Admin API is the operational surface of an open-source Cavora gateway: list and inspect the loaded models, caller API keys, provider credentials, guardrails, MCP servers, A2A agents, cache policies, and observability exporters, check per-model upstream health, drive the playground, and apply declarative resources via `POST /admin/v1/resources`.\n\n`POST /admin/v1/resources` validates a `resources.yaml` payload, hot-reloads it in memory, and persists it to the configured `resources_file` (`CAVORA_RESOURCES_PATH` / `resources.yaml` fallback). Other resource writes stay declarative: edit the `resources_file` (`resources.yaml`, reloaded on SIGHUP) or write to etcd directly. See the resources file reference at https://docs.api7.ai/ai-gateway/reference/resources-file.\n\n## Authenticating a browser\n\nRequests authenticate with an admin key from `config.admin.admin_keys`, as `Authorization: Bearer <key>` or `x-api-key: <key>`. A browser cannot send either, so `POST /admin/v1/auth/session` exchanges the key for an `HttpOnly` session cookie that carries the same authority and is scoped to `/admin/v1`.\n\nWhere a request presents more than one credential, the first of `Authorization`, then `x-api-key`, then the session cookie is the one that decides, and an invalid one is refused rather than falling through to the next.\n\n## Cross-origin requests\n\nBecause the session cookie is attached by the browser on its own, every unsafe method on this API (`POST`, `PUT`, `PATCH`, `DELETE`) additionally checks that the request came from this server's own host: a request that carries an `Origin` or `Referer` naming a different host is refused with `403`. Requests that carry neither header are not browsers and are allowed through.\n\nGateways connected to AISIX Cloud do not expose this listener. Configure them through AISIX Cloud."
   },
   "paths": {
     "/livez": {
@@ -1836,7 +1836,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
             "description": "Session created. The admin session cookie is set on the response; there is no body.",
             "headers": {
               "Set-Cookie": {
-                "description": "The admin session cookie, named `aisix_admin_session`, with `HttpOnly`, `SameSite=Strict`, and `Path=/admin/v1`.",
+                "description": "The admin session cookie, named `cavora_admin_session`, with `HttpOnly`, `SameSite=Strict`, and `Path=/admin/v1`.",
                 "schema": {
                   "type": "string"
                 }
@@ -2161,7 +2161,7 @@ const OPENAPI_JSON_BASE: &str = r##"{
       "AdminSessionCookie": {
         "type": "apiKey",
         "in": "cookie",
-        "name": "aisix_admin_session",
+        "name": "cavora_admin_session",
         "description": "Session cookie minted by `POST /admin/v1/auth/session`. Carries the same authority as an admin key. Sent as an `HttpOnly` cookie, so it is never readable by page scripts; scoped to `Path=/admin/v1`, and to a browser session (no `Max-Age`). Where more than one credential is presented, `Authorization` decides and the cookie is not consulted."
       },
       "ProxyBearer": {
@@ -3428,7 +3428,7 @@ fn wrap_ref_siblings_for_redoc(v: &mut Value) {
 /// JSON Schema, but ReDoc renders it as a two-tab choice for optional fields.
 /// Collapse that generated nullable shape in the served OpenAPI so optionality
 /// is expressed by the field being absent from `required`, matching the
-/// hand-written API7/AISIX Cloud Admin API style.
+/// hand-written API7/Cavora Cloud Admin API style.
 fn collapse_nullable_any_of(v: &mut Value) {
     match v {
         Value::Object(map) => {

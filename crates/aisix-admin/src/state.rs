@@ -46,7 +46,7 @@ pub struct AdminState {
     pub store: Arc<dyn ConfigStore>,
     /// Standalone file source path (`config.resources_file`) used by
     /// `POST /admin/v1/resources` for durable persistence. `None` in
-    /// etcd mode — the handler then falls back to `AISIX_RESOURCES_PATH`
+    /// etcd mode — the handler then falls back to `CAVORA_RESOURCES_PATH`
     /// / `resources.yaml` for standalone-style deployments.
     pub resources_file: Option<PathBuf>,
     /// Shared in-process health tracker from the proxy. Used by the

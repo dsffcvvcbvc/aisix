@@ -22,9 +22,9 @@ describe("etcdEndpoint", () => {
   // spawned talks to fork N's, and the symptom is a config-propagation
   // timeout that looks like a product bug.
   //
-  // Three spellings count: reading AISIX_E2E_ETCD, reading the
+  // Three spellings count: reading CAVORA_E2E_ETCD, reading the
   // _ENDPOINTS list (`\b` does NOT separate them — `_` is a word
-  // character — so a case doing `AISIX_E2E_ETCD_ENDPOINTS.split(",")[0]`
+  // character — so a case doing `CAVORA_E2E_ETCD_ENDPOINTS.split(",")[0]`
   // would pin fork 1's cluster and pass a narrower guard), and writing a
   // literal in the 2379-2382 range CI publishes its clusters on, in any
   // of its three host spellings. (A deliberately dead endpoint like
@@ -45,7 +45,7 @@ describe("etcdEndpoint", () => {
       }
       const src = readFileSync(file, "utf8");
       return (
-        /process\.env\.AISIX_E2E_ETCD/.test(src) ||
+        /process\.env\.CAVORA_E2E_ETCD/.test(src) ||
         /(?:127\.0\.0\.1|localhost|\[::1\]):(?:2379|238[0-2])\b/.test(src)
       );
     });
@@ -74,7 +74,7 @@ describe("etcdEndpoint", () => {
 
   it("spreads forks across the configured endpoints", () => {
     withEnv(
-      { AISIX_E2E_ETCD_ENDPOINTS: "http://a:2379, http://b:2379,http://c:2379", VITEST_POOL_ID: "1" },
+      { CAVORA_E2E_ETCD_ENDPOINTS: "http://a:2379, http://b:2379,http://c:2379", VITEST_POOL_ID: "1" },
       () => {
         const seen = new Set<string>();
         for (const poolId of ["1", "2", "3"]) {
@@ -92,7 +92,7 @@ describe("etcdEndpoint", () => {
   // does — deriving them independently is how it came to clear an
   // unused endpoint while leaving a used one unchecked.
   it("maps one-based pool ids, so N forks are not the first N entries", () => {
-    withEnv({ AISIX_E2E_ETCD_ENDPOINTS: "http://a:2379,http://b:2379,http://c:2379,http://d:2379" }, () => {
+    withEnv({ CAVORA_E2E_ETCD_ENDPOINTS: "http://a:2379,http://b:2379,http://c:2379,http://d:2379" }, () => {
       expect([1, 2].map(etcdEndpointForPool)).toEqual(["http://b:2379", "http://c:2379"]);
       expect([1, 2, 3, 4].map(etcdEndpointForPool)).toEqual([
         "http://b:2379",
@@ -106,8 +106,8 @@ describe("etcdEndpoint", () => {
   it("falls back to the single-endpoint form when no list is set", () => {
     withEnv(
       {
-        AISIX_E2E_ETCD_ENDPOINTS: undefined,
-        AISIX_E2E_ETCD: "http://only:2379",
+        CAVORA_E2E_ETCD_ENDPOINTS: undefined,
+        CAVORA_E2E_ETCD: "http://only:2379",
         VITEST_POOL_ID: "7",
       },
       () => {

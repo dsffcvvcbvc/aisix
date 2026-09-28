@@ -1,6 +1,6 @@
-# Contributing to AISIX
+# Contributing to Cavora
 
-Thanks for your interest in AISIX! Contributions of every kind are welcome —
+Thanks for your interest in Cavora! Contributions of every kind are welcome —
 bug reports, feature requests, docs fixes, and code.
 
 ## Where to start
@@ -26,7 +26,7 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 
 # Run locally (needs a reachable etcd + a config.yaml — see the docs quickstart)
-cargo run -p aisix-server --bin aisix -- --config config.yaml
+cargo run -p aisix-server --bin cavora -- --config config.yaml
 ```
 
 CI enforces `fmt`, `clippy -D warnings`, unit tests with a coverage gate, the
@@ -96,5 +96,5 @@ on `main`.
 
 ## License
 
-AISIX is licensed under [Apache 2.0](LICENSE). By contributing, you agree that
+Cavora is licensed under [Apache 2.0](LICENSE). By contributing, you agree that
 your contributions are licensed under the same terms.

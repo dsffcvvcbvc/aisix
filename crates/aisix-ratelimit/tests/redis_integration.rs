@@ -1026,7 +1026,7 @@ fn a_refused_credential_is_told_apart_from_an_outage() {
 /// server-wide and every other test in this file shares the server. The
 /// user is created with one password, the store is configured with
 /// another — so the first connect is refused, exactly as a typo'd
-/// `AISIX_RATELIMIT__REDIS__PASSWORD` would be — and then the user's
+/// `CAVORA_RATELIMIT__REDIS__PASSWORD` would be — and then the user's
 /// password is changed to the configured one with the gateway still
 /// running.
 #[tokio::test]

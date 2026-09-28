@@ -74,7 +74,7 @@ export async function setup(): Promise<void> {
     `etcd not reachable at ${dead.join(", ")} (of ${endpoints.length} in use). ` +
       "Every case file that landed on one of these would SKIP silently and the run " +
       "would still pass, so it fails here instead. Check the etcd services in " +
-      ".github/workflows/ci.yml against AISIX_E2E_ETCD_ENDPOINTS — the two lists " +
+      ".github/workflows/ci.yml against CAVORA_E2E_ETCD_ENDPOINTS — the two lists " +
       "must match entry for entry.",
   );
 }

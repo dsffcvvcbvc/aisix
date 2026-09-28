@@ -19,7 +19,7 @@ import {
 } from "../harness/index.js";
 
 const BIN_PATH =
-  process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+  process.env.CAVORA_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
 // E2E for the load-observability contract: `GET /status/config`,
 // `GET /status/ready`, and the `aisix_config_*` Prometheus series on the
@@ -584,10 +584,10 @@ async function spawnPointedAtDeadEtcd(): Promise<MinimalApp> {
   const cfgPath = join(dir, "config.yaml");
   await writeFile(cfgPath, yamlStringify(cfg), "utf8");
 
-  // Strip AISIX_* so the harness's own env can't override the config.
+  // Strip CAVORA_* so the harness's own env can't override the config.
   const childEnv: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
+    if (v !== undefined && !k.startsWith("CAVORA_")) childEnv[k] = v;
   }
   childEnv.RUST_LOG = "warn";
 

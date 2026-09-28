@@ -1,6 +1,6 @@
 <div align="center">
 
-# AISIX AI Gateway
+# Cavora AI Gateway
 
 ### The open-source, Rust-native AI gateway for LLMs and AI agents
 
@@ -20,18 +20,18 @@ forever.
 [**Start free**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=ai-gateway) ·
 [**Documentation**](https://docs.api7.ai/ai-gateway/) ·
 [**Quickstart**](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
-[**AISIX Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
+[**Cavora Cloud**](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) ·
 [**Roadmap**](ROADMAP.md)
 
 <br>
 
-<img src="assets/aisix-architecture.svg" alt="AISIX AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
+<img src="assets/aisix-architecture.svg" alt="Cavora AI Gateway architecture — one OpenAI- or Anthropic-compatible API in front of OpenAI, Anthropic, Gemini/Vertex, Bedrock, Azure OpenAI, and DeepSeek, with API key auth, rate and token limits, guardrails, caching, routing and failover, and observability in between" width="100%">
 
 </div>
 
 ---
 
-**AISIX AI Gateway** is a Rust-native gateway that puts a single, OpenAI-compatible API in
+**Cavora AI Gateway** is a Rust-native gateway that puts a single, OpenAI-compatible API in
 front of every LLM provider — OpenAI, Anthropic, Google Gemini, AWS Bedrock, Azure OpenAI,
 DeepSeek, and any OpenAI-compatible endpoint. It gives platform teams one place to route,
 govern, secure, and observe LLM traffic, with first-class SSE streaming and low gateway
@@ -41,18 +41,18 @@ It runs as a **single static binary** — low cold-start, lock-free config reads
 configuration reloads with no restarts: declare resources in one `resources.yaml` and
 reload on `SIGHUP`, or point the gateway at etcd for a multi-replica cluster. Run the
 open-source gateway in your infrastructure, or connect it to
-**[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
+**[Cavora Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 for centralized management with team governance, budgets, audit, and a dashboard.
 
-> **AISIX AI Gateway (this repo)** is the open-source product. It runs without a control
+> **Cavora AI Gateway (this repo)** is the open-source product. It runs without a control
 > plane using declarative configuration or etcd. When connected to
-> **[AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**,
-> the same gateway serves as the data plane. AISIX Cloud adds a commercial control plane,
+> **[Cavora Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud)**,
+> the same gateway serves as the data plane. Cavora Cloud adds a commercial control plane,
 > either hosted by API7 (**Hybrid Cloud**) or hosted by you in your infrastructure
 > (**On-Premises**). In both options, the gateway runs in your environment and calls
 > providers directly; live AI traffic does not pass through the control plane or API7.
 > The proxy API is identical throughout.
-> **[Talk to us about AISIX Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
+> **[Talk to us about Cavora Cloud →](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)**
 
 ## ⚡ Quickstart
 
@@ -98,7 +98,7 @@ api_keys:
 export OPENAI_API_KEY="YOUR_PROVIDER_KEY"
 export CALLER_API_KEY="YOUR_CALLER_KEY"
 
-docker run -d --name aisix \
+docker run -d --name cavora \
   -v "$(pwd)/config.yaml:/etc/aisix/config.yaml:ro" \
   -v "$(pwd)/resources.yaml:/etc/aisix/resources.yaml:ro" \
   -e OPENAI_API_KEY -e CALLER_API_KEY \
@@ -117,9 +117,9 @@ curl http://localhost:3000/v1/chat/completions \
   -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-Edit `resources.yaml` and send `SIGHUP` (`docker kill -s HUP aisix`) to apply changes with
+Edit `resources.yaml` and send `SIGHUP` (`docker kill -s HUP cavora`) to apply changes with
 no restart — an invalid file is rejected whole and the last good configuration keeps
-serving. Check a file before booting with `aisix validate --resources resources.yaml`.
+serving. Check a file before booting with `cavora validate --resources resources.yaml`.
 
 Full walkthrough: the
 [Gateway Quickstart](https://docs.api7.ai/ai-gateway/getting-started/gateway-quickstart) ·
@@ -127,7 +127,7 @@ every field: the [resources file reference](https://docs.api7.ai/ai-gateway/refe
 For a multi-replica cluster, point the gateway at etcd instead — `resources_file` and
 `etcd` are mutually exclusive.
 
-## ✨ Why AISIX
+## ✨ Why Cavora
 
 - **One API, every model.** Speak the OpenAI *or* Anthropic wire format in; the gateway
   translates to whichever provider each model points at. Point an OpenAI or Claude SDK at
@@ -135,10 +135,10 @@ For a multi-replica cluster, point the gateway at etcd instead — `resources_fi
 - **A real gateway, in Rust.** Single static binary, low cold-start, lock-free config reads
   on the hot path, native streaming.
 - **Open source, free forever.** Apache-2.0 licensed and built to run in your
-  infrastructure. Choose AISIX Cloud when you want centralized management through a
+  infrastructure. Choose Cavora Cloud when you want centralized management through a
   control plane and dashboard.
 - **Production controls built in.** Routing & failover, rate limits, guardrails, caching,
-  and observability ship in the box. (Budgets and spend caps are an AISIX Cloud feature —
+  and observability ship in the box. (Budgets and spend caps are an Cavora Cloud feature —
   the gateway enforces the control plane's decisions.)
 
 ## 🧩 Features — available today
@@ -195,7 +195,7 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
 - **Declarative configuration** — one `resources.yaml` carries all ten resource collections
   (provider keys, models, caller keys, guardrails, MCP servers, A2A agents, cache policies,
   observability exporters, rate-limit policies, OIDC providers), validated against the same
-  JSON Schemas the gateway uses at runtime. `aisix validate` checks a file offline; `SIGHUP`
+  JSON Schemas the gateway uses at runtime. `cavora validate` checks a file offline; `SIGHUP`
   reloads it atomically.
 - **Operational endpoints** — `/livez` and `/readyz` on the proxy listener; `/status/config`,
   `/status/ready`, `/status/models`, and Prometheus `/metrics` on a dedicated metrics
@@ -206,7 +206,7 @@ Covered by 183 end-to-end scenario files (496 cases) that run against real gatew
 
 ## 🔌 Supported providers
 
-AISIX dispatches through **five native adapter families** — distinct wire-protocol bridges,
+Cavora dispatches through **five native adapter families** — distinct wire-protocol bridges,
 not one generic relabel. Whatever the upstream protocol, the client-facing API stays
 OpenAI-shaped.
 
@@ -222,44 +222,44 @@ Plus specialized handling for vendor quirks (e.g. DeepSeek reasoning content) an
 **rerank / embeddings** vendors (Cohere, Jina). Details in
 [adapter protocol families](https://docs.api7.ai/ai-gateway/providers/adapters).
 
-## ☁️ Open source vs AISIX Cloud
+## ☁️ Open source vs Cavora Cloud
 
 Same gateway binary, same proxy API — in every form the gateway runs in your environment.
-**AISIX Cloud** adds a commercial control plane, either hosted by API7
+**Cavora Cloud** adds a commercial control plane, either hosted by API7
 (**Hybrid Cloud**) or hosted in your infrastructure (**On-Premises**).
 
 <table>
   <tr>
     <td width="50%" valign="top">
-      <img src="assets/console-overview.png" alt="AISIX Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and data-plane health" width="100%"><br>
+      <img src="assets/console-overview.png" alt="Cavora Cloud overview — requests, latency p50/p99, error rate and cost today, with a 7-day request-and-cost trend and data-plane health" width="100%"><br>
       <sub><b>Overview</b> — traffic, latency, error rate &amp; spend at a glance</sub>
       <br><br>
-      <img src="assets/console-models.png" alt="AISIX Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
+      <img src="assets/console-models.png" alt="Cavora Cloud models — alias an upstream LLM per provider (OpenAI, Anthropic, AWS Bedrock, DeepSeek) with model IDs and per-model rate limits" width="100%"><br>
       <sub><b>Models</b> — one alias per upstream: OpenAI, Anthropic, Bedrock, DeepSeek…</sub>
       <br><br>
-      <img src="assets/console-guardrails.png" alt="AISIX Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
+      <img src="assets/console-guardrails.png" alt="Cavora Cloud guardrails — pre-input and post-output content policies (keyword blocklist, Azure Content Safety, AWS Bedrock) that block on violation" width="100%"><br>
       <sub><b>Guardrails</b> — pre-input &amp; post-output policies, block on violation</sub>
     </td>
     <td width="50%" valign="top">
-      <img src="assets/console-playground.png" alt="AISIX Cloud playground — pick a model, set system and user prompts, run, and read the response with live token and cost metering" width="100%"><br>
+      <img src="assets/console-playground.png" alt="Cavora Cloud playground — pick a model, set system and user prompts, run, and read the response with live token and cost metering" width="100%"><br>
       <sub><b>Playground</b> — test any model with live token &amp; cost metering</sub>
       <br><br>
-      <img src="assets/console-observability.png" alt="AISIX Cloud observability exporters — fan out chat-completion telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
+      <img src="assets/console-observability.png" alt="Cavora Cloud observability exporters — fan out chat-completion telemetry to OTLP, Datadog and object storage, with per-target delivery health" width="100%"><br>
       <sub><b>Observability</b> — fan out traces &amp; logs to OTLP, Datadog, object storage</sub>
       <br><br>
-      <img src="assets/console-budgets.png" alt="AISIX Cloud budgets — organization and per-environment spend caps with progress bars, hard-stop versus warn-only, including an over-budget policy" width="100%"><br>
+      <img src="assets/console-budgets.png" alt="Cavora Cloud budgets — organization and per-environment spend caps with progress bars, hard-stop versus warn-only, including an over-budget policy" width="100%"><br>
       <sub><b>Budgets</b> — hard-stop spend caps with warn-only tiers</sub>
     </td>
   </tr>
 </table>
 
 <p align="center">
-  <em>The AISIX Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets (with hard-stop spend caps), and observability exporters, across all your gateways.</em>
+  <em>The Cavora Cloud dashboard — overview metrics, multi-provider models, guardrails, budgets (with hard-stop spend caps), and observability exporters, across all your gateways.</em>
   <br><br>
   <a href="https://aisix-demo.api7.ai/"><b>▶ Try the live dashboard demo — aisix-demo.api7.ai</b></a>
 </p>
 
-| | Open-source gateway (this repo) | [AISIX Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (Hybrid Cloud or On-Premises) |
+| | Open-source gateway (this repo) | [Cavora Cloud](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme&utm_campaign=cloud) (Hybrid Cloud or On-Premises) |
 |---|---|---|
 | Price | Free · Apache-2.0 · forever | Commercial — [talk to us](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=pricing) |
 | Configuration | Declarative `resources.yaml`, or etcd for a cluster | Dashboard + Cloud Admin API, multi-environment |
@@ -272,13 +272,13 @@ Same gateway binary, same proxy API — in every form the gateway runs in your e
 | Usage & cost | Export logs, metrics, and usage events yourself | Managed usage views, model pricing catalog, spend reporting |
 | Surface | Status endpoints, OpenAPI read surface, playground | Full dashboard + per-environment playground |
 
-→ **Want the AISIX Cloud control plane, governance, budgets, and dashboard?**
+→ **Want the Cavora Cloud control plane, governance, budgets, and dashboard?**
 **[Talk to API7](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=cloud)** about
 Hybrid Cloud or On-Premises, or **[book a demo](https://api7.ai/contact?utm_source=github&utm_medium=readme&utm_campaign=demo)**.
 
 ## 🏗️ Architecture
 
-A single Cargo workspace; the `aisix-server` crate builds one binary named `aisix` that
+A single Cargo workspace; the `aisix-server` crate builds one binary named `cavora` that
 wires the crates together.
 
 ```text
@@ -296,7 +296,7 @@ crates/
 ├── aisix-redis          shared Redis connection for cache + rate limits
 ├── aisix-guardrails     pre/post content-policy hooks
 ├── aisix-obs            tracing, metrics, access log, exporters
-└── aisix-server         the `aisix` binary — bootstrap + CLI
+└── aisix-server         the `cavora` binary — bootstrap + CLI
 ```
 
 ## 🗺️ Roadmap
@@ -329,10 +329,10 @@ cargo llvm-cov --workspace --lcov --output-path lcov.info
 
 # Run locally against a resources.yaml (no etcd needed). Copy the Quickstart's two files
 # and change resources_file to the local path, e.g. resources_file: ./resources.yaml
-cargo run -p aisix-server --bin aisix -- --config config.local.yaml
+cargo run -p aisix-server --bin cavora -- --config config.local.yaml
 
 # Check a resources file without starting a listener
-cargo run -p aisix-server --bin aisix -- validate --resources resources.yaml
+cargo run -p aisix-server --bin cavora -- validate --resources resources.yaml
 ```
 
 ## 💬 Community
@@ -342,7 +342,7 @@ cargo run -p aisix-server --bin aisix -- validate --resources resources.yaml
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md)
 - **Website** — [api7.ai/ai-gateway](https://api7.ai/ai-gateway?utm_source=github&utm_medium=readme)
 
-If AISIX is useful to you, a ⭐ helps other engineers find it.
+If Cavora is useful to you, a ⭐ helps other engineers find it.
 
 ## 📄 License
 

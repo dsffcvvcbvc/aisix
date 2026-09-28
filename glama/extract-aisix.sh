@@ -35,7 +35,7 @@ fi
 DIGESTS=$(printf '%s' "$MANIFEST" | python -c 'import sys,json;[print(l["digest"]) for l in reversed(json.load(sys.stdin)["layers"])]')
 for D in $DIGESTS; do
   curl -fsSL -H "Authorization: Bearer $TOKEN" "https://ghcr.io/v2/api7/aisix/blobs/$D" -o /tmp/layer.tgz
-  ENTRY=$(tar -tzf /tmp/layer.tgz 2>/dev/null | grep -E '(^|/)usr/local/bin/aisix$' | head -1 || true)
+  ENTRY=$(tar -tzf /tmp/layer.tgz 2>/dev/null | grep -E '(^|/)usr/local/bin/cavora$' | head -1 || true)
   if [ -n "$ENTRY" ]; then
     mkdir -p /tmp/x && tar -xzf /tmp/layer.tgz -C /tmp/x "$ENTRY"
     mv "/tmp/x/$ENTRY" /app/glama/aisix && chmod +x /app/glama/aisix

@@ -47,7 +47,7 @@ describe.each([false, true])("upstream User-Agent (threadPerCore=%s)", (threadPe
     if (!(await etcd.ping())) return;
 
     const binary =
-      process.env.AISIX_BIN ?? join(process.cwd(), "../../target/debug/aisix");
+      process.env.CAVORA_BIN ?? join(process.cwd(), "../../target/debug/cavora");
     const { stdout } = await promisify(execFile)(binary, ["--version"]);
     expect(stdout.trim()).toMatch(/^aisix \S+$/);
     version = stdout.trim().slice("aisix ".length);

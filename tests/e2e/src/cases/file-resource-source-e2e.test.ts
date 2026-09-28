@@ -29,7 +29,7 @@ import {
 //
 // NOTE on env names: the caller-key plaintext travels to the gateway via
 // an environment variable (`key_env` sugar). The variable name must NOT
-// start with `AISIX_` — the binary's config loader treats that prefix as
+// start with `CAVORA_` — the binary's config loader treats that prefix as
 // config overrides (same reason the harness strips them).
 
 const execFileP = promisify(execFile);
@@ -595,7 +595,7 @@ not_a_collection: []
 
 describe("file resource source: validate subcommand", () => {
   const BIN_PATH =
-    process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+    process.env.CAVORA_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "cavora");
 
   test("valid file exits 0; invalid file exits 1 with the aggregated report on stderr", async () => {
     const dir = await mkdtemp(join(tmpdir(), "aisix-validate-e2e-"));

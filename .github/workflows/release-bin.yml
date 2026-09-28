@@ -36,17 +36,17 @@ jobs:
 
       - name: Build Release Binary
         run: |
-          cargo build --release -p aisix-server --bin aisix
+          cargo build --release -p aisix-server --bin cavora
 
       - name: Verify Binary
         run: |
-          ls -lh target/release/aisix
-          file target/release/aisix
+          ls -lh target/release/cavora
+          file target/release/cavora
 
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: aisix-linux-amd64
-          path: target/release/aisix
+          name: cavora-linux-amd64
+          path: target/release/cavora
           if-no-files-found: error
           retention-days: 7

@@ -25,7 +25,7 @@
 //!    file this handler persists is proved loadable before it lands.
 //!
 //! Commit is an RCU swap of the whole snapshot, then a durable write to
-//! the configured `resources_file` (`AISIX_RESOURCES_PATH` /
+//! the configured `resources_file` (`CAVORA_RESOURCES_PATH` /
 //! `resources.yaml` fallback) — the same order, and the same
 //! last-writer-wins semantics, [`crate::resources_handler`] documents.
 
@@ -374,14 +374,14 @@ fn persist_snapshot(state: &AdminState, snapshot: &AisixSnapshot) -> Result<(), 
 }
 
 /// The configured durable path: `resources_file` first, then
-/// `AISIX_RESOURCES_PATH`, then `resources.yaml`. Same order
+/// `CAVORA_RESOURCES_PATH`, then `resources.yaml`. Same order
 /// `update_resources` uses.
 fn resources_file_path(state: &AdminState) -> PathBuf {
     state
         .resources_file
         .clone()
         .or_else(|| {
-            std::env::var("AISIX_RESOURCES_PATH")
+            std::env::var("CAVORA_RESOURCES_PATH")
                 .ok()
                 .map(PathBuf::from)
         })

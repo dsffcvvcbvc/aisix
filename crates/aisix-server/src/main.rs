@@ -2,7 +2,7 @@
 //!
 //! Startup sequence (spec §1):
 //!  1. Parse CLI args (`--config <path>`)
-//!  2. Load + validate config (YAML/TOML/JSON, `AISIX__*` env overrides)
+//!  2. Load + validate config (YAML/TOML/JSON, `CAVORA__*` env overrides)
 //!  3. Initialise tracing
 //!  4. Connect to etcd with 5s × 5 retry
 //!  5. Bootstrap initial snapshot
@@ -96,14 +96,13 @@ use tokio::sync::watch;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "aisix",
-    version = aisix_core::BUILD_VERSION.as_str(),
-    about = "aisix AI Gateway",
+    name = "cavora",
+    about = "Cavora AI Gateway",
     subcommand_negates_reqs = true
 )]
 struct Cli {
     /// Path to the bootstrap config file (YAML / TOML / JSON).
-    #[arg(short, long, env = "AISIX_CONFIG", required = true)]
+    #[arg(short, long, env = "CAVORA_CONFIG", required = true)]
     config: Option<PathBuf>,
 
     #[command(subcommand)]
@@ -238,7 +237,7 @@ async fn async_main(cfg: Config) -> anyhow::Result<()> {
         tracing::warn!("{retired}");
     }
 
-    // `AISIX_*` variables that name no setting. Same reason for the
+    // `CAVORA_*` variables that name no setting. Same reason for the
     // placement: the load that dropped them ran before the subscriber.
     for ignored in Config::ignored_env_overrides() {
         tracing::warn!("{ignored}");
@@ -619,8 +618,8 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
             anyhow::bail!(
                 "managed mode is enabled but no boot path is available: \
                  cert_bundle_provided={}; \
-                 set AISIX_MANAGED__CP_CERT_PEM + _KEY_PEM + _CA_PEM \
-                 (or AISIX_MANAGED__CP_CERT_FILE + _KEY_FILE + _CA_FILE), \
+                 set CAVORA_MANAGED__CP_CERT_PEM + _KEY_PEM + _CA_PEM \
+                 (or CAVORA_MANAGED__CP_CERT_FILE + _KEY_FILE + _CA_FILE), \
                  or persist an mTLS bundle at {:?}",
                 bundle_provided,
                 cfg.managed.mtls_dir,
@@ -1238,7 +1237,7 @@ async fn run(mut cfg: Config) -> anyhow::Result<()> {
     //
     // `bedrock_endpoint_url` is the deployment-wide override for
     // kind=bedrock guardrails; empty string is normalized to
-    // `None` so a `docker run -e AISIX_BEDROCK_ENDPOINT_URL=`
+    // `None` so a `docker run -e CAVORA_BEDROCK_ENDPOINT_URL=`
     // doesn't accidentally redirect Bedrock calls into thin air.
     let bedrock_endpoint_url = cfg.bedrock_endpoint_url.clone().filter(|s| !s.is_empty());
     let guardrail_metrics_sink = proxy_state.metrics.clone();
@@ -2073,7 +2072,7 @@ fn derive_cp_etcd_url(managed: &aisix_core::ManagedConfig) -> anyhow::Result<Str
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "managed mode: cp_base_url must be set \
-                 (set AISIX_MANAGED__CP_BASE_URL)"
+                 (set CAVORA_MANAGED__CP_BASE_URL)"
             )
         })?;
     let host_port = cp_base

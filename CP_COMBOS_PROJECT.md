@@ -178,7 +178,7 @@
 ## 2c. Точный список для агента, который правит dashboard
 
 Dashboard сейчас жёстко кодирует 11 «honoured» стратегий в
-`src/shared/utils/aisixCombos.ts` (`AISIX_ETALON_STRATEGY_HONOURS`,
+`src/shared/utils/aisixCombos.ts` (`CAVORA_ETALON_STRATEGY_HONOURS`,
 строки 191–203) и объявляет остальные отключёнными. **Этот список неверен
 в сторону «слишком щедро»: 6 из 11 он считает рабочими, а gateway их
 отвергает с 400.** То есть форма сегодня предлагает шесть опций, которые
@@ -219,7 +219,7 @@ round_robin  consistent_hash  failover  least_cost  least_latency  least_busy
 priority  weighted  round-robin  fill-first  cost-optimized
 ```
 
-**Три записи в `AISIX_STRATEGY_ETALON_SPELLING` (строки 205–212) станут
+**Три записи в `CAVORA_STRATEGY_ETALON_SPELLING` (строки 205–212) станут
 именами, которые сама же форма отвергает**, и требуют отдельного решения:
 `least_latency: "headroom"`, `consistent_hash: "context-relay"`,
 `least_busy: "least-used"` — все три имени из списка удаляемых. Либо

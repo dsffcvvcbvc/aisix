@@ -7,7 +7,7 @@
 //! Loading order (spec §2):
 //! 1. Defaults
 //! 2. File contents (path from CLI `--config` or discovery list)
-//! 3. Environment-variable overrides (prefix `AISIX_`, separator `__`)
+//! 3. Environment-variable overrides (prefix `CAVORA_`, separator `__`)
 //!
 //! Example (see `config.example.yaml`):
 //!
@@ -91,13 +91,13 @@ pub struct Config {
     /// service (LocalStack, a fakecloud / WireMock sidecar in e2e),
     /// or when an outbound HTTP proxy needs to terminate the call.
     /// Empty string is treated as unset so a `docker run -e
-    /// AISIX_BEDROCK_ENDPOINT_URL=` doesn't accidentally redirect.
+    /// CAVORA_BEDROCK_ENDPOINT_URL=` doesn't accidentally redirect.
     ///
     /// Top-level on purpose — overriding the Bedrock endpoint is a
     /// deployment concern, not a per-guardrail-row configuration that
     /// a tenant should be able to set. The matching env var
-    /// `AISIX_BEDROCK_ENDPOINT_URL` is what gets picked up by
-    /// config-rs via the `AISIX_` prefix.
+    /// `CAVORA_BEDROCK_ENDPOINT_URL` is what gets picked up by
+    /// config-rs via the `CAVORA_` prefix.
     #[serde(default)]
     pub bedrock_endpoint_url: Option<String>,
 }
@@ -392,7 +392,7 @@ impl ManagedConfig {
 /// Environment variable that sets `managed.cp_base_url`. Named in the
 /// rejection so an operator who set it through the environment (the
 /// only way a container deployment can) is told which variable to fix.
-const CP_BASE_URL_ENV: &str = "AISIX_MANAGED__CP_BASE_URL";
+const CP_BASE_URL_ENV: &str = "CAVORA_MANAGED__CP_BASE_URL";
 
 /// Give `managed.cp_base_url` a scheme once, at load, so every
 /// consumer agrees on it.
@@ -490,7 +490,7 @@ fn normalise_cp_base_url(raw: &str) -> Result<String, BootstrapError> {
 }
 
 /// Environment variable that sets `managed.cp_etcd_endpoint`.
-const CP_ETCD_ENDPOINT_ENV: &str = "AISIX_MANAGED__CP_ETCD_ENDPOINT";
+const CP_ETCD_ENDPOINT_ENV: &str = "CAVORA_MANAGED__CP_ETCD_ENDPOINT";
 
 /// Reduce `managed.cp_etcd_endpoint` to the bare `host[:port]` that
 /// `derive_cp_etcd_url` expects.
@@ -699,7 +699,7 @@ impl EtcdConfig {
 pub struct ProxyConfig {
     /// The single proxy listener's address — the shorthand form, and the
     /// only one until `listeners` was added. Required either way: the
-    /// shipped chart injects `AISIX_PROXY__ADDR` unconditionally, so a
+    /// shipped chart injects `CAVORA_PROXY__ADDR` unconditionally, so a
     /// deployment that lists its listeners explicitly still carries it.
     /// It is then ignored, and nothing binds it.
     pub addr: String,
@@ -730,9 +730,9 @@ pub struct ProxyConfig {
     /// listener.
     ///
     /// Env-only deployments (the chart injects config purely through
-    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// `CAVORA_*` vars, which cannot express a structured list) set the
     /// whole set as one JSON array:
-    /// `AISIX_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]'`.
+    /// `CAVORA_PROXY__LISTENERS='[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]'`.
     #[serde(default, deserialize_with = "deserialize_proxy_listeners")]
     pub listeners: Vec<ProxyListener>,
     /// Real-client-IP resolution from forwarded headers (#492). Default
@@ -785,9 +785,9 @@ pub struct ProxyConfig {
     /// `/mcp/{server}`. Empty (the default) = no rewriting.
     ///
     /// Env-only deployments (the chart injects config purely through
-    /// `AISIX_*` vars, which cannot express a structured list) set the
+    /// `CAVORA_*` vars, which cannot express a structured list) set the
     /// whole list as one JSON array:
-    /// `AISIX_PROXY__URL_REWRITES='[{"match":"^/x$","rewrite":"/y"}]'`.
+    /// `CAVORA_PROXY__URL_REWRITES='[{"match":"^/x$","rewrite":"/y"}]'`.
     #[serde(default, deserialize_with = "deserialize_url_rewrites")]
     pub url_rewrites: Vec<UrlRewriteRule>,
 }
@@ -1239,7 +1239,7 @@ impl ObservabilityConfig {
     }
 
     fn default_service_name() -> String {
-        "aisix".into()
+        "cavora".into()
     }
     fn default_log_level() -> String {
         "info".into()
@@ -1272,7 +1272,7 @@ pub struct MetricsConfig {
     /// wins); compiled + validated at boot (fail-fast), never hot-reloaded.
     ///
     /// Env-only deployments set the whole list as one JSON array:
-    /// `AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-bill/","client":"billing"}]'`.
+    /// `CAVORA_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES='[{"pattern":"^py-bill/","client":"billing"}]'`.
     #[serde(default, deserialize_with = "deserialize_client_type_rules")]
     pub client_type_rules: Vec<ClientTypeRule>,
     /// Operator overrides for the histogram bucket edges
@@ -1479,7 +1479,7 @@ pub enum RedisMode {
 /// and master credentials may differ.
 ///
 /// To keep secrets out of the config file, supply `password` via the
-/// matching env var instead, e.g. `AISIX_RATELIMIT__REDIS__PASSWORD`.
+/// matching env var instead, e.g. `CAVORA_RATELIMIT__REDIS__PASSWORD`.
 /// That is the shape the precedence rule exists for: a value injected
 /// through the environment is no use if a stale credential left in `url`
 /// quietly outranks it.
@@ -1903,7 +1903,7 @@ impl Default for ShutdownConfig {
 }
 
 /// Every top-level setting of [`Config`], spelled as the environment
-/// source sees it — `AISIX_` stripped and lowercased.
+/// source sees it — `CAVORA_` stripped and lowercased.
 ///
 /// A variable outside this set, and without the `__` that marks a nested
 /// key, is not a setting at all and is dropped by [`EnvOverrides`] rather
@@ -1925,12 +1925,12 @@ const TOP_LEVEL_ENV_KEYS: [&str; 12] = [
     "upstream",
 ];
 
-/// `AISIX_*` variables the gateway reads by name somewhere other than the
+/// `CAVORA_*` variables the gateway reads by name somewhere other than the
 /// configuration loader. They are deliberate, so they are dropped without
 /// a warning.
 ///
 /// Spelled as the environment source sees them, as in
-/// [`TOP_LEVEL_ENV_KEYS`]: `AISIX_CONFIG` → `config`.
+/// [`TOP_LEVEL_ENV_KEYS`]: `CAVORA_CONFIG` → `config`.
 const NON_CONFIG_ENV_KEYS: [&str; 3] = [
     // `--config`'s env fallback (clap, `aisix-server`).
     "config",
@@ -1940,7 +1940,7 @@ const NON_CONFIG_ENV_KEYS: [&str; 3] = [
     "dp_budget_stale_max_seconds",
 ];
 
-/// The `AISIX_*` variables the configuration loader consumes, split from
+/// The `CAVORA_*` variables the configuration loader consumes, split from
 /// the ones it must leave alone.
 struct EnvOverrides {
     /// Handed to the `Environment` source in place of the real
@@ -1961,7 +1961,7 @@ impl EnvOverrides {
         // config-rs lowercases before it matches the prefix, so the
         // environment's own casing never decides whether a variable is an
         // override. Match it.
-        const PREFIX: &str = "aisix_";
+        const PREFIX: &str = "cavora_";
         let mut source = HashMap::new();
         let mut warnings = Vec::new();
 
@@ -1977,17 +1977,17 @@ impl EnvOverrides {
             // Judged on the FIRST segment, not on whether the key is
             // nested at all. A key whose head names a real section was
             // meant as a setting, so it keeps reaching the deserializer
-            // typo and all (`AISIX_PROXY__BOGUS` still fails the boot);
+            // typo and all (`CAVORA_PROXY__BOGUS` still fails the boot);
             // a key whose head names nothing cannot be one however deeply
             // it is spelled. Nesting is `__`, but config-rs also treats a
             // literal `.` as a path separator, so both split the head.
             //
             // Service names may contain consecutive hyphens, and kubelet
-            // folds each to `_` — so `aisix-oss--x` injects
-            // `AISIX_OSS__X_SERVICE_HOST`, which reads as nested and is
+            // folds each to `_` — so `cavora-oss--x` injects
+            // `CAVORA_OSS__X_SERVICE_HOST`, which reads as nested and is
             // exactly what a contains-`__` test would wave through into a
             // failed boot. The residue is a Service named for a section
-            // (`aisix-proxy--x`), which is indistinguishable from an
+            // (`cavora-proxy--x`), which is indistinguishable from an
             // operator's typo and is treated as one.
             let head = key
                 .split("__")
@@ -2009,7 +2009,7 @@ impl EnvOverrides {
             warnings.push(format!(
                 "{name} was not applied as a configuration override: it names no \
                  gateway setting, and a nested setting is spelled \
-                 AISIX_<SECTION>__<KEY>. If the configuration reads it by name \
+                 CAVORA_<SECTION>__<KEY>. If the configuration reads it by name \
                  (etcd.password_env, a resources-file interpolation) it still \
                  applies; otherwise nothing reads it — Kubernetes injects \
                  variables of this shape for every Service named aisix or \
@@ -2023,7 +2023,7 @@ impl EnvOverrides {
 }
 
 impl Config {
-    /// Warnings about `AISIX_*` environment variables that name no
+    /// Warnings about `CAVORA_*` environment variables that name no
     /// setting and were left out of the load.
     ///
     /// Returned rather than logged because the configuration is read
@@ -2036,12 +2036,12 @@ impl Config {
     /// Load + merge + validate.
     ///
     /// - If `path` is Some, the file is loaded (format inferred from extension).
-    /// - Env vars prefixed `AISIX_` override anything in the file:
-    ///   `AISIX_<SECTION>__<KEY>` for a nested setting, `AISIX_<KEY>` for a
+    /// - Env vars prefixed `CAVORA_` override anything in the file:
+    ///   `CAVORA_<SECTION>__<KEY>` for a nested setting, `CAVORA_<KEY>` for a
     ///   top-level one. A variable matching neither is not a setting — it is
     ///   ignored and reported by [`Config::ignored_env_overrides`], because
     ///   an environment the gateway does not control injects them (a
-    ///   Kubernetes Service named `aisix-*` contributes seven per pod) and
+    ///   Kubernetes Service named `cavora-*` contributes seven per pod) and
     ///   the root struct rejects unknown fields.
     /// - Basic invariants are checked (non-empty etcd endpoints, at least one
     ///   admin key, bind addresses parse).
@@ -2057,16 +2057,16 @@ impl Config {
 
         // config-rs default: when `separator` is set, the prefix
         // separator inherits from it — so `separator("__")` alone
-        // would demand `AISIX__FOO__BAR` env vars. That's at odds
+        // would demand `CAVORA__FOO__BAR` env vars. That's at odds
         // with every other aisix.cloud service (and the existing
         // docs / Dockerfile / e2e harness), which all use
-        // `AISIX_FOO__BAR` (single underscore between prefix and
+        // `CAVORA_FOO__BAR` (single underscore between prefix and
         // first key segment, double underscore for nested keys).
         // Pin prefix_separator explicitly so the two shapes are
-        // distinct: `AISIX_` strips the prefix, `__` splits keys.
+        // distinct: `CAVORA_` strips the prefix, `__` splits keys.
         let overrides = EnvOverrides::from_env();
         builder = builder.add_source(
-            Environment::with_prefix("AISIX")
+            Environment::with_prefix("CAVORA")
                 .prefix_separator("_")
                 .separator("__")
                 // Only the variables `EnvOverrides` kept. Handing the
@@ -2083,7 +2083,7 @@ impl Config {
                 // actually sequences.
                 //
                 // EVERY sequence field belongs on this list: the deployed
-                // chart injects gateway config purely through AISIX_* env
+                // chart injects gateway config purely through CAVORA_* env
                 // vars, so an unregistered key is not merely awkward from
                 // the environment — it fails to deserialize, leaving the
                 // field unreachable in Kubernetes.
@@ -2376,24 +2376,24 @@ mod tests {
     }
 
     /// The seven variables Kubernetes injects into every pod for a Service
-    /// named `aisix-oss` exposing port 9090 — the shape that made a
+    /// named `cavora-oss` exposing port 9090 — the shape that made a
     /// gateway exit at boot instead of starting.
     const SERVICE_LINK_ENV: [(&str, &str); 7] = [
-        ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
-        ("AISIX_OSS_SERVICE_PORT", "9090"),
-        ("AISIX_OSS_PORT", "tcp://10.96.0.12:9090"),
-        ("AISIX_OSS_PORT_9090_TCP", "tcp://10.96.0.12:9090"),
-        ("AISIX_OSS_PORT_9090_TCP_PROTO", "tcp"),
-        ("AISIX_OSS_PORT_9090_TCP_PORT", "9090"),
-        ("AISIX_OSS_PORT_9090_TCP_ADDR", "10.96.0.12"),
+        ("CAVORA_OSS_SERVICE_HOST", "10.96.0.12"),
+        ("CAVORA_OSS_SERVICE_PORT", "9090"),
+        ("CAVORA_OSS_PORT", "tcp://10.96.0.12:9090"),
+        ("CAVORA_OSS_PORT_9090_TCP", "tcp://10.96.0.12:9090"),
+        ("CAVORA_OSS_PORT_9090_TCP_PROTO", "tcp"),
+        ("CAVORA_OSS_PORT_9090_TCP_PORT", "9090"),
+        ("CAVORA_OSS_PORT_9090_TCP_ADDR", "10.96.0.12"),
     ];
 
     /// A Service name may carry consecutive hyphens, and kubelet folds
-    /// each one to `_` — so `aisix-oss--x` injects variables that read as
+    /// each one to `_` — so `cavora-oss--x` injects variables that read as
     /// nested keys. They are still not settings.
     const HYPHENATED_SERVICE_LINK_ENV: [(&str, &str); 2] = [
-        ("AISIX_OSS__X_SERVICE_HOST", "10.96.0.13"),
-        ("AISIX_OSS__X_PORT_9090_TCP_PROTO", "tcp"),
+        ("CAVORA_OSS__X_SERVICE_HOST", "10.96.0.13"),
+        ("CAVORA_OSS__X_PORT_9090_TCP_PROTO", "tcp"),
     ];
 
     const ENV_TEST_CONFIG: &str = r#"
@@ -2407,7 +2407,7 @@ admin:
 "#;
 
     /// Re-run this test's body in a child process carrying `vars` as the
-    /// only `AISIX_*` variables in its environment; returns `false` in the
+    /// only `CAVORA_*` variables in its environment; returns `false` in the
     /// parent, `true` once running as the child.
     ///
     /// Env-backed loading cannot be isolated any other way: the loader
@@ -2420,7 +2420,7 @@ admin:
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         child.arg(test).arg("--test-threads=1").env(marker, "1");
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().starts_with("AISIX_") {
+            if key.to_string_lossy().starts_with("CAVORA_") {
                 child.env_remove(key);
             }
         }
@@ -2445,9 +2445,9 @@ admin:
     fn service_link_env_vars_are_ignored_instead_of_aborting_startup() {
         // Kubernetes injects a variable per Service per port into every
         // pod in the namespace, and a Service whose name starts with
-        // `aisix` produces `AISIX_*` names. None of them is a setting, and
+        // `cavora` produces `CAVORA_*` names. None of them is a setting, and
         // the root struct rejects unknown fields — so before this filter
-        // existed, deploying the gateway beside an `aisix-oss` Service
+        // existed, deploying the gateway beside an `cavora-oss` Service
         // made it exit at boot with `unknown field`.
         let injected: Vec<(&str, &str)> = SERVICE_LINK_ENV
             .iter()
@@ -2488,7 +2488,7 @@ admin:
         if !in_child_with_env(
             "a_nested_unknown_env_var_still_aborts_startup",
             "TEST_ENV_NESTED_UNKNOWN_CHILD",
-            &[("AISIX_PROXY__BOGUS", "1")],
+            &[("CAVORA_PROXY__BOGUS", "1")],
         ) {
             return;
         }
@@ -2507,12 +2507,12 @@ admin:
         // These three are read by name elsewhere — clap's `--config`
         // fallback, the container entrypoint, the budget client — so they
         // are set deliberately and a warning about them would be noise.
-        // `AISIX_CONFIG` is the one that used to stop `aisix` from
+        // `CAVORA_CONFIG` is the one that used to stop `aisix` from
         // starting from its own documented environment variable at all.
         const OWN: [(&str, &str); 3] = [
-            ("AISIX_CONFIG", "/etc/aisix/config.yaml"),
-            ("AISIX_CONFIG_PATH", "/etc/aisix/config.managed.yaml"),
-            ("AISIX_DP_BUDGET_STALE_MAX_SECONDS", "30"),
+            ("CAVORA_CONFIG", "/etc/aisix/config.yaml"),
+            ("CAVORA_CONFIG_PATH", "/etc/aisix/config.managed.yaml"),
+            ("CAVORA_DP_BUDGET_STALE_MAX_SECONDS", "30"),
         ];
         if !in_child_with_env(
             "the_gateways_own_non_config_env_vars_load_silently",
@@ -2533,7 +2533,7 @@ admin:
 
     #[test]
     fn a_flat_top_level_env_var_still_overrides_the_file() {
-        // The two scalar top-level settings have no `AISIX_<SECTION>__<KEY>`
+        // The two scalar top-level settings have no `CAVORA_<SECTION>__<KEY>`
         // spelling, so the filter is the only thing standing between them
         // and the deserializer. Nothing else in the suite drives one
         // through `load_from_path`: the guards above stop at the partition,
@@ -2542,7 +2542,7 @@ admin:
         if !in_child_with_env(
             "a_flat_top_level_env_var_still_overrides_the_file",
             "TEST_ENV_FLAT_TOP_LEVEL_CHILD",
-            &[("AISIX_BEDROCK_ENDPOINT_URL", "http://localstack:4566")],
+            &[("CAVORA_BEDROCK_ENDPOINT_URL", "http://localstack:4566")],
         ) {
             return;
         }
@@ -2565,7 +2565,7 @@ admin:
         if !in_child_with_env(
             "a_dot_spelled_nested_env_var_still_overrides_the_file",
             "TEST_ENV_DOT_SPELLED_CHILD",
-            &[("AISIX_ETCD.ENDPOINTS", "http://dotted:2379")],
+            &[("CAVORA_ETCD.ENDPOINTS", "http://dotted:2379")],
         ) {
             return;
         }
@@ -2592,7 +2592,7 @@ admin:
 
     #[test]
     fn config_top_level_keys_match_the_struct() {
-        // TOP_LEVEL_ENV_KEYS decides which flat `AISIX_<KEY>` variables
+        // TOP_LEVEL_ENV_KEYS decides which flat `CAVORA_<KEY>` variables
         // reach the deserializer. Left to drift, a newly added setting
         // would be unreachable from the environment — silently, and only
         // in the env-only deployments (the chart) that have no other way
@@ -2628,24 +2628,24 @@ admin:
     #[test]
     fn env_partition_matches_on_lowercased_names() {
         // config-rs lowercases a variable's name before matching the
-        // prefix, so `aisix_proxy__addr` is an override to it. A filter
+        // prefix, so `cavora_proxy__addr` is an override to it. A filter
         // that recognised only the upper-case spelling would drop an
         // override that works and warn about it.
         let overrides = EnvOverrides::partition(
             [
-                ("aisix_proxy__addr", "127.0.0.1:1"),
-                ("Aisix_Bedrock_Endpoint_Url", "http://localhost:4566"),
+                ("cavora_proxy__addr", "127.0.0.1:1"),
+                ("Cavora_Bedrock_Endpoint_Url", "http://localhost:4566"),
                 ("PATH", "/usr/bin"),
-                ("AISIX_OSS_SERVICE_HOST", "10.96.0.12"),
+                ("CAVORA_OSS_SERVICE_HOST", "10.96.0.12"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string())),
         );
         let mut kept: Vec<&str> = overrides.source.keys().map(String::as_str).collect();
         kept.sort_unstable();
-        assert_eq!(kept, ["Aisix_Bedrock_Endpoint_Url", "aisix_proxy__addr"]);
+        assert_eq!(kept, ["Cavora_Bedrock_Endpoint_Url", "cavora_proxy__addr"]);
         assert_eq!(overrides.warnings.len(), 1);
-        assert!(overrides.warnings[0].starts_with("AISIX_OSS_SERVICE_HOST "));
+        assert!(overrides.warnings[0].starts_with("CAVORA_OSS_SERVICE_HOST "));
     }
 
     #[test]
@@ -3120,7 +3120,7 @@ managed:
                 Err(e) => e.to_string(),
             };
             assert!(
-                err.contains("AISIX_MANAGED__CP_BASE_URL"),
+                err.contains("CAVORA_MANAGED__CP_BASE_URL"),
                 "rejection for {value:?} must name the variable to fix, got: {err}"
             );
             assert!(
@@ -3176,7 +3176,7 @@ managed:
             Err(e) => e.to_string(),
         };
         assert!(
-            err.contains("AISIX_MANAGED__CP_BASE_URL"),
+            err.contains("CAVORA_MANAGED__CP_BASE_URL"),
             "the rejection must name the variable to fix, got: {err}"
         );
         assert!(
@@ -3244,7 +3244,7 @@ managed:
             Err(e) => e.to_string(),
         };
         assert!(
-            err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+            err.contains("CAVORA_MANAGED__CP_ETCD_ENDPOINT"),
             "the rejection must name the variable to fix, got: {err}"
         );
         assert!(
@@ -3303,7 +3303,7 @@ managed:
                 Err(e) => e.to_string(),
             };
             assert!(
-                err.contains("AISIX_MANAGED__CP_ETCD_ENDPOINT"),
+                err.contains("CAVORA_MANAGED__CP_ETCD_ENDPOINT"),
                 "rejection for {value:?} must name the variable to fix, got: {err}"
             );
             assert!(
@@ -3580,7 +3580,7 @@ observability:
 
     #[test]
     fn url_rewrites_accepts_a_json_string_for_env_only_deployments() {
-        // Chart-driven deployments inject config purely through AISIX_* env
+        // Chart-driven deployments inject config purely through CAVORA_* env
         // vars, which cannot express a structured list — the whole list
         // rides in one JSON string. A YAML string scalar takes the same
         // code path as the env source.
@@ -3624,7 +3624,7 @@ admin:
     #[test]
     fn env_only_deployments_can_set_every_sequence_field() {
         // The chart and the dashboard's `docker run` snippet configure the
-        // gateway purely through AISIX_* env vars, so a sequence field that
+        // gateway purely through CAVORA_* env vars, so a sequence field that
         // the env source cannot express is unreachable in those deployments
         // — it does not fall back to a default, the whole load fails.
         //
@@ -3634,32 +3634,32 @@ admin:
         // nowhere and shipped unreachable behind exactly that gap.
         const CHILD_MARKER: &str = "TEST_ENV_SEQUENCE_FIELDS_CHILD";
         const ENV: [(&str, &str); 10] = [
-            ("AISIX_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
-            ("AISIX_ADMIN__ADMIN_KEYS", "k1,k2"),
-            ("AISIX_PROXY__ADDR", "0.0.0.0:3000"),
-            ("AISIX_ADMIN__ADDR", "127.0.0.1:3001"),
+            ("CAVORA_ETCD__ENDPOINTS", "http://127.0.0.1:2379"),
+            ("CAVORA_ADMIN__ADMIN_KEYS", "k1,k2"),
+            ("CAVORA_PROXY__ADDR", "0.0.0.0:3000"),
+            ("CAVORA_ADMIN__ADDR", "127.0.0.1:3001"),
             (
-                "AISIX_PROXY__REAL_IP__TRUSTED_PROXIES",
+                "CAVORA_PROXY__REAL_IP__TRUSTED_PROXIES",
                 "10.0.0.0/8,127.0.0.1/32",
             ),
             (
-                "AISIX_PROXY__REQUEST_ID__ACCEPT_HEADERS",
+                "CAVORA_PROXY__REQUEST_ID__ACCEPT_HEADERS",
                 "x-aisix-request-id,x-request-id",
             ),
             (
-                "AISIX_PROXY__URL_REWRITES",
+                "CAVORA_PROXY__URL_REWRITES",
                 r#"[{"name":"c","hosts":["gw.example.com"],"match":"^/a$","rewrite":"/b"}]"#,
             ),
             (
-                "AISIX_PROXY__LISTENERS",
+                "CAVORA_PROXY__LISTENERS",
                 r#"[{"addr":"0.0.0.0:3443","tls":{"cert_file":"/c.pem","key_file":"/k.pem"}},{"addr":"0.0.0.0:3000"}]"#,
             ),
             (
-                "AISIX_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
+                "CAVORA_OBSERVABILITY__METRICS__CLIENT_TYPE_RULES",
                 r#"[{"pattern":"^py-bill/","client":"billing"}]"#,
             ),
             (
-                "AISIX_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT",
+                "CAVORA_OBSERVABILITY__METRICS__BUCKETS__REQUEST_TTFT",
                 "0.1,0.5,1",
             ),
         ];
@@ -3673,7 +3673,7 @@ admin:
                 .arg("--test-threads=1")
                 .env(CHILD_MARKER, "1");
             for (key, _) in std::env::vars_os() {
-                if key.to_string_lossy().starts_with("AISIX_") {
+                if key.to_string_lossy().starts_with("CAVORA_") {
                     child.env_remove(key);
                 }
             }
@@ -4538,11 +4538,11 @@ observability:
     fn managed_container_examples_use_supported_bootstrap_env() {
         const CHILD_MARKER: &str = "TEST_MANAGED_CONFIG_ENV_CHILD";
         const MANAGED_ENV_VARS: [&str; 5] = [
-            "AISIX_MANAGED__CP_BASE_URL",
-            "AISIX_MANAGED__CP_ETCD_ENDPOINT",
-            "AISIX_MANAGED__CP_CERT_PEM",
-            "AISIX_MANAGED__CP_KEY_PEM",
-            "AISIX_MANAGED__CP_CA_PEM",
+            "CAVORA_MANAGED__CP_BASE_URL",
+            "CAVORA_MANAGED__CP_ETCD_ENDPOINT",
+            "CAVORA_MANAGED__CP_CERT_PEM",
+            "CAVORA_MANAGED__CP_KEY_PEM",
+            "CAVORA_MANAGED__CP_CA_PEM",
         ];
 
         if std::env::var_os(CHILD_MARKER).is_none() {
@@ -4556,7 +4556,7 @@ observability:
                     );
                 }
                 assert!(
-                    !example.contains("AISIX_MANAGED__REGISTRATION_TOKEN"),
+                    !example.contains("CAVORA_MANAGED__REGISTRATION_TOKEN"),
                     "{relative} must not document the removed registration-token bootstrap",
                 );
             }
@@ -4569,7 +4569,7 @@ observability:
                 .arg("--test-threads=1")
                 .env(CHILD_MARKER, "1");
             for (key, _) in std::env::vars_os() {
-                if key.to_string_lossy().starts_with("AISIX_") {
+                if key.to_string_lossy().starts_with("CAVORA_") {
                     child.env_remove(key);
                 }
             }
@@ -4620,7 +4620,7 @@ observability:
         assert_eq!(cfg.observability.metrics.prometheus.addr, "0.0.0.0:9090");
     }
 
-    /// The block the issue reports as missing. `AISIX_UPSTREAM_SSL_VERIFY`
+    /// The block the issue reports as missing. `CAVORA_UPSTREAM_SSL_VERIFY`
     /// used to be rejected at boot with "unknown field", and the error
     /// listed every section *except* a place to put a CA.
     #[test]

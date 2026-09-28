@@ -48,7 +48,7 @@ describe("URL rewrite precedes every route and respects host scope", () => {
     llm = await startOpenAiUpstream();
     app = await spawnApp({
       extraEnv: {
-        AISIX_PROXY__URL_REWRITES: JSON.stringify([
+        CAVORA_PROXY__URL_REWRITES: JSON.stringify([
           { hosts: ["gw.example.com"], match: "^/(?:pjt/)?chat$", rewrite: "/v1/chat/completions" },
           { hosts: ["*.tenant.example.com"], match: "^/chat$", rewrite: "/rewritten/chat" },
           { match: "^/legacy/(.*)$", rewrite: "/rewritten/$1" },

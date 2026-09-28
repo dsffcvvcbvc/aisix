@@ -45,7 +45,7 @@ describe("metric label configuration is applied to real request observations", (
     reachable = await etcd.ping();
     if (!reachable) return;
     app = await spawnApp({ extraEnv: {
-      AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
+      CAVORA_OBSERVABILITY__METRICS__LABELS: JSON.stringify({
         [TTFT]: ["provider_key_name", "upstream_model", "api_key_id"],
         [E2E]: ["endpoint", "provider_key_name"],
         aisix_proxy_requests_total: ["endpoint"],
@@ -86,7 +86,7 @@ describe("metric label configuration is applied to real request observations", (
   test("unsupported label configuration fails startup", async (ctx) => {
     if (!reachable) return ctx.skip();
     await expect(spawnApp({ extraEnv: {
-      AISIX_OBSERVABILITY__METRICS__LABELS: JSON.stringify({ [TTFT]: ["request_id"] }),
+      CAVORA_OBSERVABILITY__METRICS__LABELS: JSON.stringify({ [TTFT]: ["request_id"] }),
     } })).rejects.toThrow(/unsupported variable.*request_id/);
   });
 

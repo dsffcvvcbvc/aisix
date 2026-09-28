@@ -20,9 +20,9 @@
 # unconfigured.
 #
 # Required repository secrets (identifiers, not static keys):
-#   AISIX_E2E_OIDC_AWS_ROLE_ARN   IAM role to assume (trusts repo:api7/aisix via GitHub OIDC)
-#   AISIX_E2E_OBJSTORE_S3_BUCKET  the S3 test bucket (reused from the credential_ref job)
-#   AISIX_E2E_OBJSTORE_S3_REGION  the bucket's region (configure-aws-credentials requires it)
+#   CAVORA_E2E_OIDC_AWS_ROLE_ARN   IAM role to assume (trusts repo:api7/aisix via GitHub OIDC)
+#   CAVORA_E2E_OBJSTORE_S3_BUCKET  the S3 test bucket (reused from the credential_ref job)
+#   CAVORA_E2E_OBJSTORE_S3_REGION  the bucket's region (configure-aws-credentials requires it)
 name: objstore-cloud-identity
 
 on:
@@ -53,8 +53,8 @@ jobs:
        contains(github.event.pull_request.labels.*.name, 'objstore real cloud'))
     runs-on: ubuntu-latest
     env:
-      AWS_ROLE_ARN: ${{ secrets.AISIX_E2E_OIDC_AWS_ROLE_ARN }}
-      AWS_REGION_CFG: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
+      AWS_ROLE_ARN: ${{ secrets.CAVORA_E2E_OIDC_AWS_ROLE_ARN }}
+      AWS_REGION_CFG: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_REGION }}
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -66,7 +66,7 @@ jobs:
           if [ -n "$AWS_ROLE_ARN" ] && [ -n "$AWS_REGION_CFG" ]; then
             echo "AWS OIDC: configured (role + region)"
           elif [ -n "$AWS_ROLE_ARN" ]; then
-            echo "::warning::AWS_ROLE_ARN set but AISIX_E2E_OBJSTORE_S3_REGION is empty — S3 keyless self-skips"
+            echo "::warning::AWS_ROLE_ARN set but CAVORA_E2E_OBJSTORE_S3_REGION is empty — S3 keyless self-skips"
           else
             echo "::warning::AWS OIDC role absent — S3 keyless self-skips"
           fi
@@ -86,8 +86,8 @@ jobs:
         env:
           # Set the bucket only when the OIDC role + region are BOTH present, so
           # the smoke self-skips rather than running with no ambient credentials.
-          AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET: ${{ (secrets.AISIX_E2E_OIDC_AWS_ROLE_ARN != '' && secrets.AISIX_E2E_OBJSTORE_S3_REGION != '') && secrets.AISIX_E2E_OBJSTORE_S3_BUCKET || '' }}
-          AISIX_E2E_OBJSTORE_CLOUDID_S3_REGION: ${{ secrets.AISIX_E2E_OBJSTORE_S3_REGION }}
+          CAVORA_E2E_OBJSTORE_CLOUDID_S3_BUCKET: ${{ (secrets.CAVORA_E2E_OIDC_AWS_ROLE_ARN != '' && secrets.CAVORA_E2E_OBJSTORE_S3_REGION != '') && secrets.CAVORA_E2E_OBJSTORE_S3_BUCKET || '' }}
+          CAVORA_E2E_OBJSTORE_CLOUDID_S3_REGION: ${{ secrets.CAVORA_E2E_OBJSTORE_S3_REGION }}
           # GCS keyless self-skips on a non-GCE runner (no metadata server) — see
           # the scope note above and #573. The test stays in the cargo filter so
           # it runs (and greens) when executed on a real GKE/GCE runner.

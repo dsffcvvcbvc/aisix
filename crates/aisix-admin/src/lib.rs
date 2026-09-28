@@ -41,7 +41,7 @@
 //! `POST /admin/v1/resources` validates a declarative payload via
 //! `aisix_core::filesource::load_from_str`, commits it with an RCU
 //! update, and persists it to the configured `resources_file`
-//! (`AISIX_RESOURCES_PATH` / `resources.yaml` fallback). Other resource
+//! (`CAVORA_RESOURCES_PATH` / `resources.yaml` fallback). Other resource
 //! writes (PUT/DELETE, api-key rotate) remain unavailable: use the
 //! declarative file (reloaded on SIGHUP) or direct etcd writes. The
 //! storage layer stays pluggable via the [`ConfigStore`] trait;

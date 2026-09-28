@@ -79,7 +79,7 @@ export interface AppOverrides {
   requestBodyLimitBytes?: number;
   /**
    * Extra environment variables for the spawned binary, applied AFTER the
-   * `AISIX_*` strip. Use for non-config secrets the DP reads from its own
+   * `CAVORA_*` strip. Use for non-config secrets the DP reads from its own
    * environment rather than from the kine config — e.g.
    * `SLS_CRED_<REF>_AK_ID` / `_AK_SECRET` for an `aliyun_sls` exporter, whose
    * AccessKey deliberately never travels on the config path.
@@ -87,7 +87,7 @@ export interface AppOverrides {
   extraEnv?: Record<string, string>;
   /**
    * Start the binary with NO `--config` argument, handing it the generated
-   * config's path through `AISIX_CONFIG` instead — the clap env fallback a
+   * config's path through `CAVORA_CONFIG` instead — the clap env fallback a
    * `command:`-less container image relies on. Off by default: every other
    * spec should exercise the argument, which is what the entrypoint passes.
    */
@@ -236,7 +236,7 @@ export interface SpawnedApp {
 }
 
 const BIN_PATH =
-  process.env.AISIX_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "aisix");
+  process.env.CAVORA_BIN ?? join(process.cwd(), "..", "..", "target", "debug", "cavora");
 const READY_TIMEOUT_MS = 10_000;
 const SHUTDOWN_GRACE_MS = 3_000;
 
@@ -304,7 +304,7 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   if (!fileMode && !(await etcd.ping())) {
     throw new Error(
       `etcd not reachable at ${etcdEndpoint()} ` +
-        "(set AISIX_E2E_ETCD_ENDPOINTS — which takes precedence — or AISIX_E2E_ETCD, " +
+        "(set CAVORA_E2E_ETCD_ENDPOINTS — which takes precedence — or CAVORA_E2E_ETCD, " +
           "or run `docker run --rm -p 2379:2379 quay.io/coreos/etcd:v3.5.15`)",
     );
   }
@@ -446,11 +446,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   const cfgPath = join(dir, "config.yaml");
   await writeFile(cfgPath, yamlStringify(cfg), "utf8");
 
-  // Strip AISIX_* env vars so they don't leak into the binary's
-  // config loader (which treats AISIX_<KEY> as config overrides).
+  // Strip CAVORA_* env vars so they don't leak into the binary's
+  // config loader (which treats CAVORA_<KEY> as config overrides).
   const childEnv: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined && !k.startsWith("AISIX_")) childEnv[k] = v;
+    if (v !== undefined && !k.startsWith("CAVORA_")) childEnv[k] = v;
   }
   childEnv.RUST_LOG = overrides.logLevel ?? process.env.RUST_LOG ?? "warn";
   childEnv.HTTP_PROXY = "";
@@ -463,11 +463,11 @@ async function spawnAppOnce(overrides: AppOverrides = {}): Promise<SpawnedApp> {
   childEnv.no_proxy = "127.0.0.1,localhost";
 
   // Non-config secrets the DP reads straight from its environment (e.g.
-  // SLS AccessKeys). Applied last so they survive the AISIX_* strip above.
+  // SLS AccessKeys). Applied last so they survive the CAVORA_* strip above.
   for (const [k, v] of Object.entries(overrides.extraEnv ?? {})) {
     childEnv[k] = v;
   }
-  if (overrides.configViaEnv) childEnv.AISIX_CONFIG = cfgPath;
+  if (overrides.configViaEnv) childEnv.CAVORA_CONFIG = cfgPath;
 
   const args = overrides.configViaEnv ? [] : ["--config", cfgPath];
   const child = spawn(BIN_PATH, args, {

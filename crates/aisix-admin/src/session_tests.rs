@@ -146,7 +146,7 @@ async fn the_cookie_carries_the_documented_attributes() {
         .collect();
     let value = parts.remove(0);
     assert!(
-        value.starts_with("aisix_admin_session="),
+        value.starts_with("cavora_admin_session="),
         "cookie name: {value}"
     );
     // 32 random bytes, hex-encoded.
@@ -665,7 +665,7 @@ fn session_token_from_cookies_reads_only_our_cookie() {
 
     headers.insert(
         header::COOKIE,
-        HeaderValue::from_static("_ga=GA1; aisix_admin_session=tok; theme=dark"),
+        HeaderValue::from_static("_ga=GA1; cavora_admin_session=tok; theme=dark"),
     );
     assert_eq!(session_token_from_cookies(&headers).as_deref(), Some("tok"));
 
@@ -673,7 +673,7 @@ fn session_token_from_cookies_reads_only_our_cookie() {
     let mut prefixed = HeaderMap::new();
     prefixed.insert(
         header::COOKIE,
-        HeaderValue::from_static("aisix_admin_session_x=nope"),
+        HeaderValue::from_static("cavora_admin_session_x=nope"),
     );
     assert!(session_token_from_cookies(&prefixed).is_none());
 
@@ -681,7 +681,7 @@ fn session_token_from_cookies_reads_only_our_cookie() {
     let mut empty = HeaderMap::new();
     empty.insert(
         header::COOKIE,
-        HeaderValue::from_static("aisix_admin_session="),
+        HeaderValue::from_static("cavora_admin_session="),
     );
     assert!(session_token_from_cookies(&empty).is_none());
 
@@ -690,7 +690,7 @@ fn session_token_from_cookies_reads_only_our_cookie() {
     split.append(header::COOKIE, HeaderValue::from_static("a=1"));
     split.append(
         header::COOKIE,
-        HeaderValue::from_static("aisix_admin_session=second"),
+        HeaderValue::from_static("cavora_admin_session=second"),
     );
     assert_eq!(
         session_token_from_cookies(&split).as_deref(),

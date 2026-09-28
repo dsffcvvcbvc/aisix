@@ -384,7 +384,7 @@ fn is_loopback_site(site: &str) -> bool {
 /// The API key never travels on the kine path (the control plane stores only
 /// the reference), so the DP looks it up where it actually runs. The reference
 /// is upper-cased with non-alphanumerics folded to `_`, then read from
-/// `DD_CRED_<REF>_API_KEY`. The prefix is deliberately NOT `AISIX_`: that
+/// `DD_CRED_<REF>_API_KEY`. The prefix is deliberately NOT `CAVORA_`: that
 /// namespace is owned by the config loader (`Environment::with_prefix("AISIX")`),
 /// which reads such a name as a configuration override or warns about it on
 /// every boot.

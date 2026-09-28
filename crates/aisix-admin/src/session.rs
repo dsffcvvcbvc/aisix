@@ -70,7 +70,7 @@ use crate::state::AdminState;
 
 /// Cookie name. Namespaced so it cannot collide with anything the
 /// dashboard bundle or an ingress sets on the same origin.
-pub(crate) const COOKIE_NAME: &str = "aisix_admin_session";
+pub(crate) const COOKIE_NAME: &str = "cavora_admin_session";
 
 /// Cookie `Path`, the narrowest scope that still authenticates the whole
 /// admin API: the browser must present the cookie to `GET
@@ -369,7 +369,7 @@ pub(crate) fn session_token_from_cookies(headers: &HeaderMap) -> Option<String> 
             let Some(token) = pair.strip_prefix(COOKIE_NAME) else {
                 continue;
             };
-            // `aisix_admin_session` must not match `aisix_admin_session_x`.
+            // `cavora_admin_session` must not match `cavora_admin_session_x`.
             let Some(token) = token.strip_prefix('=') else {
                 continue;
             };

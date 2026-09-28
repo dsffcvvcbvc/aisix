@@ -560,7 +560,7 @@ impl ObservabilitySink for BrokenSink {
 /// it runs — mirroring `resolve_sls_credential`. Env keys are
 /// `OBJSTORE_CRED_<SLUG>_<FIELD>`, where `<SLUG>` upper-cases the ref with
 /// non-alphanumerics folded to `_` (the `OBJSTORE_` prefix is deliberately
-/// not `AISIX_`, which the config loader owns). Returns `None` when a required
+/// not `CAVORA_`, which the config loader owns). Returns `None` when a required
 /// field is unset/blank — the caller surfaces a delivery-health auth error
 /// rather than building a half-credentialed client.
 pub fn resolve_object_store_credential(
@@ -1475,21 +1475,21 @@ mod smoke {
     #[tokio::test]
     #[ignore = "hits a real S3 or S3-compatible server (native AWS / MinIO / LocalStack). \
                 Run: docker compose -f crates/aisix-obs/tests/object-store-emulators.compose.yml up -d \
-                then AISIX_E2E_OBJSTORE_S3_* set; cargo test -p aisix-obs -- --ignored objstore_smoke_s3"]
+                then CAVORA_E2E_OBJSTORE_S3_* set; cargo test -p aisix-obs -- --ignored objstore_smoke_s3"]
     async fn objstore_smoke_s3_roundtrip() {
         let (Some(bucket), Some(key_id), Some(secret)) = (
-            env("AISIX_E2E_OBJSTORE_S3_BUCKET"),
-            env("AISIX_E2E_OBJSTORE_S3_ACCESS_KEY_ID"),
-            env("AISIX_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY"),
+            env("CAVORA_E2E_OBJSTORE_S3_BUCKET"),
+            env("CAVORA_E2E_OBJSTORE_S3_ACCESS_KEY_ID"),
+            env("CAVORA_E2E_OBJSTORE_S3_SECRET_ACCESS_KEY"),
         ) else {
-            eprintln!("objstore_smoke_s3: AISIX_E2E_OBJSTORE_S3_* not set — skipping");
+            eprintln!("objstore_smoke_s3: CAVORA_E2E_OBJSTORE_S3_* not set — skipping");
             return;
         };
         // endpoint optional: set it for an S3-compatible host (MinIO /
         // LocalStack / R2 — path-style); omit it for native AWS S3
         // (virtual-hosted, region only). region defaults to us-east-1.
-        let endpoint = env("AISIX_E2E_OBJSTORE_S3_ENDPOINT");
-        let region = env("AISIX_E2E_OBJSTORE_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
+        let endpoint = env("CAVORA_E2E_OBJSTORE_S3_ENDPOINT");
+        let region = env("CAVORA_E2E_OBJSTORE_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
         let store = build_object_store(
             ObjectStoreProvider::S3,
             &bucket,
@@ -1507,21 +1507,21 @@ mod smoke {
 
     #[tokio::test]
     #[ignore = "hits a real Azure Blob account (or the Azurite emulator). \
-                Run with AISIX_E2E_OBJSTORE_AZURE_* set; \
+                Run with CAVORA_E2E_OBJSTORE_AZURE_* set; \
                 cargo test -p aisix-obs -- --ignored objstore_smoke_azure"]
     async fn objstore_smoke_azure_roundtrip() {
         let (Some(container), Some(account), Some(access_key)) = (
-            env("AISIX_E2E_OBJSTORE_AZURE_CONTAINER"),
-            env("AISIX_E2E_OBJSTORE_AZURE_ACCOUNT"),
-            env("AISIX_E2E_OBJSTORE_AZURE_ACCESS_KEY"),
+            env("CAVORA_E2E_OBJSTORE_AZURE_CONTAINER"),
+            env("CAVORA_E2E_OBJSTORE_AZURE_ACCOUNT"),
+            env("CAVORA_E2E_OBJSTORE_AZURE_ACCESS_KEY"),
         ) else {
-            eprintln!("objstore_smoke_azure: AISIX_E2E_OBJSTORE_AZURE_* not set — skipping");
+            eprintln!("objstore_smoke_azure: CAVORA_E2E_OBJSTORE_AZURE_* not set — skipping");
             return;
         };
         // endpoint optional: set it for the Azurite emulator
         // (http://127.0.0.1:10000/devstoreaccount1); omit it for a real Azure
         // account, where the builder derives https://<account>.blob.core.windows.net.
-        let endpoint = env("AISIX_E2E_OBJSTORE_AZURE_ENDPOINT");
+        let endpoint = env("CAVORA_E2E_OBJSTORE_AZURE_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::AzureBlob,
             &container,
@@ -1537,22 +1537,22 @@ mod smoke {
     }
 
     #[tokio::test]
-    #[ignore = "GCS round-trip — set AISIX_E2E_OBJSTORE_GCS_* against REAL GCS or a \
+    #[ignore = "GCS round-trip — set CAVORA_E2E_OBJSTORE_GCS_* against REAL GCS or a \
                 conformant emulator. NOTE: fake-gcs-server's XML API does not round-trip \
                 object_store's percent-encoded object names (the `/` in partition keys → \
                 %2F), so build + auth verify there but the PUT only greens on real GCS. \
                 cargo test -p aisix-obs -- --ignored objstore_smoke_gcs"]
     async fn objstore_smoke_gcs_roundtrip() {
         let (Some(bucket), Some(service_account_key)) = (
-            env("AISIX_E2E_OBJSTORE_GCS_BUCKET"),
-            env("AISIX_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT"),
+            env("CAVORA_E2E_OBJSTORE_GCS_BUCKET"),
+            env("CAVORA_E2E_OBJSTORE_GCS_SERVICE_ACCOUNT"),
         ) else {
-            eprintln!("objstore_smoke_gcs: AISIX_E2E_OBJSTORE_GCS_* not set — skipping");
+            eprintln!("objstore_smoke_gcs: CAVORA_E2E_OBJSTORE_GCS_* not set — skipping");
             return;
         };
         // endpoint optional: set it for an emulator (fake-gcs-server);
         // omit it for native GCS.
-        let endpoint = env("AISIX_E2E_OBJSTORE_GCS_ENDPOINT");
+        let endpoint = env("CAVORA_E2E_OBJSTORE_GCS_ENDPOINT");
         let store = build_object_store(
             ObjectStoreProvider::Gcs,
             &bucket,
@@ -1568,20 +1568,20 @@ mod smoke {
 
     #[tokio::test]
     #[ignore = "KEYLESS cloud_identity S3 round-trip — set \
-                AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET to a real bucket the runtime's \
+                CAVORA_E2E_OBJSTORE_CLOUDID_S3_BUCKET to a real bucket the runtime's \
                 AMBIENT identity can write (EC2 instance role / EKS IRSA / \
                 GitHub-OIDC-assumed role). No static keys: from_env sources the \
                 ambient chain. cargo test -p aisix-obs -- --ignored \
                 objstore_smoke_s3_cloud_identity"]
     async fn objstore_smoke_s3_cloud_identity() {
-        let Some(bucket) = env("AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET") else {
+        let Some(bucket) = env("CAVORA_E2E_OBJSTORE_CLOUDID_S3_BUCKET") else {
             eprintln!(
-                "objstore_smoke_s3_cloud_identity: AISIX_E2E_OBJSTORE_CLOUDID_S3_BUCKET not set — skipping"
+                "objstore_smoke_s3_cloud_identity: CAVORA_E2E_OBJSTORE_CLOUDID_S3_BUCKET not set — skipping"
             );
             return;
         };
         let region =
-            env("AISIX_E2E_OBJSTORE_CLOUDID_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
+            env("CAVORA_E2E_OBJSTORE_CLOUDID_S3_REGION").unwrap_or_else(|| "us-east-1".to_string());
         // Keyless: no credential_ref, no static keys — the ambient AWS chain
         // (instance role / IRSA / OIDC-assumed role) is sourced by from_env.
         let store =
@@ -1592,15 +1592,15 @@ mod smoke {
 
     #[tokio::test]
     #[ignore = "KEYLESS cloud_identity GCS round-trip — set \
-                AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET on a real GKE pod with Workload \
+                CAVORA_E2E_OBJSTORE_CLOUDID_GCS_BUCKET on a real GKE pod with Workload \
                 Identity (or a GCE VM with an attached service account), where \
                 object_store's ADC reaches the GCE metadata server. A non-GCE runner \
                 (incl. GitHub Actions via WIF) cannot — see #573. No service-account \
                 key. cargo test -p aisix-obs -- --ignored objstore_smoke_gcs_cloud_identity"]
     async fn objstore_smoke_gcs_cloud_identity() {
-        let Some(bucket) = env("AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET") else {
+        let Some(bucket) = env("CAVORA_E2E_OBJSTORE_CLOUDID_GCS_BUCKET") else {
             eprintln!(
-                "objstore_smoke_gcs_cloud_identity: AISIX_E2E_OBJSTORE_CLOUDID_GCS_BUCKET not set — skipping"
+                "objstore_smoke_gcs_cloud_identity: CAVORA_E2E_OBJSTORE_CLOUDID_GCS_BUCKET not set — skipping"
             );
             return;
         };

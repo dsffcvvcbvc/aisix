@@ -13,7 +13,7 @@
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::time::{Duration, Instant};
 
-const CHILD_ENV: &str = "AISIX_LOG_BACKPRESSURE_CHILD";
+const CHILD_ENV: &str = "CAVORA_LOG_BACKPRESSURE_CHILD";
 /// Far more than the queue holds, so the drop path is certainly taken.
 const EVENTS: usize = 200_000;
 /// Marker the child writes to stdout once every event has been emitted.

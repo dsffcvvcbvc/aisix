@@ -28,7 +28,7 @@ const ETCD_CALLER_KEY_HASH = createHash("sha256")
 
 const FILE_CALLER_PLAINTEXT = "sk-admin-off-file-caller";
 // `key_env` sugar: the plaintext travels to the gateway via this env var
-// (never `AISIX_`-prefixed — the config loader claims that namespace).
+// (never `CAVORA_`-prefixed — the config loader claims that namespace).
 const FILE_CALLER_KEY_ENV = "ADMIN_OFF_FILE_CALLER_KEY";
 
 /**
