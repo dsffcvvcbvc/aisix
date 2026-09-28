@@ -196,14 +196,20 @@ fn mime_for_path(path: &Path) -> &'static str {
         "css" => "text/css; charset=utf-8",
         "json" | "map" => "application/json",
         // The RSC payload a client-side navigation fetches (`<page>.txt`,
-        // `<page>/__next._tree.txt`, `__next._index.txt`, `__next._full.txt`)
-        // is text, and Next only accepts it as a Flight response in
-        // `output: "export"` mode when the content type starts with
-        // `text/plain` — `next/dist/client/components/router-reducer/
-        // fetch-server-response.js:136-139`. Served as
-        // `application/octet-stream` it is rejected as "not a flight
+        // `<page>/__next._tree.txt`, `__next._index.txt`) is text, and Next
+        // only accepts it as a Flight response in `output: "export"` mode when
+        // the content type starts with `text/plain` — `next@16.3.5`
+        // `next/dist/client/components/router-reducer/fetch-server-response.js:135-139`.
+        // Served as `application/octet-stream` it is rejected as "not a flight
         // response" and the router degrades to a full-page navigation that
         // dumps raw Flight text at the operator.
+        //
+        // `__next._full.txt` is not in that list and must not be added to it:
+        // the client runtime has no `_full` case at all, and the build deletes
+        // the file. See the table on [`resolve_dashboard`], which is where that
+        // is stated with the measurement. This arm is unaffected either way —
+        // `txt` is one arm, not a per-name list — so the correction is to the
+        // claim, not to the table below.
         "txt" => "text/plain; charset=utf-8",
         "webmanifest" => "application/manifest+json",
         "wasm" => "application/wasm",
@@ -592,10 +598,11 @@ fn route_state_header(response: &mut Response) {
 fn asset_missing_response(url_path: &str) -> Response {
     // Every segment/payload/chunk file is mandatory per Next's export
     // protocol, and a 404 on one makes the client call
-    // `rejectRouteCacheEntry` (`next/dist/client/components/segment-cache/
-    // cache.js:1263-1268`) — the route becomes unreachable with no
-    // operator-visible cause. So its absence is a broken deployment, not a
-    // missing page: answer 5xx and say so in the log.
+    // `rejectRouteCacheEntry` (`next@16.3.5`
+    // `next/dist/client/components/segment-cache/cache.js:1263-1268`, the
+    // `!response.ok` arm of the tree fetch) — the route becomes unreachable
+    // with no operator-visible cause. So its absence is a broken deployment,
+    // not a missing page: answer 5xx and say so in the log.
     tracing::error!(
         url_path,
         "dashboard build is incomplete: a required asset is missing"
@@ -960,15 +967,37 @@ enum DashboardResolution {
 /// another about what a URL means.
 ///
 /// A static export lays its files out like this, and each shape below is one
-/// client request form:
+/// client request form.
+///
+/// **The `cache.js` / `fetch-server-response.js` coordinates are read against
+/// `next@16.3.5` in the CommonJS tree at `next/dist/client/…`.** That is the
+/// version both export repositories pin exactly — `"next": "16.3.5"` in
+/// `cavora/package.json` and in `omniroute/package.json`, and the same entry
+/// in both `package-lock.json`s — so one table describes both exports, and
+/// "cavora is a different build" does not move a single number in it: these
+/// cites point into the Next runtime, not into an artifact.
+///
+/// The tree has a near-twin at `next/dist/esm/…` carrying the same code at
+/// different line numbers (`cache.js` is 2683 lines CommonJS, 2649 ESM;
+/// `fetch-server-response.js` is 602 and 596). A coordinate read off the
+/// wrong twin is wrong and looks right: `cache.js:1241` is
+/// `const headResponse = await (0, _fetch.fetch)(url, {` in the CommonJS tree
+/// and `if (slots === null) {`, the tail of the child loop in
+/// `convertFlightRouterStateToRouteTree`, in the ESM one.
+/// `cavora/scripts/build/pruneExportFullSegments.mjs` cites the ESM tree, so
+/// both spellings exist in this product and neither is a typo to "fix" in
+/// the other. Every number below was read off the installed package, in the
+/// CommonJS tree, at the version named above. A `next` bump invalidates all
+/// of them at once: the pin is the contract, and the next reader who sees
+/// `next@` move re-reads this block or deletes the cites.
 ///
 /// | request | resolves to | who asks for it |
 /// |---|---|---|
 /// | `/dashboard` | `dashboard.html` | `GET /dashboard` (the SPA entry) |
-/// | `/dashboard/providers/openai` | `dashboard/providers/openai.html` | the document, plus a `HEAD` probe first (`cache.js:1241`) |
-/// | `/dashboard/providers/openai.txt` | `dashboard/providers/openai.txt` | the RSC payload of a client-side navigation (`fetch-server-response.js:104-113`) |
+/// | `/dashboard/providers/openai` | `dashboard/providers/openai.html` | the document, plus a `HEAD` probe first (`cache.js:1241-1243`) |
+/// | `/dashboard/providers/openai.txt` | `dashboard/providers/openai.txt` | the RSC payload of a client-side navigation (`fetch-server-response.js:104-114`) |
 /// | `/dashboard/providers/openai/__next._tree.txt` | same path, exact | the route tree on a cold segment cache (`cache.js:1254`) |
-/// | `/dashboard/providers/openai/__next._index.txt`, `__next._full.txt` | same path, exact | per-segment prefetches (`cache.js:1517`) |
+/// | `/dashboard/providers/openai/__next._index.txt` | same path, exact | per-segment prefetches (`cache.js:1517`) |
 /// | `/_next/static/chunks/x.js` | `_next/static/chunks/x.js` | the form the document actually requests |
 /// | `/dashboard/_next/static/chunks/x.js` | `_next/static/chunks/x.js` | the re-rooted form under the mount |
 /// | `/favicon.ico`, `/manifest.webmanifest` | the same name at the export root | `public/` assets, referenced without a prefix |
@@ -978,6 +1007,33 @@ enum DashboardResolution {
 /// | `/login`, `/auth/callback` | `login.html`, `auth/callback.html` | an origin-root app route document |
 /// | `/login.txt` | `login.txt` | its RSC payload on a client-side navigation |
 /// | `/login/__next._tree.txt` | same path, exact | its route tree on a cold segment cache |
+///
+/// **`__next._full.txt` is deliberately not a row, and the reason is
+/// measured on both sides.** The exporter writes it — `next@16.3.5`
+/// `next/dist/esm/server/app-render/collect-segment-data.js:186` puts the
+/// whole page response into the segment map under the key `/_full`, and
+/// `convertSegmentPathToStaticExportFilename`
+/// (`next/dist/esm/shared/lib/segment-cache/segment-value-encoding.js:61`)
+/// maps `/_full` to `__next._full.txt`. The client never asks for it: `_full`
+/// has ZERO occurrences anywhere under `next/dist/client/` or
+/// `next/dist/shared/`, which is the reference guard
+/// `pruneExportFullSegments.mjs` runs before it deletes anything. And the
+/// build DOES delete it, identically for both exports:
+/// `cavora/scripts/build/build-next-isolated.mjs:449-458` calls the prune
+/// whenever `result.code === 0 && OMNIROUTE_EXPORT === "1"`, `build:export`
+/// sets exactly that (`cavora/package.json:113`), and a throw from the prune
+/// propagates to the build script's own `catch` (`:534`) and fails the build
+/// — so the prune is neither absent nor silently skipped. The file is
+/// therefore neither a request form nor a file on disk, and listing it
+/// described a protocol the artifact does not have.
+///
+/// Its ABSENCE is still not free, and the gap is [`names_build_artifact`]
+/// rather than this table: `/dashboard/x/__next._full.txt` carries the `txt`
+/// extension under the app-route tree, so it is classified as a build
+/// artifact and answered 500 "the build is incomplete" — for a file the
+/// build deliberately removed and no client will ever name. That is a defect
+/// rather than a description; it belongs to whoever owns the 500-vs-404
+/// policy, and is deliberately left undecided here.
 ///
 /// The candidates are tried in that order and the first existing file wins;
 /// nothing else is consulted, so no request shape can reach a file that is
@@ -1226,7 +1282,10 @@ fn dashboard_candidates(real_root: &Path, rel: &DashboardPaths) -> Vec<PathBuf> 
         };
         // Exact name first: the RSC payload of a client-side navigation
         // (`<page>.txt`) and the per-segment files (`__next._tree.txt`,
-        // `__next._index.txt`, `__next._full.txt`).
+        // `__next._index.txt`). Deliberately a NAME LIST with no `_full` in
+        // it: nothing is enumerated, this is the exact spelling of the
+        // request, and Next adds segment names without asking us — see the
+        // table on [`resolve_dashboard`].
         // MUST precede the document form — an extension-appending candidate
         // tried first would answer a payload request with the HTML document.
         candidates.push(base.join(&rel.rest));
@@ -1538,13 +1597,13 @@ mod tests {
     fn every_client_request_form_of_a_route_resolves() {
         let root = export_root();
         // The document, for `GET` and for the `HEAD` probe the client router
-        // issues first (`cache.js:1241`).
+        // issues first (`cache.js:1241-1243`).
         assert_eq!(
             std::fs::read(resolved_file(&root, "dashboard/providers/openai").0).unwrap(),
             b"<html>openai</html>"
         );
         // The RSC payload of a client-side navigation
-        // (`fetch-server-response.js:104-113`) — and NOT the document, which
+        // (`fetch-server-response.js:104-114`) — and NOT the document, which
         // an extension-appending candidate tried first would have answered.
         assert_eq!(
             std::fs::read(resolved_file(&root, "dashboard/providers/openai.txt").0).unwrap(),
@@ -1613,7 +1672,7 @@ mod tests {
 
     #[test]
     fn the_rsc_payload_is_served_as_text_plain() {
-        // `fetch-server-response.js:136-139` only accepts a `<page>.txt` as a
+        // `fetch-server-response.js:135-139` only accepts a `<page>.txt` as a
         // Flight response in export mode when the content type starts with
         // `text/plain`; anything else and the router degrades to a full-page
         // navigation that dumps raw Flight text at the operator.
@@ -2189,7 +2248,8 @@ mod tests {
         )
     }
 
-    /// `HEAD` — the probe `next/dist/client/components/segment-cache/cache.js:1241`
+    /// `HEAD` — the probe `next@16.3.5`
+    /// `next/dist/client/components/segment-cache/cache.js:1241-1243`
     /// issues before it fetches a route document, and the only method the
     /// browser sends for it.
     async fn head(app: axum::Router, uri: &str) -> (StatusCode, Vec<u8>, Headers) {
@@ -2447,7 +2507,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{uri} answered {body:?}");
             assert_eq!(body, format!("{name} TREE"), "{uri} body");
             // And the `HEAD` probe the client router issues before it fetches
-            // a document (`cache.js:1241`): the same status and the same
+            // a document (`cache.js:1241-1243`): the same status and the same
             // content type, with no body.
             let (status, body, headers) = head(dashboard_app(), route).await;
             assert_eq!(status, StatusCode::OK, "HEAD {route} answered {status}");
