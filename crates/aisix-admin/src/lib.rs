@@ -144,6 +144,112 @@ pub fn admin_openapi_json() -> &'static str {
     openapi::merged_openapi()
 }
 
+/// The handler a row of [`HANDWRITTEN_MOUNTS`] is served by.
+///
+/// The table carries this enum rather than a handler value because the rows
+/// have to be readable as DATA by the two things that check them — the
+/// collision census and `tests::every_handwritten_mount_is_actually_mounted`
+/// — and a closure column would be readable by neither. Every variant is a
+/// different entry point into the same origin-root chokepoint, which is the
+/// point: five of the six are one handler under five names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandwrittenMount {
+    /// `serve_dashboard_index` — the SPA entry document. `/`, `/dashboard`
+    /// and `/dashboard/` resolve through it, and only it turns a host with
+    /// no export deployed into the landing page rather than a 404.
+    DashboardIndex,
+    /// `serve_dashboard_path` — every other dashboard URL: the route
+    /// documents, the RSC payloads, the chunks, the origin-root icons, and
+    /// the families a static export can never carry.
+    DashboardPath,
+    /// `serve_service_worker_standing_down` — deliberately NOT the export's
+    /// own `/sw.js`. See that row for why.
+    StandingDownServiceWorker,
+    /// `livez`.
+    Liveness,
+    /// `readyz`.
+    Readiness,
+    /// `playground_handler::playground_chat_completions`, POST only. It
+    /// forwards in-process to the proxy router (no network hop) and accepts
+    /// a *proxy* API key rather than an admin key; the proxy middleware
+    /// stack running inside the forwarded request is what enforces that.
+    Playground,
+}
+
+/// Every mount on the admin listener that is NOT the `/admin/v1/…` API, as
+/// the ONE list.
+///
+/// `build_router` mounts these rows and nothing else, and the census in
+/// `tests::origin_root_routes_cannot_take_an_admin_path` reads THIS constant
+/// rather than a hand-copy of it. That copy used to live in the test, and it
+/// was a check that could not fail in the one direction that mattered: a
+/// mount added to `build_router` and forgotten in the array left both lists
+/// internally consistent and every assertion green, so the census went on
+/// reporting "the derived mounts collide with nothing" about a mount list it
+/// no longer described. A mount now exists if and only if it is a row here,
+/// so the question the copy was keeping honest is not one this file can be
+/// put into.
+///
+/// The two derived mount families are deliberately NOT rows: the export's
+/// app routes (`resources_handler::ORIGIN_ROOT_ROUTES`) and its asset trees
+/// (`resources_handler::ORIGIN_ROOT_ASSET_TREES`) are mounted by their own
+/// tables, four and three spellings each. Writing them out here as well
+/// would be the same second list, one level down.
+const HANDWRITTEN_MOUNTS: &[(&str, HandwrittenMount)] = &[
+    ("/livez", HandwrittenMount::Liveness),
+    ("/readyz", HandwrittenMount::Readiness),
+    ("/dashboard", HandwrittenMount::DashboardIndex),
+    // `matchit` 0.7.3 (`tree.rs:519`) deliberately leaves a trailing-slash
+    // path unmatched when a catch-all is registered, so `/dashboard/`
+    // reaches NO handler without this and answers with a bare 404. It is
+    // the URL an operator types by hand, so it must resolve to the same
+    // entry document.
+    ("/dashboard/", HandwrittenMount::DashboardIndex),
+    ("/dashboard/*path", HandwrittenMount::DashboardPath),
+    // The exported documents request their chunks and icons at the ORIGIN
+    // ROOT, not under `/dashboard`: `basePath` and `assetPrefix` are both
+    // empty in the export (`OMNIROUTE_BASE_PATH` unset), so every
+    // `<script src>` is `/_next/static/...`. Without these the 79.3 MiB of
+    // chunks 404 and the SPA never boots. Same chokepoint, same layout
+    // rules — only the mount differs.
+    ("/_next/*path", HandwrittenMount::DashboardPath),
+    // The export's ORIGIN-ROOT surface, on the same chokepoint: the
+    // `EntryRedirector` shell at `/`, the RSC payload and the route tree
+    // of the root route (which the export writes at the root, not under
+    // `dashboard/`), and the payload of the `/dashboard` route itself.
+    ("/", HandwrittenMount::DashboardIndex),
+    ("/index.txt", HandwrittenMount::DashboardPath),
+    ("/__next._tree.txt", HandwrittenMount::DashboardPath),
+    ("/__next.__PAGE__.txt", HandwrittenMount::DashboardPath),
+    ("/dashboard.txt", HandwrittenMount::DashboardPath),
+    ("/manifest.webmanifest", HandwrittenMount::DashboardPath),
+    ("/favicon.ico", HandwrittenMount::DashboardPath),
+    ("/favicon.svg", HandwrittenMount::DashboardPath),
+    // The export ships a service worker at its root and registers it as
+    // `/sw.js?v=<build stamp>`. Mounting it on the dashboard chokepoint
+    // would serve the export's file, which precaches this origin's own
+    // document into credential-blind Cache Storage — so the admin origin
+    // answers it with a script that registers and stands down instead. The
+    // whole reasoning, and what must not be re-added, is on the handler:
+    // `serve_service_worker_standing_down`.
+    ("/sw.js", HandwrittenMount::StandingDownServiceWorker),
+    ("/apple-touch-icon.png", HandwrittenMount::DashboardPath),
+    ("/icon-512.png", HandwrittenMount::DashboardPath),
+    // Route families a static export can never carry, mounted so they get
+    // the honest 404 instead of the router's bare one: `/docs/*` is
+    // force-dynamic by design, and `/connect/codex/[token]` is a
+    // single-use token row. Both are linked from the origin-root documents,
+    // so both are reachable.
+    ("/docs", HandwrittenMount::DashboardPath),
+    ("/docs/", HandwrittenMount::DashboardPath),
+    ("/docs/*path", HandwrittenMount::DashboardPath),
+    ("/connect/codex/:token", HandwrittenMount::DashboardPath),
+    // Playground: forwards in-process to the proxy router (no network hop).
+    // Accepts a *proxy* API key (not an admin key); auth is enforced by the
+    // proxy middleware stack that runs inside the forwarded request.
+    ("/playground/chat/completions", HandwrittenMount::Playground),
+];
+
 pub fn build_router(state: AdminState) -> Router {
     // Eagerly build the merged OpenAPI doc so any panic in schema
     // parsing surfaces at boot, not at first `/admin/openapi.json`
@@ -151,16 +257,20 @@ pub fn build_router(state: AdminState) -> Router {
     // subsequent handler call is a free lookup.
     let _ = openapi::merged_openapi();
 
-    let router = Router::new()
-        .route("/livez", get(livez))
-        .route("/readyz", get(readyz))
+    // The API half of the listener, written out route by route because each
+    // one is a distinct handler, a distinct credential or a distinct request
+    // shape. The origin-root half is NOT written out: it is
+    // `HANDWRITTEN_MOUNTS` below, mounted from the same table the collision
+    // census reads, so "a mount that exists" and "a mount the census knows
+    // about" cannot come apart.
+    let mut router = Router::new()
         // OpenAPI scalar UI is unauthenticated like /livez — admin
         // listener is private in production.
         .route("/admin/openapi.json", get(openapi::openapi_json))
         .route("/admin/openapi-scalar", get(openapi::openapi_scalar))
         // The admin-key → session exchange. Deliberately NOT behind
-        // `AdminAuth`: the credential it verifies is in the body, not in
-        // a header, which is the whole reason the endpoint exists — see
+        // `AdminAuth`: the credential it verifies is in the body, not
+        // in a header, which is the whole reason the endpoint exists — see
         // `session`. Every other admin route is behind the gate, and the
         // session cookie it mints is an equally-valid credential for
         // them (`auth::is_admin_authorized`).
@@ -171,127 +281,6 @@ pub fn build_router(state: AdminState) -> Router {
         .route(
             "/admin/v1/resources",
             post(resources_handler::update_resources),
-        )
-        .route(
-            "/dashboard",
-            get(resources_handler::serve_dashboard_index),
-        )
-        // `matchit` 0.7.3 (`tree.rs:519`) deliberately leaves a trailing-slash
-        // path unmatched when a catch-all is registered, so `/dashboard/`
-        // reaches NO handler without this and answers with a bare 404. It is
-        // the URL an operator types by hand, so it must resolve to the same
-        // entry document.
-        .route(
-            "/dashboard/",
-            get(resources_handler::serve_dashboard_index),
-        )
-        .route(
-            "/dashboard/*path",
-            get(resources_handler::serve_dashboard_path),
-        )
-        // The exported documents request their chunks and icons at the
-        // ORIGIN ROOT, not under `/dashboard`: `basePath` and `assetPrefix`
-        // are both empty in the export (`OMNIROUTE_BASE_PATH` unset), so every
-        // `<script src>` is `/_next/static/...`. Without these the 79.3 MiB of
-        // chunks 404 and the SPA never boots. Same chokepoint, same layout
-        // rules — only the mount differs.
-        .route(
-            "/_next/*path",
-            get(resources_handler::serve_dashboard_path),
-        )
-        // The export's ORIGIN-ROOT surface, on the same chokepoint: the
-        // `EntryRedirector` shell at `/`, the RSC payload and the route tree
-        // of the root route (which the export writes at the root, not under
-        // `dashboard/`), and the payload of the `/dashboard` route itself.
-        .route(
-            "/",
-            get(resources_handler::serve_dashboard_index),
-        )
-        .route(
-            "/index.txt",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/__next._tree.txt",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/__next.__PAGE__.txt",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/dashboard.txt",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/manifest.webmanifest",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route("/favicon.ico", get(resources_handler::serve_dashboard_path))
-        .route("/favicon.svg", get(resources_handler::serve_dashboard_path))
-        // The export ships a service worker at its root and registers it as
-        // `/sw.js?v=<build stamp>`. Mounting it on the dashboard chokepoint
-        // would serve the export's file, which precaches this origin's own
-        // document into credential-blind Cache Storage — so the admin origin
-        // answers it with a script that registers and stands down instead.
-        // The whole reasoning, and what must not be re-added, is on the
-        // handler: `serve_service_worker_standing_down`.
-        .route(
-            "/sw.js",
-            get(resources_handler::serve_service_worker_standing_down),
-        )
-        .route(
-            "/apple-touch-icon.png",
-            get(resources_handler::serve_dashboard_path),
-        )
-        .route(
-            "/icon-512.png",
-            get(resources_handler::serve_dashboard_path),
-        )
-        // The origin-root ASSET TREES, derived rather than written out.
-        //
-        // `providers/`, `images/` and `.well-known/` are directories the
-        // export lays down at its root, and they are mounted as TREES rather
-        // than as a list of names: the catalog draws a vendor as `<img
-        // src="/providers/<id>.svg">` and the export ships 141 of those, so
-        // the five mounted-by-name form left 136 of them 404ing on
-        // `/dashboard/providers/openai` — a grid of empty logo frames with
-        // nothing on the page saying why. A name list is a list that rots
-        // silently against every catalog change, which is the same failure
-        // the rest of this mount list is written to avoid, and
-        // `resources_handler::ORIGIN_ROOT_ASSET_TREES` is the ONE list: it
-        // also carries the type bound the chokepoint refuses against, so a
-        // tree cannot be mounted without one or bounded without being
-        // mounted.
-        //
-        // What each tree exposes is bounded in the chokepoint, not here: a
-        // `.js`/`.html` a future export drops into `providers/` is not served
-        // from the admin origin, and the image trees additionally answer with
-        // `nosniff` and a `sandbox` CSP (`file_response`).
-        //
-        // Three mounts each, not one, because `matchit` 0.7.3 (`tree.rs:519`)
-        // leaves a trailing-slash path unmatched against a catch-all: `/images`
-        // and `/images/` are mounted for the reason `/docs/` is, and an
-        // unmounted one would answer the router's bare 404 rather than this
-        // surface's explanation of what is and is not in the build.
-        //
-        // Whether an origin-root directory is MISSING from the table is a
-        // separate question the export answers, and
-        // `every_origin_root_directory_of_the_export_is_mounted_or_declared_dead`
-        // is what asks it: a directory a future export adds has to be mounted
-        // or explicitly declared unmounted, with a reason.
-
-        // Route families a static export can never carry, mounted so they get
-        // the honest 404 instead of the router's bare one: `/docs/*` is
-        // force-dynamic by design, and `/connect/codex/[token]` is a
-        // single-use token row. Both are linked from the origin-root
-        // documents, so both are reachable.
-        .route("/docs", get(resources_handler::serve_dashboard_path))
-        .route("/docs/", get(resources_handler::serve_dashboard_path))
-        .route("/docs/*path", get(resources_handler::serve_dashboard_path))
-        .route(
-            "/connect/codex/:token",
-            get(resources_handler::serve_dashboard_path),
         )
         .route(
             "/admin/v1/models",
@@ -398,14 +387,33 @@ pub fn build_router(state: AdminState) -> Router {
             get(observability_exporters_handlers::get_observability_exporter),
         )
         // Health — per-model upstream health levels (0/1/2).
-        .route("/admin/v1/health", get(health_handler::get_health))
-        // Playground: forwards in-process to the proxy router (no network hop).
-        // Accepts a *proxy* API key (not an admin key); auth is enforced by the
-        // proxy middleware stack that runs inside the forwarded request.
-        .route(
-            "/playground/chat/completions",
-            post(playground_handler::playground_chat_completions),
-        );
+        .route("/admin/v1/health", get(health_handler::get_health));
+
+    // The hand-written mounts that are not the API: the dashboard tree, the
+    // origin-root documents and icons, the operational probes and the
+    // playground. `HANDWRITTEN_MOUNTS` says what each row is and why it
+    // exists, and this loop is the only place in the crate that mounts one —
+    // so a row that is not mounted is not a mount, and a mount that is not a
+    // row cannot be added.
+    for &(path, mount) in HANDWRITTEN_MOUNTS {
+        router = match mount {
+            HandwrittenMount::DashboardIndex => {
+                router.route(path, get(resources_handler::serve_dashboard_index))
+            }
+            HandwrittenMount::DashboardPath => {
+                router.route(path, get(resources_handler::serve_dashboard_path))
+            }
+            HandwrittenMount::StandingDownServiceWorker => router.route(
+                path,
+                get(resources_handler::serve_service_worker_standing_down),
+            ),
+            HandwrittenMount::Liveness => router.route(path, get(livez)),
+            HandwrittenMount::Readiness => router.route(path, get(readyz)),
+            HandwrittenMount::Playground => {
+                router.route(path, post(playground_handler::playground_chat_completions))
+            }
+        };
+    }
 
     // The export's origin-root app routes, four mounts each, because that is
     // how many ways a client asks for one: the document, its RSC payload on a
@@ -443,7 +451,6 @@ pub fn build_router(state: AdminState) -> Router {
     // its PRESENCE is the signal. **Making the three bodies identical for
     // tidiness is the change that would genuinely destroy it**, which is why
     // `resources_handler`'s `the_two_404s_stay_distinguishable` exists.
-    let mut router = router;
     for route in resources_handler::ORIGIN_ROOT_ROUTES {
         router = router
             .route(route, get(resources_handler::serve_dashboard_path))
@@ -461,10 +468,41 @@ pub fn build_router(state: AdminState) -> Router {
             );
     }
 
-    // The origin-root asset trees, the same three spellings for the same
-    // `matchit` reason, derived from the ONE table that also carries the
-    // chokepoint's type bound — see the comment above for why a tree is
-    // mounted as a tree and what bounds it.
+    // The origin-root ASSET TREES, and the reason they are trees and not
+    // names is the reason they are a table and not a hand-written mount.
+    //
+    // `providers/`, `images/` and `.well-known/` are directories the export
+    // lays down at its root, and they are mounted as TREES rather than as a
+    // list of names: the catalog draws a vendor as `<img
+    // src="/providers/<id>.svg">` and the export ships 141 of those, so the
+    // five mounted-by-name form left 136 of them 404ing on
+    // `/dashboard/providers/openai` — a grid of empty logo frames with
+    // nothing on the page saying why. A name list is a list that rots
+    // silently against every catalog change, which is the same failure the
+    // rest of the mount list is written to avoid, and
+    // `resources_handler::ORIGIN_ROOT_ASSET_TREES` is the ONE list: it also
+    // carries the type bound the chokepoint refuses against, so a tree
+    // cannot be mounted without one or bounded without being mounted. That
+    // is the precedent `HANDWRITTEN_MOUNTS` follows for the hand-written
+    // half, and the reason the two derived loops below are the only places
+    // a mount may be spelled out rather than named.
+    //
+    // What each tree exposes is bounded in the chokepoint, not here: a
+    // `.js`/`.html` a future export drops into `providers/` is not served
+    // from the admin origin, and the image trees additionally answer with
+    // `nosniff` and a `sandbox` CSP (`file_response`).
+    //
+    // Three mounts each, not one, because `matchit` 0.7.3 (`tree.rs:519`)
+    // leaves a trailing-slash path unmatched against a catch-all: `/images`
+    // and `/images/` are mounted for the reason `/dashboard/` is, and an
+    // unmounted one would answer the router's bare 404 rather than this
+    // surface's explanation of what is and is not in the build.
+    //
+    // Whether an origin-root directory is MISSING from the table is a
+    // separate question the export answers, and
+    // `every_origin_root_directory_of_the_export_is_mounted_or_declared_dead`
+    // is what asks it: a directory a future export adds has to be mounted
+    // or explicitly declared unmounted, with a reason.
     for tree in resources_handler::ORIGIN_ROOT_ASSET_TREES {
         router = router
             .route(
@@ -887,33 +925,17 @@ mod tests {
         ];
         // Every path `build_router` mounts by hand, so a table entry that
         // duplicates one of them is caught here rather than as a boot panic.
-        let handwritten = [
-            "/",
-            "/index.txt",
-            "/__next._tree.txt",
-            "/__next.__PAGE__.txt",
-            "/dashboard.txt",
-            "/dashboard",
-            "/dashboard/",
-            "/dashboard/*path",
-            "/_next/*path",
-            "/manifest.webmanifest",
-            "/favicon.ico",
-            "/favicon.svg",
-            "/sw.js",
-            "/apple-touch-icon.png",
-            "/icon-512.png",
-            // `/providers`, `/images` and `/.well-known` are NOT here: they
-            // are derived from ORIGIN_ROOT_ASSET_TREES below, and listing them
-            // by hand as well is exactly the second list that would drift.
-            "/docs",
-            "/docs/",
-            "/docs/*path",
-            "/connect/codex/:token",
-            "/livez",
-            "/readyz",
-            "/playground/chat/completions",
-        ];
+        // Read from the SAME table `build_router` mounts it from: this used to
+        // be a hand-copy of the mount list, and the copy is what made the
+        // census unfalsifiable in the direction that mattered. A mount added
+        // to the router and forgotten in the array left both lists internally
+        // consistent and every assertion below green, so the census went on
+        // certifying that the derived mounts collide with nothing, about a
+        // list it no longer described. `/providers`, `/images` and
+        // `/.well-known` are not rows of it either — they are derived from
+        // ORIGIN_ROOT_ASSET_TREES below, and spelling them out here as well
+        // would be the same second list one level down.
+        let handwritten: Vec<&str> = HANDWRITTEN_MOUNTS.iter().map(|(path, _)| *path).collect();
         let mut mounted: Vec<String> = Vec::new();
         for tree in resources_handler::ORIGIN_ROOT_ASSET_TREES {
             let first = tree.dir;
@@ -979,6 +1001,43 @@ mod tests {
             assert!(
                 resources_handler::ORIGIN_ROOT_ROUTES.contains(&route),
                 "{route} is not mounted"
+            );
+        }
+    }
+
+    /// Every row of `HANDWRITTEN_MOUNTS` is a MOUNT, not a claim.
+    ///
+    /// The census above reads that table, so a row the router does not serve
+    /// would leave it comparing a list of wishes against a list of wishes:
+    /// the table would look like a census of the mount list while describing
+    /// nothing the listener actually answers. This is the check that says the
+    /// other way, and it is what keeps the table honest now that it is the
+    /// only place a hand-written mount can be added.
+    ///
+    /// The discriminator is the marker header, not the status code:
+    /// `x-aisix-route-state` is set by the FALLBACK and by nothing else in
+    /// the crate (`serve_no_such_route`), so its absence says a mount
+    /// answered. Status is deliberately not asserted — on a host with no
+    /// export deployed the honest answer for `/favicon.ico` is 404, and
+    /// `/playground/chat/completions` answers 405 to a GET, and both of those
+    /// are routed answers rather than silence.
+    #[tokio::test]
+    async fn every_handwritten_mount_is_actually_mounted() {
+        let app = build_router(build_state());
+        for &(mount, _) in HANDWRITTEN_MOUNTS {
+            // A wildcard row is asked for through a real sub-path, because
+            // that is the only spelling that can match it: `/docs/*path` is
+            // not reachable as the literal string `/docs/*path`.
+            let probe = mount.replace("/*path", "/probe").replace(":token", "probe");
+            let req = Request::builder()
+                .uri(probe.as_str())
+                .body(Body::empty())
+                .unwrap();
+            let resp = run(app.clone(), req).await;
+            assert!(
+                resp.headers().get("x-aisix-route-state").is_none(),
+                "{probe} is in the mount table but the router answered the \
+                 fallback: the row is a claim, not a mount"
             );
         }
     }
