@@ -136,6 +136,7 @@ function isAuthorizationSchemeRow(r: PresetRow): r is AuthorizationSchemeRow {
 /** The one row whose credential is an `Authorization` value under a non-Bearer scheme. */
 function authorizationSchemeRows(rows: PresetRow[]): AuthorizationSchemeRow[] {
   return rows.filter(isAuthorizationSchemeRow);
+}
 
 /**
  * The upstream path a vendor's `api_base` produces. The family bridge
